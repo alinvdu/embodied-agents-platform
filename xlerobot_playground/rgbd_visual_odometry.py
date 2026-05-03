@@ -25,7 +25,7 @@ try:
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from sensor_msgs.msg import CameraInfo, Image, Imu
-    from std_msgs.msg import Float32
+    from std_msgs.msg import Bool, Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
@@ -37,6 +37,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     CameraInfo = None
     Image = None
     Imu = None
+    Bool = None
     Float32 = None
     TransformBroadcaster = None
 
@@ -61,8 +62,8 @@ class RgbdVoConfig:
     camera_frame: str = "head_camera_link"
     camera_pitch_topic: str = "/camera/head/pitch_rad"
     camera_pan_topic: str = "/camera/head/pan_rad"
-    freeze_during_head_motion: bool = True
-    head_motion_freeze_settle_s: float = 0.75
+    scan_active_topic: str = "/xlerobot/scan_active"
+    freeze_orientation_during_scan: bool = True
     head_pan_freeze_threshold_rad: float = math.radians(1.0)
     head_pitch_freeze_threshold_rad: float = math.radians(1.0)
     publish_rate_hz: float = 30.0
@@ -383,7 +384,7 @@ class RgbdVisualOdometryNode(Node):
         self._last_camera_pitch_rad = self.camera_pitch_rad
         self._last_camera_pan_rad = self.camera_pan_rad
         self._last_head_motion_s: float | None = None
-        self._head_motion_frozen = False
+        self._scan_orientation_frozen = False
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
         self.planar_velocity_x_m_s = 0.0
@@ -408,19 +409,22 @@ class RgbdVisualOdometryNode(Node):
         self.rejected_updates = 0
         self._diagnostics = RgbdVoDiagnostics()
         self._last_diagnostics_log_s: float | None = None
-        self._last_head_freeze_log_s: float | None = None
+        self._last_scan_freeze_log_s: float | None = None
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
         self.create_subscription(Image, config.depth_topic, self._on_depth, 10)
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
         self.create_subscription(Float32, config.camera_pitch_topic, self._on_camera_pitch, 10)
         self.create_subscription(Float32, config.camera_pan_topic, self._on_camera_pan, 10)
+        self.create_subscription(Bool, config.scan_active_topic, self._on_scan_active, 10)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
             "RGB-D visual odometry ready: "
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
             f"camera_pitch={config.camera_pitch_topic} camera_pan={config.camera_pan_topic} "
-            f"freeze_head_motion={config.freeze_during_head_motion} imu={config.imu_topic} odom={config.odom_topic}"
+            f"scan_active={config.scan_active_topic} "
+            f"freeze_orientation_during_scan={config.freeze_orientation_during_scan} "
+            f"imu={config.imu_topic} odom={config.odom_topic}"
         )
 
     def _record_estimate(self, estimate: VisualOdomEstimate) -> None:
@@ -551,6 +555,19 @@ class RgbdVisualOdometryNode(Node):
         self.camera_pan_rad = pan_rad
         self._last_camera_pan_rad = pan_rad
 
+    def _on_scan_active(self, message: Any) -> None:
+        active = bool(message.data)
+        if active == self._scan_orientation_frozen:
+            return
+        self._scan_orientation_frozen = active
+        self.previous_frame = None
+        self._last_prediction_stamp_s = None
+        if active:
+            self.get_logger().info("Freezing odom orientation while scan_active is true; translation updates remain enabled.")
+        else:
+            self._reset_imu_origin_to_current_pose()
+            self.get_logger().info("Resuming odom orientation after scan_active returned false; reset VO keyframe and IMU yaw origin.")
+
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
         self._latest_imu_received_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
@@ -645,28 +662,17 @@ class RgbdVisualOdometryNode(Node):
         )
         return float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s * dt
 
-    def _head_motion_freeze_reason(self) -> tuple[str | None, float]:
-        now_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
-        if not self.config.freeze_during_head_motion:
-            return None, now_s
-        if abs(self.camera_pan_rad) >= self.config.head_pan_freeze_threshold_rad:
-            return "pan_away_from_zero", now_s
-        if self._last_head_motion_s is not None and now_s - self._last_head_motion_s < self.config.head_motion_freeze_settle_s:
-            return "settling_after_head_motion", now_s
-        return None, now_s
+    def _orientation_freeze_active(self) -> bool:
+        return bool(self.config.freeze_orientation_during_scan and self._scan_orientation_frozen)
 
-    def _log_head_motion_freeze_return(self, *, now_s: float, reason: str | None) -> None:
-        if self._last_head_freeze_log_s is not None and now_s - self._last_head_freeze_log_s < 1.0:
+    def _log_scan_orientation_freeze(self, *, now_s: float) -> None:
+        if self._last_scan_freeze_log_s is not None and now_s - self._last_scan_freeze_log_s < 1.0:
             return
-        self._last_head_freeze_log_s = now_s
-        settle_age_s = None if self._last_head_motion_s is None else max(now_s - self._last_head_motion_s, 0.0)
+        self._last_scan_freeze_log_s = now_s
         self.get_logger().info(
-            "RGB-D VO early return: head-motion freeze active "
-            f"reason={reason or 'unknown'} "
+            "RGB-D VO orientation freeze active: "
+            f"scan_active={self._scan_orientation_frozen} "
             f"pan_deg={math.degrees(self.camera_pan_rad):.3f} "
-            f"pan_threshold_deg={math.degrees(self.config.head_pan_freeze_threshold_rad):.3f} "
-            f"settle_age_s={settle_age_s if settle_age_s is not None else 'none'} "
-            f"settle_required_s={self.config.head_motion_freeze_settle_s:.3f} "
             f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
         )
 
@@ -685,41 +691,18 @@ class RgbdVisualOdometryNode(Node):
     def step(self) -> None:
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
-        head_motion_freeze_reason, head_motion_freeze_now_s = self._head_motion_freeze_reason()
-        if head_motion_freeze_reason is not None:
-            self.previous_frame = None
-            self.planar_velocity_x_m_s = 0.0
-            self.planar_velocity_y_m_s = 0.0
-            if not self._head_motion_frozen:
-                self.get_logger().info(
-                    "Freezing RGB-D VO while head pan is active: "
-                    f"pan_deg={math.degrees(self.camera_pan_rad):.1f}"
-                )
-            self._head_motion_frozen = True
+        orientation_frozen = self._orientation_freeze_active()
+        if orientation_frozen:
             self._last_prediction_stamp_s = stamp_s
-            self._log_head_motion_freeze_return(
-                now_s=head_motion_freeze_now_s,
-                reason=head_motion_freeze_reason,
-            )
-            self._log_diagnostics(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
-            self._publish_odom(stamp)
-            return
-        if self._head_motion_frozen:
-            self._head_motion_frozen = False
-            self.previous_frame = None
-            self.planar_velocity_x_m_s = 0.0
-            self.planar_velocity_y_m_s = 0.0
-            self._reset_imu_origin_to_current_pose()
-            self.get_logger().info(
-                "Resuming RGB-D VO after head pan returned near zero; "
-                "reset VO keyframe and IMU yaw origin."
-            )
+            self._log_scan_orientation_freeze(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
         predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
         absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
         imu_yaw_rad = self._imu_delta_yaw_rad(
             predicted_yaw_rad=predicted_yaw_rad,
             absolute_imu_yaw_rad=absolute_imu_yaw_rad,
         )
+        if orientation_frozen:
+            imu_yaw_rad = 0.0
         imu_yaw_applied = False
         if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
             try:
@@ -736,6 +719,8 @@ class RgbdVisualOdometryNode(Node):
                     predicted_yaw_rad=predicted_yaw_rad,
                     absolute_imu_yaw_rad=absolute_imu_yaw_rad,
                 )
+                if orientation_frozen:
+                    imu_yaw_rad = 0.0
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
                     if isinstance(estimate, VisualOdomEstimate):
@@ -795,7 +780,7 @@ class RgbdVisualOdometryNode(Node):
         odom.pose.covariance[35] = 0.10
         odom.twist.twist.linear.x = float(self.planar_velocity_x_m_s)
         odom.twist.twist.linear.y = float(self.planar_velocity_y_m_s)
-        if self._head_motion_frozen:
+        if self._orientation_freeze_active():
             odom.twist.twist.angular.z = 0.0
         elif self.latest_imu is not None and self._imu_bias_ready:
             _, _, yaw_rate_rad_s = imu_to_base_components(
@@ -842,16 +827,31 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
     parser.add_argument("--camera-pan-topic", default="/camera/head/pan_rad")
     parser.add_argument(
+        "--scan-active-topic",
+        default="/xlerobot/scan_active",
+        help="Bool topic that is true only while an intentional scan is active.",
+    )
+    parser.add_argument(
         "--freeze-during-head-motion",
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Keep odom->base_link fixed while the head pan is away from zero or has just moved. "
-            "Use this for stationary head-pan OctoMap scans so camera gyro/head motion is not "
-            "misinterpreted as robot base yaw."
+            "Compatibility alias for --freeze-orientation-during-scan. This no longer freezes "
+            "position from camera pan alone."
         ),
     )
-    parser.add_argument("--head-motion-freeze-settle-s", type=float, default=0.75)
+    parser.add_argument(
+        "--freeze-orientation-during-scan",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Freeze odom yaw only while --scan-active-topic publishes true; RGB-D translation remains enabled.",
+    )
+    parser.add_argument(
+        "--head-motion-freeze-settle-s",
+        type=float,
+        default=0.75,
+        help="Deprecated compatibility option; scan-active events now control orientation freeze.",
+    )
     parser.add_argument("--head-pan-freeze-threshold-deg", type=float, default=1.0)
     parser.add_argument("--head-pitch-freeze-threshold-deg", type=float, default=1.0)
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
@@ -916,8 +916,12 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_frame=args.camera_frame,
         camera_pitch_topic=args.camera_pitch_topic,
         camera_pan_topic=args.camera_pan_topic,
-        freeze_during_head_motion=args.freeze_during_head_motion,
-        head_motion_freeze_settle_s=args.head_motion_freeze_settle_s,
+        scan_active_topic=args.scan_active_topic,
+        freeze_orientation_during_scan=(
+            bool(args.freeze_during_head_motion)
+            if args.freeze_orientation_during_scan is None
+            else bool(args.freeze_orientation_during_scan)
+        ),
         head_pan_freeze_threshold_rad=math.radians(args.head_pan_freeze_threshold_deg),
         head_pitch_freeze_threshold_rad=math.radians(args.head_pitch_freeze_threshold_deg),
         publish_rate_hz=args.publish_rate_hz,

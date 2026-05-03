@@ -403,8 +403,8 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
   --camera-pan-topic /camera/head/pan_rad \
+  --scan-active-topic /xlerobot/scan_active \
   --freeze-during-head-motion \
-  --head-motion-freeze-settle-s 0.75 \
   --imu-frame-convention base_link \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
@@ -415,7 +415,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
 
-Keep `--freeze-during-head-motion` enabled for stationary camera-pan mapping. While the head pan is away from center, RGB-D visual odometry keeps `odom -> base_link` fixed and only the bridge updates `base_link -> head_camera_link`. This prevents the camera gyro/head motion from being double-counted as robot-base yaw during OctoMap's 360 degree scan.
+Keep `--freeze-during-head-motion` enabled for stationary camera-pan mapping. It is now a compatibility alias for scan-event orientation freeze: `/xlerobot/scan_active=true` freezes only odom yaw, while RGB-D translation remains enabled. Head pan position alone no longer freezes odom. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after scanning finishes.
 
 Quick checks:
 
@@ -504,6 +504,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-map-frame map \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
+  --ros-scan-active-topic /xlerobot/scan_active \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -562,6 +563,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-map-frame map \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
+  --ros-scan-active-topic /xlerobot/scan_active \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \

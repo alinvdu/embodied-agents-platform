@@ -54,6 +54,25 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertTrue(default_config.jitter_threshold)
         self.assertFalse(debug_config.jitter_threshold)
 
+    def test_parser_uses_scan_active_topic_for_orientation_freeze(self) -> None:
+        config = config_from_args(
+            build_parser().parse_args(
+                [
+                    "--scan-active-topic",
+                    "/scan/is_active",
+                    "--no-freeze-orientation-during-scan",
+                ]
+            )
+        )
+
+        self.assertEqual(config.scan_active_topic, "/scan/is_active")
+        self.assertFalse(config.freeze_orientation_during_scan)
+
+    def test_compat_freeze_flag_maps_to_scan_orientation_freeze(self) -> None:
+        config = config_from_args(build_parser().parse_args(["--no-freeze-during-head-motion"]))
+
+        self.assertFalse(config.freeze_orientation_during_scan)
+
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))
 
@@ -121,6 +140,17 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(delta, math.radians(-3.0))
+
+    def test_orientation_freeze_depends_on_scan_event_not_pan(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"freeze_orientation_during_scan": True})()
+        node._scan_orientation_frozen = False
+        node.camera_pan_rad = math.radians(90.0)
+
+        self.assertFalse(node._orientation_freeze_active())
+
+        node._scan_orientation_frozen = True
+        self.assertTrue(node._orientation_freeze_active())
 
 
 if __name__ == "__main__":

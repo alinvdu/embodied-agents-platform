@@ -267,6 +267,7 @@ class RosRuntimeConfig:
     scan_topic: str = "/scan"
     point_cloud_topic: str = "/camera/head/points"
     point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
+    scan_active_topic: str = "/xlerobot/scan_active"
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
@@ -478,6 +479,7 @@ class RosExplorationRuntime(Node):
             config.point_cloud_update_map_enabled_topic,
             10,
         )
+        self._scan_active_pub = self.create_publisher(Bool, config.scan_active_topic, 10)
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -825,6 +827,15 @@ class RosExplorationRuntime(Node):
         self._point_cloud_update_map_enabled_pub.publish(message)
         self._spin_once(timeout_sec=0.0)
 
+    def set_scan_active(self, active: bool) -> None:
+        message = Bool()
+        message.data = bool(active)
+        self._scan_active_pub.publish(message)
+        self._spin_once(timeout_sec=0.0)
+
+    def _set_scan_active_if_available(self, active: bool) -> None:
+        self.set_scan_active(active)
+
     def drain_scan_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
         self.spin_for(0.05)
         stop_index = len(self.scan_observations)
@@ -980,6 +991,7 @@ class RosExplorationRuntime(Node):
             )
         if mode != "robot_spin":
             raise ValueError(f"Unsupported turn scan mode: {mode!r}")
+        self._set_scan_active_if_available(True)
         self._use_turn_feedback_for_scan_pose = True
         try:
             spin_event = self._manual_spin(should_cancel=should_cancel)
@@ -987,6 +999,7 @@ class RosExplorationRuntime(Node):
             raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
         finally:
             self._use_turn_feedback_for_scan_pose = False
+            self._set_scan_active_if_available(False)
         observations = _select_turnaround_scan_observations(raw_observations, sample_count=sample_count)
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
@@ -1070,6 +1083,8 @@ class RosExplorationRuntime(Node):
         fused_projected_map: RosOccupancyMap | None = None
         fuse_external_projected_maps = bool(getattr(self.config, "fuse_external_projected_map_snapshots", False))
         try:
+            if hasattr(self, "_set_scan_active_if_available"):
+                self._set_scan_active_if_available(True)
             for pan_rad in scan_angles:
                 if should_cancel is not None and should_cancel():
                     event["scan_stop_reason"] = "canceled"
@@ -1127,6 +1142,9 @@ class RosExplorationRuntime(Node):
                 )
             except Exception as exc:
                 event["restore_error"] = str(exc)
+            finally:
+                if hasattr(self, "_set_scan_active_if_available"):
+                    self._set_scan_active_if_available(False)
 
         raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
         if not self.config.publish_internal_navigation_map:
