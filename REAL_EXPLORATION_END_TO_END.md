@@ -406,6 +406,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --freeze-during-head-motion \
   --head-motion-freeze-settle-s 0.75 \
   --imu-frame-convention base_link \
+  --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 30 \
   --min-translation-update-m 0.01

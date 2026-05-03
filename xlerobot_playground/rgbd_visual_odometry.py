@@ -75,6 +75,7 @@ class RgbdVoConfig:
     max_yaw_step_rad: float = math.radians(30.0)
     imu_stale_after_s: float = 0.5
     imu_frame_convention: str = "camera_optical"
+    odom_yaw_sign: float = 1.0
     imu_bias_calibration_s: float = 2.0
     imu_bias_min_samples: int = 20
     camera_x_m: float = 0.0
@@ -612,7 +613,9 @@ class RgbdVisualOdometryNode(Node):
             return None
         if self._latest_imu_orientation_unwrapped_yaw_rad is None or self._imu_orientation_origin_yaw_rad is None:
             return None
-        return self._latest_imu_orientation_unwrapped_yaw_rad - self._imu_orientation_origin_yaw_rad
+        return float(getattr(self.config, "odom_yaw_sign", 1.0)) * (
+            self._latest_imu_orientation_unwrapped_yaw_rad - self._imu_orientation_origin_yaw_rad
+        )
 
     def _predict_yaw_from_imu(self, *, stamp_s: float) -> float:
         if not self._imu_bias_ready:
@@ -638,7 +641,7 @@ class RgbdVisualOdometryNode(Node):
             y=float(self.latest_imu.angular_velocity.y) - self._imu_bias_y_rad_s,
             z=float(self.latest_imu.angular_velocity.z) - self._imu_bias_z_rad_s,
         )
-        return yaw_rate_rad_s * dt
+        return float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s * dt
 
     def _head_motion_freeze_active(self) -> bool:
         if not self.config.freeze_during_head_motion:
@@ -777,7 +780,7 @@ class RgbdVisualOdometryNode(Node):
                 y=float(self.latest_imu.angular_velocity.y) - self._imu_bias_y_rad_s,
                 z=float(self.latest_imu.angular_velocity.z) - self._imu_bias_z_rad_s,
             )
-            odom.twist.twist.angular.z = yaw_rate_rad_s
+            odom.twist.twist.angular.z = float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s
         self.odom_publisher.publish(odom)
 
         transform = TransformStamped()
@@ -849,6 +852,16 @@ def build_parser() -> argparse.ArgumentParser:
         default="camera_optical",
         help="Interpret raw IMU vectors in camera optical coordinates or already-rotated base_link coordinates.",
     )
+    parser.add_argument(
+        "--odom-yaw-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=1.0,
+        help=(
+            "Sign applied to IMU yaw before publishing odom->base_link. Use -1 if physical right turns "
+            "make odometry yaw increase instead of decrease."
+        ),
+    )
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
@@ -885,6 +898,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         imu_bias_calibration_s=args.imu_bias_calibration_s,
         imu_bias_min_samples=args.imu_bias_min_samples,
         imu_frame_convention=args.imu_frame_convention,
+        odom_yaw_sign=args.odom_yaw_sign,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
         camera_yaw_rad=args.camera_yaw_rad,
