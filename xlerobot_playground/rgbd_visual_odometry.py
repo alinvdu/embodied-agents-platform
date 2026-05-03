@@ -659,6 +659,13 @@ class RgbdVisualOdometryNode(Node):
             self._imu_orientation_origin_yaw_rad = self._latest_imu_orientation_unwrapped_yaw_rad - self.pose.yaw
         self._last_prediction_stamp_s = None
 
+    def _imu_delta_yaw_rad(self, *, predicted_yaw_rad: float, absolute_imu_yaw_rad: float | None) -> float:
+        if absolute_imu_yaw_rad is not None:
+            return angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
+        if self.latest_imu is not None:
+            return predicted_yaw_rad
+        return 0.0
+
     def step(self) -> None:
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
@@ -689,6 +696,11 @@ class RgbdVisualOdometryNode(Node):
             )
         predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
         absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
+        imu_yaw_rad = self._imu_delta_yaw_rad(
+            predicted_yaw_rad=predicted_yaw_rad,
+            absolute_imu_yaw_rad=absolute_imu_yaw_rad,
+        )
+        imu_yaw_applied = False
         if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
             try:
                 frame = VisualOdomFrame(
@@ -700,15 +712,13 @@ class RgbdVisualOdometryNode(Node):
                 stamp_s = stamp_to_seconds(frame.stamp)
                 predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
                 absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
+                imu_yaw_rad = self._imu_delta_yaw_rad(
+                    predicted_yaw_rad=predicted_yaw_rad,
+                    absolute_imu_yaw_rad=absolute_imu_yaw_rad,
+                )
                 if self.previous_frame is not None:
                     estimate = self.estimator.estimate(self.previous_frame, frame)
                     if isinstance(estimate, VisualOdomEstimate):
-                        if absolute_imu_yaw_rad is not None:
-                            imu_yaw_rad = angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
-                        elif self.latest_imu is not None:
-                            imu_yaw_rad = predicted_yaw_rad
-                        else:
-                            imu_yaw_rad = 0.0
                         base_forward_m, base_left_m = camera_optical_translation_to_base_planar(
                             camera_x_m=estimate.camera_translation_x_m,
                             camera_y_m=estimate.camera_translation_y_m,
@@ -727,6 +737,7 @@ class RgbdVisualOdometryNode(Node):
                         self.accepted_updates += 1
                         self._record_estimate(estimate)
                         self.previous_frame = frame
+                        imu_yaw_applied = True
                     else:
                         self.rejected_updates += 1
                         self._record_rejection(estimate)
@@ -737,20 +748,12 @@ class RgbdVisualOdometryNode(Node):
                 self.rejected_updates += 1
                 self._record_exception()
                 self.get_logger().warning(f"RGB-D VO update rejected: {exc}")
-        elif (
-            abs(predicted_yaw_rad) > 1e-6
-            or absolute_imu_yaw_rad is not None
-        ):
-            delta_yaw_rad = (
-                angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
-                if absolute_imu_yaw_rad is not None
-                else predicted_yaw_rad
-            )
+        if not imu_yaw_applied and abs(imu_yaw_rad) > 1e-6:
             self.pose = compose_planar_local(
                 self.pose,
                 delta_x_m=0.0,
                 delta_y_m=0.0,
-                delta_yaw_rad=delta_yaw_rad,
+                delta_yaw_rad=imu_yaw_rad,
             )
             self.planar_velocity_x_m_s = 0.0
             self.planar_velocity_y_m_s = 0.0

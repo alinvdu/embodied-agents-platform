@@ -98,6 +98,30 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         node._latest_imu_received_s = 9.0
         self.assertIsNone(node._relative_imu_yaw_rad())
 
+    def test_imu_delta_yaw_uses_absolute_yaw_when_available(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(0.0, 0.0, math.radians(10.0))
+        node.latest_imu = None
+
+        delta = node._imu_delta_yaw_rad(
+            predicted_yaw_rad=math.radians(2.0),
+            absolute_imu_yaw_rad=math.radians(25.0),
+        )
+
+        self.assertAlmostEqual(delta, math.radians(15.0))
+
+    def test_imu_delta_yaw_uses_prediction_when_absolute_yaw_missing(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(0.0, 0.0, 0.0)
+        node.latest_imu = object()
+
+        delta = node._imu_delta_yaw_rad(
+            predicted_yaw_rad=math.radians(-3.0),
+            absolute_imu_yaw_rad=None,
+        )
+
+        self.assertAlmostEqual(delta, math.radians(-3.0))
+
 
 if __name__ == "__main__":
     unittest.main()
