@@ -409,10 +409,11 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 30 \
-  --min-translation-update-m 0.01
+  --min-translation-update-m 0.01 \
+  --no-jitter-threshold
 ```
 
-This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. The `--min-translation-update-m 0.01` threshold accumulates tiny RGB-D frame-to-frame motion until there is at least 1 cm of accepted translation, which prevents sub-millimeter noisy updates from dominating the pose.
+This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
 
 Keep `--freeze-during-head-motion` enabled for stationary camera-pan mapping. While the head pan is away from center, RGB-D visual odometry keeps `odom -> base_link` fixed and only the bridge updates `base_link -> head_camera_link`. This prevents the camera gyro/head motion from being double-counted as robot-base yaw during OctoMap's 360 degree scan.
 

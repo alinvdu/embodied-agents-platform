@@ -72,6 +72,7 @@ class RgbdVoConfig:
     min_inliers: int = 12
     max_translation_step_m: float = 0.25
     min_translation_update_m: float = 0.005
+    jitter_threshold: bool = True
     max_yaw_step_rad: float = math.radians(30.0)
     imu_stale_after_s: float = 0.5
     imu_frame_convention: str = "camera_optical"
@@ -340,7 +341,7 @@ class FeatureRgbdOdometry:
                 object_points=len(object_points),
                 inliers=inlier_count,
             )
-        if abs(camera_forward_m) < self.config.min_translation_update_m:
+        if self.config.jitter_threshold and abs(camera_forward_m) < self.config.min_translation_update_m:
             return VisualOdomRejection(
                 "translation_step_too_small",
                 matches=len(matches),
@@ -842,6 +843,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.005,
         help="Keep the current RGB-D keyframe until estimated forward motion reaches this threshold.",
     )
+    parser.add_argument(
+        "--jitter-threshold",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Reject visual odometry updates whose estimated forward motion is below "
+            "`--min-translation-update-m`. Use `--no-jitter-threshold` to accept tiny "
+            "PnP translations while debugging slow real Nav2 motion."
+        ),
+    )
     parser.add_argument("--max-yaw-step-deg", type=float, default=30.0)
     parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
     parser.add_argument("--imu-bias-calibration-s", type=float, default=2.0)
@@ -893,6 +904,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         min_inliers=args.min_inliers,
         max_translation_step_m=args.max_translation_step_m,
         min_translation_update_m=args.min_translation_update_m,
+        jitter_threshold=args.jitter_threshold,
         max_yaw_step_rad=math.radians(args.max_yaw_step_deg),
         imu_stale_after_s=args.imu_stale_after_s,
         imu_bias_calibration_s=args.imu_bias_calibration_s,

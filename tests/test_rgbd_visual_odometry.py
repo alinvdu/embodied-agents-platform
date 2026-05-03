@@ -47,6 +47,13 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertEqual(config.min_matches, 8)
         self.assertAlmostEqual(config.max_yaw_step_rad, math.radians(15.0))
 
+    def test_parser_can_disable_jitter_threshold(self) -> None:
+        default_config = config_from_args(build_parser().parse_args([]))
+        debug_config = config_from_args(build_parser().parse_args(["--no-jitter-threshold"]))
+
+        self.assertTrue(default_config.jitter_threshold)
+        self.assertFalse(debug_config.jitter_threshold)
+
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))
 
