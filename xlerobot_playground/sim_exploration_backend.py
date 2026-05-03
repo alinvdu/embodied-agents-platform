@@ -420,6 +420,7 @@ class Nav2PlanResult:
     reason: str
     goal_cell: GridCell | None
     path_cells: tuple[GridCell, ...] = tuple()
+    path_poses: tuple[Pose2D, ...] = tuple()
     path_length_m: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -435,6 +436,7 @@ class Nav2PlanResult:
                 {"x": point.x, "y": point.y}
                 for point in self.path_cells
             ],
+            "path_poses": [pose.to_dict() for pose in self.path_poses],
         }
 
 
@@ -578,6 +580,10 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             reason="planner computed a path on the current known-free occupancy map",
             goal_cell=validation.goal_cell,
             path_cells=tuple(path_cells),
+            path_poses=tuple(
+                point.center_pose(self.scenario.resolution, yaw=goal.target_pose.yaw)
+                for point in path_cells
+            ),
             path_length_m=max(len(path_cells) - 1, 0) * self.scenario.resolution,
         )
         if record:
@@ -794,6 +800,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             ),
             goal_cell=validation.goal_cell,
             path_cells=path_cells,
+            path_poses=tuple(path_poses),
             path_length_m=path_length_m(path_poses),
         )
         if record:
@@ -2914,6 +2921,7 @@ class RosExplorationSession:
         self.pending_trace: dict[str, Any] | None = None
         self.applied_memory_updates: list[dict[str, Any]] = []
         self.last_error: str | None = None
+        self.last_nav2_preview: dict[str, Any] | None = None
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
         self._owns_rclpy = False
@@ -3440,6 +3448,40 @@ class RosExplorationSession:
                 "requested_pose": target_pose.to_dict(),
                 "normalized_pose": normalized_pose,
                 "nav2_result": result.to_dict(),
+                "map": self._build_map_payload(),
+            }
+
+    def preview_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            try:
+                current_pose = self.runtime.current_pose()
+                target_pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", current_pose.yaw if current_pose is not None else 0.0)),
+                )
+            except Exception as exc:
+                return {"status": "rejected", "reason": f"Invalid waypoint pose: {exc}"}
+            goal = self._make_nav2_goal(
+                target_pose,
+                goal_type="manual_waypoint_preview",
+                reason="operator_click_waypoint_preview",
+            )
+            plan = self.nav2.compute_path(goal, record=True)
+            self.last_nav2_preview = {
+                "requested_pose": target_pose.to_dict(),
+                "plan": plan.to_dict(),
+                "created_at": time.time(),
+            }
+            self._push_progress_update(
+                message=f"Previewed Nav2 path to clicked waypoint: {plan.status}.",
+                frontier_id=None,
+            )
+            return {
+                "status": plan.status,
+                "reason": plan.reason,
+                "requested_pose": target_pose.to_dict(),
+                "plan": plan.to_dict(),
                 "map": self._build_map_payload(),
             }
 
@@ -4571,6 +4613,7 @@ class RosExplorationSession:
                     "total_distance_m": round(self.total_distance_m, 3),
                 },
                 "nav2": self.nav2.snapshot(),
+                "nav2_preview": self.last_nav2_preview,
                 "ros_runtime": {
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
@@ -4689,8 +4732,9 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         start_gate: _ExplorationStartGate,
         *,
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        super().__init__(backend, waypoint_navigator=waypoint_navigator)
+        super().__init__(backend, waypoint_navigator=waypoint_navigator, waypoint_previewer=waypoint_previewer)
         self.start_gate = start_gate
 
     def start_explore(self, *, area: str, session: str | None = None, source: str = "operator") -> dict[str, Any]:
@@ -4726,6 +4770,22 @@ class ManiSkillExplorationRunner:
         if not callable(navigate):
             return {"status": "unavailable", "reason": "The active exploration session does not support waypoint navigation."}
         return navigate(pose)
+
+    def preview_waypoint(self, pose: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": (
+                    "No live exploration session is running. For path previews, keep the session alive "
+                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                ),
+            }
+        preview = getattr(session, "preview_manual_waypoint", None)
+        if not callable(preview):
+            return {"status": "unavailable", "reason": "The active exploration session does not support waypoint previews."}
+        return preview(pose)
 
     def run(self) -> dict[str, Any]:
         if self.start_gate is not None:
@@ -5050,11 +5110,13 @@ def main(argv: list[str] | None = None) -> int:
                 backend,
                 start_gate,
                 waypoint_navigator=runner.navigate_to_waypoint,
+                waypoint_previewer=runner.preview_waypoint,
             )
         else:
             controller = LocalExplorationUIController(
                 backend,
                 waypoint_navigator=runner.navigate_to_waypoint,
+                waypoint_previewer=runner.preview_waypoint,
             )
         server = ExplorationReviewServer(
             controller,

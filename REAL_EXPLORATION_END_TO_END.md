@@ -526,7 +526,9 @@ Click `Start Explore` in the UI. The robot should keep its base still, keep pitc
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
-To test map coordinate accuracy, click `Waypoint` in the Map Editing panel, then click a known free-space location in the map. The UI sends that map-frame pose to Nav2. Use this only after the initial scan has completed and the robot is physically clear to move.
+To test map coordinate accuracy without moving, click `Preview Path` in the Map Editing panel, then click a known free-space location in the map. The UI calls Nav2 `ComputePathToPose` and draws the planned path in orange. If the orange path is strange for a waypoint directly in front of the robot, debug Nav2 planning/costmaps before commanding motion.
+
+To actually move, click `Waypoint`, then click the free-space location. The UI sends that map-frame pose to Nav2. Use this only after the initial scan has completed, the preview path looks sane, and the robot is physically clear to move.
 
 For this first OctoMap validation run, keep `--ros-navigation-map-source external`, `--ros-map-topic /projected_map`, and `--ros-map-updates-topic /projected_map_updates`. Do not use `fused_point_cloud`; that path uses the custom Python point-cloud fusion instead of OctoMap. Also keep the extra projected-map snapshot fusion disabled, which is the default. Only add `--ros-fuse-external-projected-map-snapshots` if you intentionally want the exploration runtime to fuse multiple `/projected_map` snapshots itself.
 

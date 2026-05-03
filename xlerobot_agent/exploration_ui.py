@@ -63,6 +63,9 @@ class ExplorationUIController(Protocol):
     def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
     def __init__(
@@ -70,9 +73,11 @@ class LocalExplorationUIController:
         backend: ExplorationBackend,
         *,
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.backend = backend
         self.waypoint_navigator = waypoint_navigator
+        self.waypoint_previewer = waypoint_previewer
 
     def snapshot(self) -> dict[str, Any]:
         return self.backend.snapshot()
@@ -132,6 +137,11 @@ class LocalExplorationUIController:
         if self.waypoint_navigator is None:
             return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
         return self.waypoint_navigator(pose)
+
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        if self.waypoint_previewer is None:
+            return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
+        return self.waypoint_previewer(pose)
 
 
 class RemoteExplorationUIController:
@@ -195,6 +205,9 @@ class RemoteExplorationUIController:
 
     def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote waypoint navigation is not implemented yet."}
+
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote waypoint previews are not implemented yet."}
 
 
 HTML_PAGE = """<!doctype html>
@@ -436,6 +449,7 @@ HTML_PAGE = """<!doctype html>
             <button class="secondary" id="edit-block">Draw Wall</button>
             <button class="secondary" id="edit-clear">Erase Wall</button>
             <button class="secondary" id="edit-reset">Reset Cell</button>
+            <button class="secondary" id="nav-preview">Preview Path</button>
             <button class="primary" id="nav-waypoint">Waypoint</button>
           </div>
           <div id="edit-mode-summary" class="muted" style="margin-top:10px;">Click or drag on the map to add or remove occupancy overrides.</div>
@@ -709,7 +723,9 @@ HTML_PAGE = """<!doctype html>
           ? 'erase wall cells into free space'
           : mapEditMode === 'reset'
             ? 'remove manual overrides'
-            : 'click once to send a Nav2 waypoint';
+            : mapEditMode === 'preview'
+              ? 'click once to preview Nav2 path without moving'
+              : 'click once to send a Nav2 waypoint';
       document.getElementById('edit-mode-summary').textContent = `Map mode: ${mapEditMode} (${verb}). Active frontier: ${activeFrontierId}. Manual walls ${blocked}, manual clears ${cleared}.`;
       const guardrails = ((map.artifacts || {}).guardrail_events || []).slice(-12).reverse();
       const guardrailElement = document.getElementById('guardrail-list');
@@ -822,6 +838,20 @@ HTML_PAGE = """<!doctype html>
           <text x="${p.x + 12}" y="${p.y + 4}" font-size="12" fill="#1d4ed8" font-weight="700">waypoint</text>
         `;
       })() : '';
+      const preview = ((map.artifacts || {}).nav2_preview || {});
+      const previewPlan = preview.plan || null;
+      const previewPath = (previewPlan?.path_poses || []).map((pose) => {
+        const p = project(pose);
+        return `${p.x},${p.y}`;
+      }).join(' ');
+      const previewGoal = preview.requested_pose || null;
+      const previewGoalMarkup = previewGoal ? (() => {
+        const p = project(previewGoal);
+        return `
+          <circle cx="${p.x}" cy="${p.y}" r="8" fill="#f59e0b" opacity="0.92" />
+          <text x="${p.x + 12}" y="${p.y - 8}" font-size="12" fill="#92400e" font-weight="700">preview</text>
+        `;
+      })() : '';
       const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || null;
       const robot = robotPose ? project(robotPose) : null;
       const headingLength = (map.occupancy?.resolution || 0.5) * 2.5;
@@ -838,6 +868,8 @@ HTML_PAGE = """<!doctype html>
         ${semanticEvidence}
         ${semanticPlaces}
         ${frontiers}
+        ${previewPath ? `<polyline points="${previewPath}" fill="none" stroke="#f59e0b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="10 7" opacity="0.95" />` : ''}
+        ${previewGoalMarkup}
         ${manualWaypoint}
         ${robot ? `<circle cx="${robot.x}" cy="${robot.y}" r="11" fill="#a52820" />` : ''}
         ${robot && robotHeading ? `<line x1="${robot.x}" y1="${robot.y}" x2="${robotHeading.x}" y2="${robotHeading.y}" stroke="#6d0f0a" stroke-width="4.5" stroke-linecap="round" />` : ''}
@@ -855,17 +887,21 @@ HTML_PAGE = """<!doctype html>
       svg.onpointerdown = (event) => {
         if (!currentMapBounds) return;
         event.preventDefault();
-        if (mapEditMode === 'waypoint') {
+        if (mapEditMode === 'waypoint' || mapEditMode === 'preview') {
           const world = worldFromMapEvent(map, event);
           const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || {};
           lastManualWaypoint = {x: world.x, y: world.y, yaw: Number(robotPose.yaw || 0)};
           renderMap(currentState);
-          postJson('/api/nav/waypoint', {pose: lastManualWaypoint})
+          const endpoint = mapEditMode === 'preview' ? '/api/nav/preview' : '/api/nav/waypoint';
+          postJson(endpoint, {pose: lastManualWaypoint})
             .then((response) => {
               lastManualWaypoint = response.normalized_pose || response.requested_pose || lastManualWaypoint;
+              if (response.map) {
+                currentState.current_map = response.map;
+              }
               renderMap(currentState);
               if (response.status && response.status !== 'succeeded') {
-                alert((response.status || 'failed') + ': ' + (response.reason || 'Waypoint navigation did not start.'));
+                alert((response.status || 'failed') + ': ' + (response.reason || 'Waypoint request failed.'));
               }
               return refresh();
             })
@@ -991,6 +1027,10 @@ HTML_PAGE = """<!doctype html>
     });
     document.getElementById('edit-reset').addEventListener('click', () => {
       mapEditMode = 'reset';
+      renderExploration(currentState || {});
+    });
+    document.getElementById('nav-preview').addEventListener('click', () => {
+      mapEditMode = 'preview';
       renderExploration(currentState || {});
     });
     document.getElementById('nav-waypoint').addEventListener('click', () => {
@@ -1188,6 +1228,12 @@ class ExplorationReviewServer:
                     return
                 if self.path == "/api/nav/waypoint":
                     response = controller.navigate_to_waypoint(
+                        pose=dict(payload.get("pose", {})),
+                    )
+                    self._send_json(response)
+                    return
+                if self.path == "/api/nav/preview":
+                    response = controller.preview_waypoint(
                         pose=dict(payload.get("pose", {})),
                     )
                     self._send_json(response)
