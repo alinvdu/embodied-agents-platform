@@ -98,6 +98,7 @@ class RealRosBridgeConfig:
     head_points_stale_tolerance_s: float = 0.10
     head_points_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     head_points_update_map_while_base_moving: bool = False
+    scan_active_topic: str = "/xlerobot/scan_active"
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -642,6 +643,7 @@ class RealXLeRobotRosBridge(Node):
         self._last_camera_pose_poll_s = 0.0
         self._base_motion_active = False
         self._head_points_update_map_enabled = True
+        self._scan_active = False
         self._last_head_points_skip_reason = ""
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
@@ -652,6 +654,12 @@ class RealXLeRobotRosBridge(Node):
                 Bool,
                 config.head_points_update_map_enabled_topic,
                 self._on_head_points_update_map_enabled,
+                10,
+            )
+            self.create_subscription(
+                Bool,
+                config.scan_active_topic,
+                self._on_scan_active,
                 10,
             )
         self.timer = self.create_timer(
@@ -738,6 +746,16 @@ class RealXLeRobotRosBridge(Node):
         self._head_points_update_map_enabled = enabled
         state = "enabled" if enabled else "disabled"
         self.get_logger().info(f"PointCloud2 map updates {state} by {self.config.head_points_update_map_enabled_topic}.")
+
+    def _on_scan_active(self, message: Any) -> None:
+        active = bool(message.data)
+        if active == self._scan_active:
+            return
+        self._scan_active = active
+        state = "active" if active else "inactive"
+        self.get_logger().info(f"Scan-active settled PointCloud2 gating is now {state}.")
+        if not active:
+            self._last_head_points_skip_reason = ""
 
     def _start_imu_stream_thread(self, websocket_url: str) -> None:
         self._imu_stream_thread = threading.Thread(
@@ -1128,6 +1146,9 @@ class RealXLeRobotRosBridge(Node):
             return True
         if self.config.head_points_mode != "settled":
             return True
+        if not self._scan_active:
+            self._last_head_points_skip_reason = ""
+            return True
         if self._camera_pose_moving:
             self._log_head_points_skip_once("head moving")
             return False
@@ -1307,7 +1328,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="continuous",
         help=(
             "Use `continuous` for RViz/debug streaming. Use `settled` for OctoMap camera-pan scans: "
-            "PointCloud2 is suppressed while the head is moving and only resumes after the pose settles."
+            "while scan-active is true, PointCloud2 is suppressed while the head is moving and only "
+            "resumes after the pose settles."
         ),
     )
     parser.add_argument(
@@ -1338,6 +1360,14 @@ def build_parser() -> argparse.ArgumentParser:
             "Allow /camera/head/points publication while nonzero /cmd_vel is active. "
             "Default false keeps OctoMap from integrating point clouds during base motion "
             "while live motion mapping is still experimental."
+        ),
+    )
+    parser.add_argument(
+        "--scan-active-topic",
+        default="/xlerobot/scan_active",
+        help=(
+            "std_msgs/Bool scan lifecycle topic. In settled head-points mode, pose-settle suppression "
+            "is applied only while this topic is true."
         ),
     )
     parser.add_argument("--head-laser-frame", default="head_laser")
@@ -1409,6 +1439,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
         head_points_update_map_enabled_topic=args.head_points_update_map_enabled_topic,
         head_points_update_map_while_base_moving=args.head_points_update_map_while_base_moving,
+        scan_active_topic=args.scan_active_topic,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,

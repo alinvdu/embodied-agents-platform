@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import struct
 import tempfile
+import time
 import unittest
 from urllib.error import HTTPError
 
@@ -85,6 +86,19 @@ class _FakeBrainClient:
         return self.payloads[path]
 
 
+class _Frame:
+    def __init__(self, timestamp_s: float) -> None:
+        self.timestamp_s = timestamp_s
+
+
+class _Logger:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.messages.append(message)
+
+
 class RealRosBridgeTests(unittest.TestCase):
     def test_parser_defaults_match_two_wheel_robot_ports(self) -> None:
         args = build_parser().parse_args([])
@@ -99,6 +113,7 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.max_angular_rad_s, 0.20)
         self.assertEqual(config.camera_z_m, 0.35)
         self.assertEqual(config.camera_pan_topic, "/camera/head/pan_rad")
+        self.assertEqual(config.scan_active_topic, "/xlerobot/scan_active")
 
     def test_camera_mount_arguments_are_configurable(self) -> None:
         args = build_parser().parse_args(
@@ -116,6 +131,44 @@ class RealRosBridgeTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertEqual(config.odom_source, "commanded")
+
+    def test_settled_head_points_do_not_wait_for_pose_outside_scan(self) -> None:
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        logger = _Logger()
+        bridge.get_logger = lambda: logger
+        bridge.config = RealRosBridgeConfig(head_points_mode="settled", head_points_settled_delay_s=10.0)
+        bridge._head_points_update_map_enabled = True
+        bridge._base_motion_active = False
+        bridge._scan_active = False
+        bridge._camera_pose_moving = True
+        bridge._camera_pose_updated_s = None
+        bridge._camera_pose_received_s = None
+        bridge._last_head_points_skip_reason = "waiting for settled pose/frame"
+
+        self.assertTrue(bridge._head_points_publish_allowed(_Frame(time.monotonic())))
+        self.assertEqual(bridge._last_head_points_skip_reason, "")
+        self.assertEqual(logger.messages, [])
+
+    def test_settled_head_points_wait_for_pose_during_scan(self) -> None:
+        now_s = time.monotonic()
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        logger = _Logger()
+        bridge.get_logger = lambda: logger
+        bridge.config = RealRosBridgeConfig(head_points_mode="settled", head_points_settled_delay_s=10.0)
+        bridge._head_points_update_map_enabled = True
+        bridge._base_motion_active = False
+        bridge._scan_active = True
+        bridge._camera_pose_moving = False
+        bridge._camera_pose_updated_s = now_s
+        bridge._camera_pose_received_s = now_s
+        bridge._last_head_points_skip_reason = ""
+
+        self.assertFalse(bridge._head_points_publish_allowed(_Frame(now_s)))
+        self.assertEqual(bridge._last_head_points_skip_reason, "waiting for settled pose/frame")
+        self.assertEqual(
+            logger.messages,
+            ["Suppressing /camera/head/points in settled mode: waiting for settled pose/frame."],
+        )
 
     def test_robot_brain_url_selects_remote_hardware_endpoint(self) -> None:
         args = build_parser().parse_args(
