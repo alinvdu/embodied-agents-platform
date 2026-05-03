@@ -405,7 +405,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --camera-pan-topic /camera/head/pan_rad \
   --scan-active-topic /xlerobot/scan_active \
-  --freeze-during-head-motion \
+  --freeze-orientation-during-scan \
   --imu-frame-convention base_link \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
@@ -416,7 +416,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
 
-Keep `--freeze-during-head-motion` enabled for stationary camera-pan mapping. It is now a compatibility alias for scan-event orientation freeze: `/xlerobot/scan_active=true` freezes only odom yaw, while RGB-D translation remains enabled. Head pan position alone no longer freezes odom. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after scanning finishes.
+Keep `--freeze-orientation-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes only odom yaw, while RGB-D translation remains enabled. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after scanning finishes.
 
 Quick checks:
 
@@ -445,6 +445,10 @@ python -m xlerobot_playground.real_nav2_config \
   --max-laser-range 4.0 \
   --max-linear-velocity 0.03 \
   --max-angular-velocity 0.18 \
+  --min-linear-velocity-threshold 0.01 \
+  --min-angular-velocity-threshold 0.02 \
+  --min-speed-theta 0.02 \
+  --rotate-to-goal-slowing-factor 1.0 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
   --transform-tolerance-s 0.5 \
@@ -453,6 +457,8 @@ python -m xlerobot_playground.real_nav2_config \
   --xy-goal-tolerance-m 0.18 \
   --yaw-goal-tolerance-rad 3.14
 ```
+
+The minimum velocity settings stop DWB from choosing tiny near-zero commands that the real base cannot execute. With `max_angular_velocity=0.18`, the old `min_speed_theta=0.0` allowed the first nonzero angular sample to be `0.00947 rad/s`, which shows up as `theta.vel=0.5428 deg/s` on the robot brain and can make Nav2 crawl at the goal. The lower `RotateToGoal.slowing_factor` also reduces the already-slow near-target slowdown.
 
 ### Terminal OC-5: Nav2
 

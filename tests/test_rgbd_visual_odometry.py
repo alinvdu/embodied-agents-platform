@@ -152,6 +152,17 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         node._scan_orientation_frozen = True
         self.assertTrue(node._orientation_freeze_active())
 
+    def test_pan_callback_only_updates_camera_state(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.camera_pan_rad = 0.0
+        node._last_camera_pan_rad = 0.0
+
+        node._on_camera_pan(type("Message", (), {"data": math.radians(45.0)})())
+
+        self.assertAlmostEqual(node.camera_pan_rad, math.radians(45.0))
+        self.assertAlmostEqual(node._last_camera_pan_rad, math.radians(45.0))
+        self.assertFalse(hasattr(node, "_last_head_motion_s"))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,8 +64,6 @@ class RgbdVoConfig:
     camera_pan_topic: str = "/camera/head/pan_rad"
     scan_active_topic: str = "/xlerobot/scan_active"
     freeze_orientation_during_scan: bool = True
-    head_pan_freeze_threshold_rad: float = math.radians(1.0)
-    head_pitch_freeze_threshold_rad: float = math.radians(1.0)
     publish_rate_hz: float = 30.0
     min_depth_m: float = 0.15
     max_depth_m: float = 4.0
@@ -383,7 +381,6 @@ class RgbdVisualOdometryNode(Node):
         self.camera_pan_rad = 0.0
         self._last_camera_pitch_rad = self.camera_pitch_rad
         self._last_camera_pan_rad = self.camera_pan_rad
-        self._last_head_motion_s: float | None = None
         self._scan_orientation_frozen = False
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
@@ -543,15 +540,11 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_camera_pitch(self, message: Any) -> None:
         pitch_rad = float(message.data)
-        if abs(pitch_rad - self._last_camera_pitch_rad) >= self.config.head_pitch_freeze_threshold_rad:
-            self._last_head_motion_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
         self.camera_pitch_rad = pitch_rad
         self._last_camera_pitch_rad = pitch_rad
 
     def _on_camera_pan(self, message: Any) -> None:
         pan_rad = float(message.data)
-        if abs(pan_rad - self._last_camera_pan_rad) >= self.config.head_pan_freeze_threshold_rad:
-            self._last_head_motion_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
         self.camera_pan_rad = pan_rad
         self._last_camera_pan_rad = pan_rad
 
@@ -672,7 +665,6 @@ class RgbdVisualOdometryNode(Node):
         self.get_logger().info(
             "RGB-D VO orientation freeze active: "
             f"scan_active={self._scan_orientation_frozen} "
-            f"pan_deg={math.degrees(self.camera_pan_rad):.3f} "
             f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
         )
 
@@ -852,8 +844,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.75,
         help="Deprecated compatibility option; scan-active events now control orientation freeze.",
     )
-    parser.add_argument("--head-pan-freeze-threshold-deg", type=float, default=1.0)
-    parser.add_argument("--head-pitch-freeze-threshold-deg", type=float, default=1.0)
+    parser.add_argument(
+        "--head-pan-freeze-threshold-deg",
+        type=float,
+        default=1.0,
+        help="Deprecated compatibility option; camera pan no longer controls odom freeze.",
+    )
+    parser.add_argument(
+        "--head-pitch-freeze-threshold-deg",
+        type=float,
+        default=1.0,
+        help="Deprecated compatibility option; camera pitch no longer controls odom freeze.",
+    )
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
     parser.add_argument("--min-depth-m", type=float, default=0.15)
     parser.add_argument("--max-depth-m", type=float, default=4.0)
@@ -922,8 +924,6 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
             if args.freeze_orientation_during_scan is None
             else bool(args.freeze_orientation_during_scan)
         ),
-        head_pan_freeze_threshold_rad=math.radians(args.head_pan_freeze_threshold_deg),
-        head_pitch_freeze_threshold_rad=math.radians(args.head_pitch_freeze_threshold_deg),
         publish_rate_hz=args.publish_rate_hz,
         min_depth_m=args.min_depth_m,
         max_depth_m=args.max_depth_m,

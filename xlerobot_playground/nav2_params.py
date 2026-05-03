@@ -97,6 +97,9 @@ def patch_nav2_params(
     voxel_z_voxels: int = 32,
     max_linear_velocity: float = 0.65,
     max_angular_velocity: float = 0.45,
+    min_linear_velocity_threshold: float = 0.01,
+    min_angular_velocity_threshold: float = 0.02,
+    min_speed_theta: float = 0.02,
     trans_stopped_velocity: float = 0.05,
     path_align_scale: float = 16.0,
     goal_align_scale: float = 12.0,
@@ -267,6 +270,8 @@ def patch_nav2_params(
     controller = node_params("controller_server")
     controller["odom_topic"] = "/odom"
     controller["transform_tolerance"] = transform_tolerance_s
+    controller["min_x_velocity_threshold"] = min_linear_velocity_threshold
+    controller["min_theta_velocity_threshold"] = min_angular_velocity_threshold
     progress_checker = controller.setdefault("progress_checker", {})
     progress_checker["plugin"] = progress_checker.get("plugin", "nav2_controller::SimpleProgressChecker")
     progress_checker["required_movement_radius"] = progress_required_movement_radius
@@ -280,6 +285,7 @@ def patch_nav2_params(
         follow_path["max_vel_x"] = max_linear_velocity
         follow_path["max_speed_xy"] = max_linear_velocity
         follow_path["max_vel_theta"] = max_angular_velocity
+        follow_path["min_speed_theta"] = min(min_speed_theta, max_angular_velocity)
         follow_path["trans_stopped_velocity"] = trans_stopped_velocity
         if "PathAlign.scale" in follow_path:
             follow_path["PathAlign.scale"] = path_align_scale
@@ -300,6 +306,9 @@ def patch_nav2_params(
     if isinstance(velocity_smoother.get("min_velocity"), list) and len(velocity_smoother["min_velocity"]) >= 3:
         velocity_smoother["min_velocity"][0] = -max_linear_velocity
         velocity_smoother["min_velocity"][2] = -max_angular_velocity
+    if isinstance(velocity_smoother.get("deadband_velocity"), list) and len(velocity_smoother["deadband_velocity"]) >= 3:
+        velocity_smoother["deadband_velocity"][0] = min_linear_velocity_threshold
+        velocity_smoother["deadband_velocity"][2] = min_angular_velocity_threshold
 
     amcl = node_params("amcl")
     if amcl:

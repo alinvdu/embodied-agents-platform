@@ -26,6 +26,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-width-m", type=float, default=0.459)
     parser.add_argument("--max-linear-velocity", type=float, default=0.03)
     parser.add_argument("--max-angular-velocity", type=float, default=0.18)
+    parser.add_argument(
+        "--min-linear-velocity-threshold",
+        type=float,
+        default=0.01,
+        help="Controller velocity threshold below which tiny x commands are treated as zero.",
+    )
+    parser.add_argument(
+        "--min-angular-velocity-threshold",
+        type=float,
+        default=0.02,
+        help="Controller velocity threshold below which tiny theta commands are treated as zero.",
+    )
+    parser.add_argument(
+        "--min-speed-theta",
+        type=float,
+        default=0.02,
+        help="Smallest nonzero angular speed sampled by DWB; keep above the real base deadband.",
+    )
+    parser.add_argument(
+        "--rotate-to-goal-slowing-factor",
+        type=float,
+        default=1.0,
+        help="DWB RotateToGoal slowdown factor. Lower values reduce near-goal crawling on the real base.",
+    )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
@@ -77,6 +101,10 @@ def main(argv: list[str] | None = None) -> int:
         raytrace_max_range=args.max_laser_range,
         max_linear_velocity=args.max_linear_velocity,
         max_angular_velocity=args.max_angular_velocity,
+        min_linear_velocity_threshold=args.min_linear_velocity_threshold,
+        min_angular_velocity_threshold=args.min_angular_velocity_threshold,
+        min_speed_theta=args.min_speed_theta,
+        rotate_to_goal_slowing_factor=args.rotate_to_goal_slowing_factor,
         local_costmap_width=args.local_costmap_width,
         local_costmap_height=args.local_costmap_height,
         transform_tolerance_s=args.transform_tolerance_s,

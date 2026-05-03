@@ -178,12 +178,28 @@ class Nav2BridgeTests(unittest.TestCase):
             0.45,
         )
         self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["min_x_velocity_threshold"],
+            0.01,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["min_theta_velocity_threshold"],
+            0.02,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["FollowPath"]["min_speed_theta"],
+            0.02,
+        )
+        self.assertEqual(
             patched["velocity_smoother"]["ros__parameters"]["max_velocity"][0],
             0.65,
         )
         self.assertEqual(
             patched["velocity_smoother"]["ros__parameters"]["max_velocity"][2],
             0.45,
+        )
+        self.assertEqual(
+            patched["velocity_smoother"]["ros__parameters"]["deadband_velocity"],
+            [0.01, 0.0, 0.02],
         )
         self.assertEqual(
             patched["controller_server"]["ros__parameters"]["FollowPath"]["RotateToGoal.scale"],
