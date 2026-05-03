@@ -408,6 +408,7 @@ class RgbdVisualOdometryNode(Node):
         self.rejected_updates = 0
         self._diagnostics = RgbdVoDiagnostics()
         self._last_diagnostics_log_s: float | None = None
+        self._last_head_freeze_log_s: float | None = None
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, 10)
         self.create_subscription(Image, config.depth_topic, self._on_depth, 10)
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
@@ -644,15 +645,30 @@ class RgbdVisualOdometryNode(Node):
         )
         return float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s * dt
 
-    def _head_motion_freeze_active(self) -> bool:
-        if not self.config.freeze_during_head_motion:
-            return False
-        if abs(self.camera_pan_rad) >= self.config.head_pan_freeze_threshold_rad:
-            return True
+    def _head_motion_freeze_reason(self) -> tuple[str | None, float]:
         now_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
+        if not self.config.freeze_during_head_motion:
+            return None, now_s
+        if abs(self.camera_pan_rad) >= self.config.head_pan_freeze_threshold_rad:
+            return "pan_away_from_zero", now_s
         if self._last_head_motion_s is not None and now_s - self._last_head_motion_s < self.config.head_motion_freeze_settle_s:
-            return True
-        return False
+            return "settling_after_head_motion", now_s
+        return None, now_s
+
+    def _log_head_motion_freeze_return(self, *, now_s: float, reason: str | None) -> None:
+        if self._last_head_freeze_log_s is not None and now_s - self._last_head_freeze_log_s < 1.0:
+            return
+        self._last_head_freeze_log_s = now_s
+        settle_age_s = None if self._last_head_motion_s is None else max(now_s - self._last_head_motion_s, 0.0)
+        self.get_logger().info(
+            "RGB-D VO early return: head-motion freeze active "
+            f"reason={reason or 'unknown'} "
+            f"pan_deg={math.degrees(self.camera_pan_rad):.3f} "
+            f"pan_threshold_deg={math.degrees(self.config.head_pan_freeze_threshold_rad):.3f} "
+            f"settle_age_s={settle_age_s if settle_age_s is not None else 'none'} "
+            f"settle_required_s={self.config.head_motion_freeze_settle_s:.3f} "
+            f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
+        )
 
     def _reset_imu_origin_to_current_pose(self) -> None:
         if self._latest_imu_orientation_unwrapped_yaw_rad is not None:
@@ -669,8 +685,8 @@ class RgbdVisualOdometryNode(Node):
     def step(self) -> None:
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
-        head_motion_frozen = self._head_motion_freeze_active()
-        if head_motion_frozen:
+        head_motion_freeze_reason, head_motion_freeze_now_s = self._head_motion_freeze_reason()
+        if head_motion_freeze_reason is not None:
             self.previous_frame = None
             self.planar_velocity_x_m_s = 0.0
             self.planar_velocity_y_m_s = 0.0
@@ -681,6 +697,10 @@ class RgbdVisualOdometryNode(Node):
                 )
             self._head_motion_frozen = True
             self._last_prediction_stamp_s = stamp_s
+            self._log_head_motion_freeze_return(
+                now_s=head_motion_freeze_now_s,
+                reason=head_motion_freeze_reason,
+            )
             self._log_diagnostics(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
             self._publish_odom(stamp)
             return
