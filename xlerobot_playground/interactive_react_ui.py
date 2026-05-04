@@ -114,7 +114,12 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 
     function cellCenterPose(map, cell) {
       const resolution = map?.occupancy?.resolution || 0.25;
-      return {x: (cell.cell_x + 0.5) * resolution, y: (cell.cell_y + 0.5) * resolution, yaw: 0};
+      const bounds = mapBounds(map);
+      return {
+        x: bounds.min_x + (cell.cell_x + 0.5) * resolution,
+        y: bounds.min_y + (cell.cell_y + 0.5) * resolution,
+        yaw: 0,
+      };
     }
 
     function StatGrid({state, mapEditMode}) {
@@ -240,7 +245,10 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
         if (!matrix) return null;
         const local = point.matrixTransform(matrix.inverse());
         const world = worldFromSvgPoint(bounds, local.x, local.y);
-        const cell = {cell_x: Math.floor(world.x / resolution), cell_y: Math.floor(world.y / resolution)};
+        const cell = {
+          cell_x: Math.floor((world.x - bounds.min_x) / resolution),
+          cell_y: Math.floor((world.y - bounds.min_y) / resolution),
+        };
         cell.key = `${cell.cell_x}:${cell.cell_y}`;
         return cell;
       }, [bounds, map, resolution]);
@@ -342,8 +350,8 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
 
       occupancyRef.current = new Map();
       const occupancyCells = (map.occupancy?.cells || []).map((cell) => {
-        const cellX = Math.floor(Number(cell.x) / resolution);
-        const cellY = Math.floor(Number(cell.y) / resolution);
+        const cellX = Math.floor((Number(cell.x) - bounds.min_x) / resolution);
+        const cellY = Math.floor((Number(cell.y) - bounds.min_y) / resolution);
         occupancyRef.current.set(`${cellX}:${cellY}`, {state: cell.state, manual_override: cell.manual_override || null});
         const p = project({x: cell.x, y: cell.y});
         const p2 = project({x: Number(cell.x) + resolution, y: Number(cell.y) + resolution});

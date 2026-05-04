@@ -4195,17 +4195,18 @@ INTERACTIVE_HTML = """<!doctype html>
       const world = worldFromSvgViewPoint(b, point.x, point.y);
       const resolution = map.occupancy?.resolution || 0.25;
       const cell = {
-        cell_x: Math.floor(world.x / resolution),
-        cell_y: Math.floor(world.y / resolution),
+        cell_x: Math.floor((world.x - b.min_x) / resolution),
+        cell_y: Math.floor((world.y - b.min_y) / resolution),
       };
       cell.key = `${cell.cell_x}:${cell.cell_y}`;
       return cell;
     }
     function cellCenterPose(map, cell) {
       const resolution = map.occupancy?.resolution || 0.25;
+      const b = bounds(map);
       return {
-        x: (cell.cell_x + 0.5) * resolution,
-        y: (cell.cell_y + 0.5) * resolution,
+        x: b.min_x + (cell.cell_x + 0.5) * resolution,
+        y: b.min_y + (cell.cell_y + 0.5) * resolution,
         yaw: 0
       };
     }
@@ -4309,11 +4310,12 @@ INTERACTIVE_HTML = """<!doctype html>
       const map = state.map;
       if (!map) { svg.innerHTML = '<text x="40" y="60">No map.</text>'; return; }
       const project = projector(bounds(map));
+      const b = bounds(map);
       const res = map.occupancy.resolution || 0.25;
       currentOccupancyCellStates = new Map();
       const cells = (map.occupancy.cells || []).map((c) => {
-        const cellX = Math.floor(c.x / res);
-        const cellY = Math.floor(c.y / res);
+        const cellX = Math.floor((c.x - b.min_x) / res);
+        const cellY = Math.floor((c.y - b.min_y) / res);
         currentOccupancyCellStates.set(`${cellX}:${cellY}`, {
           state: c.state,
           manual_override: c.manual_override || null,
