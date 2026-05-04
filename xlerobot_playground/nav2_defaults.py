@@ -4,10 +4,13 @@ import os
 from pathlib import Path
 
 
-DEFAULT_NAV2_BEHAVIOR_TREE_FILENAME = "navigate_to_pose_w_replanning_and_recovery.xml"
+DEFAULT_NAV2_BEHAVIOR_TREE_FILENAME = "navigate_to_pose_replanning_no_recovery.xml"
 
 
 def default_nav2_behavior_tree() -> str:
+    repo_candidate = Path(__file__).resolve().parent / "nav2_behavior_trees" / DEFAULT_NAV2_BEHAVIOR_TREE_FILENAME
+    if repo_candidate.exists():
+        return str(repo_candidate)
     ros_distro = os.environ.get("ROS_DISTRO", "humble")
     candidate = (
         Path("/opt/ros")

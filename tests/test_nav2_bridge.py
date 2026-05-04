@@ -247,6 +247,34 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertTrue(local_scan["inf_is_valid"])
         self.assertEqual(local_scan["observation_persistence"], 0.35)
 
+    def test_nav2_params_can_remove_heading_alignment_critics(self) -> None:
+        base = {
+            "controller_server": {
+                "ros__parameters": {
+                    "FollowPath": {
+                        "critics": ["RotateToGoal", "GoalAlign", "PathAlign", "PathDist", "GoalDist"],
+                        "RotateToGoal.scale": 8.0,
+                        "RotateToGoal.slowing_factor": 3.0,
+                        "GoalAlign.scale": 12.0,
+                        "PathAlign.scale": 16.0,
+                    }
+                }
+            }
+        }
+
+        patched = patch_nav2_params(
+            base,
+            rotate_to_goal_scale=0.0,
+            goal_align_scale=0.0,
+            path_align_scale=0.0,
+        )
+
+        follow_path = patched["controller_server"]["ros__parameters"]["FollowPath"]
+        self.assertEqual(follow_path["critics"], ["PathDist", "GoalDist"])
+        self.assertNotIn("RotateToGoal.scale", follow_path)
+        self.assertNotIn("GoalAlign.scale", follow_path)
+        self.assertNotIn("PathAlign.scale", follow_path)
+
     def test_slam_toolbox_params_use_standard_frames(self) -> None:
         params = render_slam_toolbox_params()
         slam = params["slam_toolbox"]["ros__parameters"]

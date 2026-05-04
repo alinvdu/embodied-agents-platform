@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <PipelineSequence name="NavigateWithReplanning">
+      <RateController hz="1.0">
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="{planner_id}"/>
+      </RateController>
+      <FollowPath path="{path}" controller_id="{controller_id}" goal_checker_id="{goal_checker_id}"/>
+    </PipelineSequence>
+  </BehaviorTree>
+</root>

@@ -40,6 +40,16 @@ def dump_yaml(path: str | Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, handle, sort_keys=False)
 
 
+def _remove_critic(root: dict[str, Any], critic_name: str) -> None:
+    critics = root.get("critics")
+    if isinstance(critics, list):
+        root["critics"] = [item for item in critics if item != critic_name]
+    prefix = f"{critic_name}."
+    for key in list(root):
+        if key.startswith(prefix):
+            root.pop(key, None)
+
+
 def render_slam_toolbox_params(
     *,
     use_sim_time: bool = True,
@@ -287,11 +297,17 @@ def patch_nav2_params(
         follow_path["max_vel_theta"] = max_angular_velocity
         follow_path["min_speed_theta"] = min(min_speed_theta, max_angular_velocity)
         follow_path["trans_stopped_velocity"] = trans_stopped_velocity
-        if "PathAlign.scale" in follow_path:
+        if path_align_scale <= 0.0:
+            _remove_critic(follow_path, "PathAlign")
+        elif "PathAlign.scale" in follow_path:
             follow_path["PathAlign.scale"] = path_align_scale
-        if "GoalAlign.scale" in follow_path:
+        if goal_align_scale <= 0.0:
+            _remove_critic(follow_path, "GoalAlign")
+        elif "GoalAlign.scale" in follow_path:
             follow_path["GoalAlign.scale"] = goal_align_scale
-        if "RotateToGoal.scale" in follow_path:
+        if rotate_to_goal_scale <= 0.0:
+            _remove_critic(follow_path, "RotateToGoal")
+        elif "RotateToGoal.scale" in follow_path:
             follow_path["RotateToGoal.scale"] = rotate_to_goal_scale
         if "RotateToGoal.slowing_factor" in follow_path:
             follow_path["RotateToGoal.slowing_factor"] = rotate_to_goal_slowing_factor

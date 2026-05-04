@@ -50,6 +50,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.0,
         help="DWB RotateToGoal slowdown factor. Lower values reduce near-goal crawling on the real base.",
     )
+    parser.add_argument(
+        "--path-align-scale",
+        type=float,
+        default=0.0,
+        help="DWB PathAlign critic scale. Default 0 removes path heading alignment for short real-robot moves.",
+    )
+    parser.add_argument(
+        "--goal-align-scale",
+        type=float,
+        default=0.0,
+        help="DWB GoalAlign critic scale. Default 0 removes final heading alignment for exploration waypoints.",
+    )
+    parser.add_argument(
+        "--rotate-to-goal-scale",
+        type=float,
+        default=0.0,
+        help="DWB RotateToGoal critic scale. Default 0 removes final rotate-in-place behavior.",
+    )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
@@ -104,6 +122,9 @@ def main(argv: list[str] | None = None) -> int:
         min_linear_velocity_threshold=args.min_linear_velocity_threshold,
         min_angular_velocity_threshold=args.min_angular_velocity_threshold,
         min_speed_theta=args.min_speed_theta,
+        path_align_scale=args.path_align_scale,
+        goal_align_scale=args.goal_align_scale,
+        rotate_to_goal_scale=args.rotate_to_goal_scale,
         rotate_to_goal_slowing_factor=args.rotate_to_goal_slowing_factor,
         local_costmap_width=args.local_costmap_width,
         local_costmap_height=args.local_costmap_height,
