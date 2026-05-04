@@ -286,10 +286,12 @@ def patch_nav2_params(
     progress_checker["plugin"] = progress_checker.get("plugin", "nav2_controller::SimpleProgressChecker")
     progress_checker["required_movement_radius"] = progress_required_movement_radius
     progress_checker["movement_time_allowance"] = progress_movement_time_allowance_s
-    goal_checker = controller.setdefault("general_goal_checker", {})
-    goal_checker["plugin"] = goal_checker.get("plugin", "nav2_controller::SimpleGoalChecker")
+    controller["goal_checker_plugins"] = ["goal_checker"]
+    controller.pop("general_goal_checker", None)
+    goal_checker = controller.setdefault("goal_checker", {})
+    goal_checker["plugin"] = "nav2_controller::PositionGoalChecker"
     goal_checker["xy_goal_tolerance"] = xy_goal_tolerance_m
-    goal_checker["yaw_goal_tolerance"] = yaw_goal_tolerance_rad
+    goal_checker["stateful"] = True
     follow_path = controller.get("FollowPath")
     if isinstance(follow_path, dict):
         follow_path["max_vel_x"] = max_linear_velocity

@@ -53,20 +53,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--path-align-scale",
         type=float,
-        default=0.0,
-        help="DWB PathAlign critic scale. Default 0 removes path heading alignment for short real-robot moves.",
+        default=16.0,
+        help="DWB PathAlign critic scale. Set 0 to remove path heading alignment while debugging.",
     )
     parser.add_argument(
         "--goal-align-scale",
         type=float,
-        default=0.0,
-        help="DWB GoalAlign critic scale. Default 0 removes final heading alignment for exploration waypoints.",
+        default=12.0,
+        help="DWB GoalAlign critic scale. Set 0 to remove final heading alignment while debugging.",
     )
     parser.add_argument(
         "--rotate-to-goal-scale",
         type=float,
-        default=0.0,
-        help="DWB RotateToGoal critic scale. Default 0 removes final rotate-in-place behavior.",
+        default=8.0,
+        help="DWB RotateToGoal critic scale. Goal completion is still XY-only via PositionGoalChecker.",
     )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)

@@ -448,9 +448,6 @@ python -m xlerobot_playground.real_nav2_config \
   --min-linear-velocity-threshold 0.01 \
   --min-angular-velocity-threshold 0.02 \
   --min-speed-theta 0.02 \
-  --path-align-scale 0.0 \
-  --goal-align-scale 0.0 \
-  --rotate-to-goal-scale 0.0 \
   --rotate-to-goal-slowing-factor 1.0 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
@@ -461,7 +458,7 @@ python -m xlerobot_playground.real_nav2_config \
   --yaw-goal-tolerance-rad 3.14
 ```
 
-The minimum velocity settings stop DWB from choosing tiny near-zero commands that the real base cannot execute. With `max_angular_velocity=0.18`, the old `min_speed_theta=0.0` allowed the first nonzero angular sample to be `0.00947 rad/s`, which shows up as `theta.vel=0.5428 deg/s` on the robot brain and can make Nav2 crawl at the goal. The alignment settings remove DWB's path-heading, goal-heading, and rotate-to-goal critics for real exploration waypoints, so nearby goals are treated as position targets instead of final-pose alignment problems.
+The minimum velocity settings stop DWB from choosing tiny near-zero commands that the real base cannot execute. With `max_angular_velocity=0.18`, the old `min_speed_theta=0.0` allowed the first nonzero angular sample to be `0.00947 rad/s`, which shows up as `theta.vel=0.5428 deg/s` on the robot brain and can make Nav2 crawl at the goal. The generated controller uses Nav2's `PositionGoalChecker`, so exploration waypoints complete on XY position and ignore final yaw.
 
 ### Terminal OC-5: Nav2
 

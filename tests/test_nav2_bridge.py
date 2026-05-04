@@ -214,13 +214,18 @@ class Nav2BridgeTests(unittest.TestCase):
             25.0,
         )
         self.assertEqual(
-            patched["controller_server"]["ros__parameters"]["general_goal_checker"]["xy_goal_tolerance"],
-            0.18,
+            patched["controller_server"]["ros__parameters"]["goal_checker_plugins"],
+            ["goal_checker"],
         )
         self.assertEqual(
-            patched["controller_server"]["ros__parameters"]["general_goal_checker"]["yaw_goal_tolerance"],
-            3.14,
+            patched["controller_server"]["ros__parameters"]["goal_checker"]["plugin"],
+            "nav2_controller::PositionGoalChecker",
         )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["goal_checker"]["xy_goal_tolerance"],
+            0.18,
+        )
+        self.assertTrue(patched["controller_server"]["ros__parameters"]["goal_checker"]["stateful"])
 
     def test_nav2_params_can_keep_local_scan_obstacles_when_explicitly_enabled(self) -> None:
         base = {
