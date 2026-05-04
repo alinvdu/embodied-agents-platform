@@ -65,6 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
+    parser.add_argument("--ros-scan-active-release-delay-s", type=float, default=3.0)
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
@@ -152,6 +153,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_point_cloud_topic,
         "--ros-scan-active-topic",
         args.ros_scan_active_topic,
+        "--ros-scan-active-release-delay-s",
+        str(args.ros_scan_active_release_delay_s),
         "--ros-rgb-topic",
         args.ros_rgb_topic,
         "--ros-imu-topic",

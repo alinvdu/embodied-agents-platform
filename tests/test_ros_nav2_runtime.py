@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 from xlerobot_agent.exploration import Pose2D
 from xlerobot_playground.ros_nav2_runtime import (
@@ -44,6 +45,22 @@ class RosNav2RuntimeTests(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_scan_active_release_waits_configured_delay(self) -> None:
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.config = SimpleNamespace(scan_active_release_delay_s=3.0)
+                self.events: list[bool] = []
+
+            def _set_scan_active_if_available(self, active: bool) -> None:
+                self.events.append(active)
+
+        runtime = FakeRuntime()
+        with patch("xlerobot_playground.ros_nav2_runtime.time.sleep") as sleep:
+            RosExplorationRuntime._release_scan_active_after_delay(runtime)
+
+        sleep.assert_called_once_with(3.0)
+        self.assertEqual(runtime.events, [False])
 
     def test_camera_pan_scan_captures_outward_sweeps_only_and_restores_center(self) -> None:
         class FakeRuntime:

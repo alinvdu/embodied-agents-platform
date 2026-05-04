@@ -26,6 +26,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
         self.assertEqual(translated[translated.index("--ros-scan-active-topic") + 1], "/xlerobot/scan_active")
+        self.assertEqual(translated[translated.index("--ros-scan-active-release-delay-s") + 1], "3.0")
         self.assertIn("--no-pause-for-operator-approval", translated)
 
     def test_explicit_llm_and_ui_options_are_preserved(self) -> None:

@@ -512,6 +512,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-scan-active-topic /xlerobot/scan_active \
+  --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
@@ -571,6 +572,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-scan-active-topic /xlerobot/scan_active \
+  --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \

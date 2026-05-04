@@ -268,6 +268,7 @@ class RosRuntimeConfig:
     point_cloud_topic: str = "/camera/head/points"
     point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     scan_active_topic: str = "/xlerobot/scan_active"
+    scan_active_release_delay_s: float = 3.0
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
@@ -836,6 +837,12 @@ class RosExplorationRuntime(Node):
     def _set_scan_active_if_available(self, active: bool) -> None:
         self.set_scan_active(active)
 
+    def _release_scan_active_after_delay(self) -> None:
+        delay_s = max(float(getattr(self.config, "scan_active_release_delay_s", 0.0)), 0.0)
+        if delay_s > 0.0:
+            time.sleep(delay_s)
+        self._set_scan_active_if_available(False)
+
     def drain_scan_observations(self, since_index: int) -> tuple[list[dict[str, Any]], int]:
         self.spin_for(0.05)
         stop_index = len(self.scan_observations)
@@ -999,7 +1006,7 @@ class RosExplorationRuntime(Node):
             raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
         finally:
             self._use_turn_feedback_for_scan_pose = False
-            self._set_scan_active_if_available(False)
+            self._release_scan_active_after_delay()
         observations = _select_turnaround_scan_observations(raw_observations, sample_count=sample_count)
         end_pose = self.current_pose()
         event["elapsed_s"] = round(time.time() - start_time, 3)
@@ -1144,7 +1151,10 @@ class RosExplorationRuntime(Node):
                 event["restore_error"] = str(exc)
             finally:
                 if hasattr(self, "_set_scan_active_if_available"):
-                    self._set_scan_active_if_available(False)
+                    if hasattr(self, "_release_scan_active_after_delay"):
+                        self._release_scan_active_after_delay()
+                    else:
+                        self._set_scan_active_if_available(False)
 
         raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
         if not self.config.publish_internal_navigation_map:
