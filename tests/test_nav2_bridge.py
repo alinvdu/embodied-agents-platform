@@ -141,10 +141,17 @@ class Nav2BridgeTests(unittest.TestCase):
             footprint=rectangular_footprint(length_m=0.3913, width_m=0.459),
         )
 
-        local_scan = patched["local_costmap"]["local_costmap"]["ros__parameters"]["voxel_layer"]["scan"]
-        self.assertEqual(local_scan["topic"], "/bridge/scan")
-        self.assertTrue(local_scan["inf_is_valid"])
-        self.assertEqual(local_scan["observation_persistence"], 0.35)
+        local_costmap = patched["local_costmap"]["local_costmap"]["ros__parameters"]
+        self.assertEqual(local_costmap["plugins"], ["static_layer"])
+        self.assertNotIn("voxel_layer", local_costmap)
+        self.assertNotIn("obstacle_layer", local_costmap)
+        self.assertEqual(local_costmap["static_layer"]["map_topic"], "/projected_map")
+        self.assertTrue(local_costmap["static_layer"]["subscribe_to_updates"])
+        self.assertFalse(local_costmap["static_layer"]["map_subscribe_transient_local"])
+        self.assertEqual(
+            patched["global_costmap"]["global_costmap"]["ros__parameters"]["static_layer"]["map_topic"],
+            "/projected_map",
+        )
         self.assertNotIn("obstacle_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
         self.assertNotIn("obstacle_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"])
         self.assertEqual(
@@ -159,10 +166,6 @@ class Nav2BridgeTests(unittest.TestCase):
         self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"])
         self.assertEqual(patched["global_costmap"]["global_costmap"]["ros__parameters"]["footprint_padding"], 0.0)
         self.assertEqual(patched["local_costmap"]["local_costmap"]["ros__parameters"]["global_frame"], "odom")
-        self.assertEqual(
-            patched["local_costmap"]["local_costmap"]["ros__parameters"]["voxel_layer"]["z_voxels"],
-            32,
-        )
         self.assertEqual(patched["bt_navigator"]["ros__parameters"]["odom_topic"], "/odom")
         self.assertEqual(patched["amcl"]["ros__parameters"]["base_frame_id"], "base_link")
         self.assertFalse(patched["amcl"]["ros__parameters"]["tf_broadcast"])
@@ -175,6 +178,18 @@ class Nav2BridgeTests(unittest.TestCase):
             0.45,
         )
         self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["min_x_velocity_threshold"],
+            0.01,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["min_theta_velocity_threshold"],
+            0.02,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["FollowPath"]["min_speed_theta"],
+            0.02,
+        )
+        self.assertEqual(
             patched["velocity_smoother"]["ros__parameters"]["max_velocity"][0],
             0.65,
         )
@@ -183,9 +198,87 @@ class Nav2BridgeTests(unittest.TestCase):
             0.45,
         )
         self.assertEqual(
+            patched["velocity_smoother"]["ros__parameters"]["deadband_velocity"],
+            [0.01, 0.0, 0.02],
+        )
+        self.assertEqual(
             patched["controller_server"]["ros__parameters"]["FollowPath"]["RotateToGoal.scale"],
             8.0,
         )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["progress_checker"]["required_movement_radius"],
+            0.05,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["progress_checker"]["movement_time_allowance"],
+            25.0,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["goal_checker_plugins"],
+            ["goal_checker"],
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["goal_checker"]["plugin"],
+            "nav2_controller::PositionGoalChecker",
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["goal_checker"]["xy_goal_tolerance"],
+            0.18,
+        )
+        self.assertTrue(patched["controller_server"]["ros__parameters"]["goal_checker"]["stateful"])
+
+    def test_nav2_params_can_keep_local_scan_obstacles_when_explicitly_enabled(self) -> None:
+        base = {
+            "global_costmap": {
+                "global_costmap": {"ros__parameters": {"plugins": ["static_layer"]}}
+            },
+            "local_costmap": {
+                "local_costmap": {
+                    "ros__parameters": {
+                        "plugins": ["voxel_layer"],
+                        "voxel_layer": {},
+                    }
+                }
+            },
+        }
+        patched = patch_nav2_params(
+            base,
+            scan_topic="/bridge/scan",
+            enable_local_scan_obstacles=True,
+        )
+
+        local_scan = patched["local_costmap"]["local_costmap"]["ros__parameters"]["voxel_layer"]["scan"]
+        self.assertEqual(local_scan["topic"], "/bridge/scan")
+        self.assertTrue(local_scan["inf_is_valid"])
+        self.assertEqual(local_scan["observation_persistence"], 0.35)
+
+    def test_nav2_params_can_remove_heading_alignment_critics(self) -> None:
+        base = {
+            "controller_server": {
+                "ros__parameters": {
+                    "FollowPath": {
+                        "critics": ["RotateToGoal", "GoalAlign", "PathAlign", "PathDist", "GoalDist"],
+                        "RotateToGoal.scale": 8.0,
+                        "RotateToGoal.slowing_factor": 3.0,
+                        "GoalAlign.scale": 12.0,
+                        "PathAlign.scale": 16.0,
+                    }
+                }
+            }
+        }
+
+        patched = patch_nav2_params(
+            base,
+            rotate_to_goal_scale=0.0,
+            goal_align_scale=0.0,
+            path_align_scale=0.0,
+        )
+
+        follow_path = patched["controller_server"]["ros__parameters"]["FollowPath"]
+        self.assertEqual(follow_path["critics"], ["PathDist", "GoalDist"])
+        self.assertNotIn("RotateToGoal.scale", follow_path)
+        self.assertNotIn("GoalAlign.scale", follow_path)
+        self.assertNotIn("PathAlign.scale", follow_path)
 
     def test_slam_toolbox_params_use_standard_frames(self) -> None:
         params = render_slam_toolbox_params()

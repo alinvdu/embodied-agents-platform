@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import struct
 import threading
 import time
 from typing import Any, Protocol, Sequence
@@ -18,7 +19,7 @@ from xlerobot_playground.real_exploration_runtime import (
     RealXLeRobotDirectRuntime,
     RealXLeRobotRuntimeConfig,
 )
-from xlerobot_playground.rgbd_transport import unpack_rgbd_frame
+from xlerobot_playground.rgbd_transport import POINT_CLOUD_FORMAT_XYZ_FLOAT32, unpack_rgbd_frame
 
 try:
     import aiohttp
@@ -36,8 +37,8 @@ try:
     from geometry_msgs.msg import Quaternion, TransformStamped, Twist
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
-    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan
-    from std_msgs.msg import Float32
+    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan, PointCloud2, PointField
+    from std_msgs.msg import Bool, Float32
     from tf2_ros import TransformBroadcaster
 except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     IMPORT_ERROR = exc
@@ -53,6 +54,9 @@ except Exception as exc:  # pragma: no cover - exercised as a runtime guard.
     Image = None
     Imu = None
     LaserScan = None
+    PointCloud2 = None
+    PointField = None
+    Bool = None
     Float32 = None
     TransformBroadcaster = None
 
@@ -88,6 +92,13 @@ class RealRosBridgeConfig:
     base_frame: str = "base_link"
     odom_frame: str = "odom"
     head_camera_frame: str = "head_camera_link"
+    head_points_topic: str = "/camera/head/points"
+    head_points_mode: str = "continuous"
+    head_points_settled_delay_s: float = 0.20
+    head_points_stale_tolerance_s: float = 0.10
+    head_points_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
+    head_points_update_map_while_base_moving: bool = False
+    scan_active_topic: str = "/xlerobot/scan_active"
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
     camera_y_m: float = 0.0
@@ -95,6 +106,7 @@ class RealRosBridgeConfig:
     camera_yaw_rad: float = 0.0
     camera_pitch_rad: float = 0.0
     camera_pitch_topic: str = "/camera/head/pitch_rad"
+    camera_pan_topic: str = "/camera/head/pan_rad"
     camera_pose_poll_period_s: float = 0.2
     publish_head_camera: bool = True
     publish_rate_hz: float = 30.0
@@ -105,7 +117,7 @@ class RealRosBridgeConfig:
     laser_min_range_m: float = 0.05
     laser_max_range_m: float = 6.0
     scan_band_height_px: int = 12
-    laser_fill_no_return: bool = True
+    laser_fill_no_return: bool = False
     orbbec: OrbbecFilesystemConfig = OrbbecFilesystemConfig()
     robot_brain_url: str | None = None
 
@@ -123,6 +135,11 @@ class RgbdFrame:
     frame_index: int | None = None
     depth_be: bytes | None = None
     metadata: dict[str, Any] | None = None
+    point_cloud_format: int = 0
+    point_cloud_points: bytes | None = None
+    point_cloud_count: int = 0
+    point_cloud_stride: int = 0
+    point_cloud_units: str | None = None
 
 
 class RgbdSource(Protocol):
@@ -466,6 +483,11 @@ class RobotBrainRgbdSource:
                 frame_index=frame.frame_index,
                 depth_be=frame.depth_be,
                 metadata=frame.metadata,
+                point_cloud_format=frame.point_cloud_format,
+                point_cloud_points=frame.point_cloud_points,
+                point_cloud_count=frame.point_cloud_count,
+                point_cloud_stride=frame.point_cloud_stride,
+                point_cloud_units=frame.point_cloud_units,
             )
         except Exception:
             pass
@@ -610,13 +632,36 @@ class RealXLeRobotRosBridge(Node):
         self.head_rgb_publisher = None
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
+        self.head_points_publisher = None
         self.camera_pitch_publisher = self.create_publisher(Float32, config.camera_pitch_topic, 10)
+        self.camera_pan_publisher = self.create_publisher(Float32, config.camera_pan_topic, 10)
         self._camera_pitch_rad = float(config.camera_pitch_rad)
+        self._camera_pan_rad = 0.0
+        self._camera_pose_updated_s: float | None = None
+        self._camera_pose_received_s: float | None = None
+        self._camera_pose_moving = False
         self._last_camera_pose_poll_s = 0.0
+        self._base_motion_active = False
+        self._head_points_update_map_enabled = True
+        self._scan_active = False
+        self._last_head_points_skip_reason = ""
         if config.publish_head_camera:
             self.head_rgb_publisher = self.create_publisher(Image, "/camera/head/image_raw", 10)
             self.head_depth_publisher = self.create_publisher(Image, "/camera/head/depth/image_raw", 10)
             self.head_camera_info_publisher = self.create_publisher(CameraInfo, "/camera/head/camera_info", 10)
+            self.head_points_publisher = self.create_publisher(PointCloud2, config.head_points_topic, 10)
+            self.create_subscription(
+                Bool,
+                config.head_points_update_map_enabled_topic,
+                self._on_head_points_update_map_enabled,
+                10,
+            )
+            self.create_subscription(
+                Bool,
+                config.scan_active_topic,
+                self._on_scan_active,
+                10,
+            )
         self.timer = self.create_timer(
             1.0 / max(config.publish_rate_hz, 1e-6),
             self.step,
@@ -657,6 +702,7 @@ class RealXLeRobotRosBridge(Node):
         self._last_step_stamp = now
         self._poll_camera_pose(now_s=now)
         linear, angular = self._active_velocity()
+        self._update_base_motion_state(linear=linear, angular=angular, now_s=now)
         motion_sent = self._drive_or_stop(linear=linear, angular=angular)
         if motion_sent:
             self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
@@ -665,6 +711,7 @@ class RealXLeRobotRosBridge(Node):
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
         self._publish_scan(frame=frame, stamp=stamp)
         self._publish_head_images(frame=frame, stamp=stamp)
+        self._publish_head_points(frame=frame, stamp=stamp)
 
     def _poll_camera_pose(self, *, now_s: float) -> None:
         if self.brain_client is not None and now_s - self._last_camera_pose_poll_s >= self.config.camera_pose_poll_period_s:
@@ -673,11 +720,42 @@ class RealXLeRobotRosBridge(Node):
                 state = self.brain_client.get_json("/camera/head/pose")
                 if "pitch_rad" in state:
                     self._camera_pitch_rad = float(state["pitch_rad"])
+                if "pan_rad" in state:
+                    self._camera_pan_rad = float(state["pan_rad"])
+                if "updated_s" in state:
+                    self._camera_pose_updated_s = float(state["updated_s"])
+                self._camera_pose_moving = bool(state.get("moving", False))
+                self._camera_pose_received_s = now_s
             except Exception as exc:
                 self.get_logger().warning(f"Failed to fetch camera head pose: {_format_runtime_error(exc)}")
-        msg = Float32()
-        msg.data = float(self._camera_pitch_rad)
-        self.camera_pitch_publisher.publish(msg)
+        pitch_msg = Float32()
+        pitch_msg.data = float(self._camera_pitch_rad)
+        self.camera_pitch_publisher.publish(pitch_msg)
+        pan_msg = Float32()
+        pan_msg.data = float(self._camera_pan_rad)
+        self.camera_pan_publisher.publish(pan_msg)
+
+    def _update_base_motion_state(self, *, linear: float, angular: float, now_s: float) -> None:
+        _ = now_s
+        self._base_motion_active = abs(float(linear)) > 1e-5 or abs(float(angular)) > 1e-5
+
+    def _on_head_points_update_map_enabled(self, message: Any) -> None:
+        enabled = bool(message.data)
+        if enabled == self._head_points_update_map_enabled:
+            return
+        self._head_points_update_map_enabled = enabled
+        state = "enabled" if enabled else "disabled"
+        self.get_logger().info(f"PointCloud2 map updates {state} by {self.config.head_points_update_map_enabled_topic}.")
+
+    def _on_scan_active(self, message: Any) -> None:
+        active = bool(message.data)
+        if active == self._scan_active:
+            return
+        self._scan_active = active
+        state = "active" if active else "inactive"
+        self.get_logger().info(f"Scan-active settled PointCloud2 gating is now {state}.")
+        if not active:
+            self._last_head_points_skip_reason = ""
 
     def _start_imu_stream_thread(self, websocket_url: str) -> None:
         self._imu_stream_thread = threading.Thread(
@@ -868,7 +946,11 @@ class RealXLeRobotRosBridge(Node):
         camera_tf.transform.translation.x = self.config.camera_x_m
         camera_tf.transform.translation.y = self.config.camera_y_m
         camera_tf.transform.translation.z = self.config.camera_z_m
-        cx, cy, cz, cw = rpy_to_quaternion_xyzw(0.0, self._camera_pitch_rad, self.config.camera_yaw_rad)
+        cx, cy, cz, cw = rpy_to_quaternion_xyzw(
+            0.0,
+            self._camera_pitch_rad,
+            self.config.camera_yaw_rad + self._camera_pan_rad,
+        )
         camera_tf.transform.rotation = _quaternion_msg(cx, cy, cz, cw)
 
         laser_tf = TransformStamped()
@@ -1024,6 +1106,84 @@ class RealXLeRobotRosBridge(Node):
         camera_info.header.stamp = stamp
         self.head_camera_info_publisher.publish(camera_info)
 
+    def _publish_head_points(self, *, frame: RgbdFrame, stamp: Any) -> None:
+        if self.head_points_publisher is None:
+            return
+        if not self._head_points_publish_allowed(frame):
+            return
+        if (
+            frame.point_cloud_format != POINT_CLOUD_FORMAT_XYZ_FLOAT32
+            or frame.point_cloud_points is None
+            or frame.point_cloud_count <= 0
+            or frame.point_cloud_stride != 12
+        ):
+            return
+        msg = PointCloud2()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.config.head_camera_frame
+        msg.height = 1
+        msg.width = int(frame.point_cloud_count)
+        msg.fields = [
+            _point_field("x", 0),
+            _point_field("y", 4),
+            _point_field("z", 8),
+        ]
+        msg.is_bigendian = False
+        msg.point_step = int(frame.point_cloud_stride)
+        msg.row_step = msg.point_step * msg.width
+        msg.data = _orbbec_optical_xyz_to_ros_camera_link(frame.point_cloud_points, count=msg.width)
+        msg.is_dense = False
+        self.head_points_publisher.publish(msg)
+
+    def _head_points_publish_allowed(self, frame: RgbdFrame) -> bool:
+        if not self._head_points_update_map_enabled:
+            self._log_head_points_skip_once("map updates disabled")
+            return False
+        if self._base_motion_active and not self.config.head_points_update_map_while_base_moving:
+            self._log_head_points_skip_once("base moving")
+            return False
+        if self.config.head_points_mode == "continuous":
+            return True
+        if self.config.head_points_mode != "settled":
+            return True
+        if not self._scan_active:
+            self._last_head_points_skip_reason = ""
+            return True
+        if self._camera_pose_moving:
+            self._log_head_points_skip_once("head moving")
+            return False
+        pose_updated_s = self._camera_pose_updated_s
+        if pose_updated_s is None:
+            self._log_head_points_skip_once("camera pose not ready")
+            return False
+        pose_received_s = self._camera_pose_received_s
+        if pose_received_s is None:
+            self._log_head_points_skip_once("camera pose not ready")
+            return False
+        age_s = time.monotonic() - pose_received_s
+        if age_s < max(float(self.config.head_points_settled_delay_s), 0.0):
+            self._log_head_points_skip_once("waiting for settled pose/frame")
+            return False
+        frame_timestamp_s = float(frame.timestamp_s)
+        stale_tolerance_s = max(float(self.config.head_points_stale_tolerance_s), 0.0)
+        if frame_timestamp_s + stale_tolerance_s < pose_updated_s:
+            self._log_head_points_skip_once("discarding pre-settle point cloud")
+            return False
+        if self._last_head_points_skip_reason:
+            self.get_logger().info(
+                "Resuming settled /camera/head/points publication "
+                f"pan_deg={math.degrees(self._camera_pan_rad):.1f} "
+                f"pitch_deg={math.degrees(self._camera_pitch_rad):.1f}"
+            )
+            self._last_head_points_skip_reason = ""
+        return True
+
+    def _log_head_points_skip_once(self, reason: str) -> None:
+        if reason == self._last_head_points_skip_reason:
+            return
+        self._last_head_points_skip_reason = reason
+        self.get_logger().info(f"Suppressing /camera/head/points in settled mode: {reason}.")
+
     def close(self) -> None:
         try:
             self._imu_stream_stop.set()
@@ -1061,6 +1221,27 @@ def _build_camera_info(*, frame_id: str, width: int, height: int, horizontal_fov
     msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
     msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
     return msg
+
+
+def _point_field(name: str, offset: int) -> Any:
+    field = PointField()
+    field.name = name
+    field.offset = int(offset)
+    field.datatype = PointField.FLOAT32
+    field.count = 1
+    return field
+
+
+def _orbbec_optical_xyz_to_ros_camera_link(data: bytes, *, count: int) -> bytes:
+    expected = int(count) * 12
+    if len(data) < expected:
+        raise ValueError(f"Point cloud payload is truncated: expected {expected} bytes, got {len(data)}.")
+    converted = bytearray(expected)
+    for index in range(int(count)):
+        offset = index * 12
+        optical_x, optical_y, optical_z = struct.unpack_from("<fff", data, offset)
+        struct.pack_into("<fff", converted, offset, optical_z, -optical_x, -optical_y)
+    return bytes(converted)
 
 
 def _build_camera_info_from_metadata(
@@ -1140,6 +1321,55 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--head-camera-frame", default="head_camera_link")
+    parser.add_argument("--head-points-topic", default="/camera/head/points")
+    parser.add_argument(
+        "--head-points-mode",
+        choices=("continuous", "settled"),
+        default="continuous",
+        help=(
+            "Use `continuous` for RViz/debug streaming. Use `settled` for OctoMap camera-pan scans: "
+            "while scan-active is true, PointCloud2 is suppressed while the head is moving and only "
+            "resumes after the pose settles."
+        ),
+    )
+    parser.add_argument(
+        "--head-points-settled-delay-s",
+        type=float,
+        default=0.20,
+        help="Extra delay after robot_brain reports a settled head pose before publishing PointCloud2 in settled mode.",
+    )
+    parser.add_argument(
+        "--head-points-stale-tolerance-s",
+        type=float,
+        default=0.10,
+        help="Accept PointCloud2 frames this many seconds older than the settled camera pose timestamp.",
+    )
+    parser.add_argument(
+        "--head-points-update-map-enabled-topic",
+        default="/camera/head/points/update_map_enabled",
+        help=(
+            "std_msgs/Bool topic controlling whether /camera/head/points is published into the map pipeline. "
+            "False pauses only PointCloud2 publication; odom, TF, images, IMU, and cmd_vel remain live."
+        ),
+    )
+    parser.add_argument(
+        "--head-points-update-map-while-base-moving",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Allow /camera/head/points publication while nonzero /cmd_vel is active. "
+            "Default false keeps OctoMap from integrating point clouds during base motion "
+            "while live motion mapping is still experimental."
+        ),
+    )
+    parser.add_argument(
+        "--scan-active-topic",
+        default="/xlerobot/scan_active",
+        help=(
+            "std_msgs/Bool scan lifecycle topic. In settled head-points mode, pose-settle suppression "
+            "is applied only while this topic is true."
+        ),
+    )
     parser.add_argument("--head-laser-frame", default="head_laser")
     parser.add_argument("--camera-x-m", type=float, default=0.0)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
@@ -1147,6 +1377,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)
     parser.add_argument("--camera-pitch-rad", type=float, default=0.0)
     parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
+    parser.add_argument("--camera-pan-topic", default="/camera/head/pan_rad")
     parser.add_argument("--camera-pose-poll-period-s", type=float, default=0.2)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
@@ -1162,7 +1393,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--laser-min-range-m", type=float, default=0.05)
     parser.add_argument("--laser-max-range-m", type=float, default=6.0)
     parser.add_argument("--scan-band-height-px", type=int, default=12)
-    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--laser-fill-no-return", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--orbbec-output-dir", default="artifacts/orbbec_rgbd")
     parser.add_argument("--orbbec-rgb-filename", default="latest.ppm")
     parser.add_argument("--orbbec-depth-filename", default="latest_depth.pgm")
@@ -1202,6 +1433,13 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         base_frame=args.base_frame,
         odom_frame=args.odom_frame,
         head_camera_frame=args.head_camera_frame,
+        head_points_topic=args.head_points_topic,
+        head_points_mode=args.head_points_mode,
+        head_points_settled_delay_s=args.head_points_settled_delay_s,
+        head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
+        head_points_update_map_enabled_topic=args.head_points_update_map_enabled_topic,
+        head_points_update_map_while_base_moving=args.head_points_update_map_while_base_moving,
+        scan_active_topic=args.scan_active_topic,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,
         camera_y_m=args.camera_y_m,
@@ -1209,6 +1447,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         camera_yaw_rad=args.camera_yaw_rad,
         camera_pitch_rad=args.camera_pitch_rad,
         camera_pitch_topic=args.camera_pitch_topic,
+        camera_pan_topic=args.camera_pan_topic,
         camera_pose_poll_period_s=args.camera_pose_poll_period_s,
         publish_head_camera=args.publish_head_camera,
         publish_rate_hz=args.publish_rate_hz,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
 import sys
 from types import ModuleType
@@ -57,7 +58,13 @@ class XLeRobotInterface:
         module = self.bootstrap().robot_2wheels_module
         if module is None:
             raise XLeRobotBootstrapError("xlerobot_2wheels module is unavailable in this environment")
-        return module.XLerobot2WheelsConfig, module.XLerobot2Wheels
+        config_cls = getattr(module, "XLerobot2WheelsConfig", None)
+        if config_cls is None:
+            config_module = importlib.import_module(
+                f"{module.__name__}.config_xlerobot_2wheels"
+            )
+            config_cls = config_module.XLerobot2WheelsConfig
+        return config_cls, module.XLerobot2Wheels
 
     def vr_classes(self) -> tuple[type[Any], type[Any]]:
         vr_module = self.bootstrap().vr_module

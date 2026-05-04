@@ -161,7 +161,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
-  --camera-yaw-rad 0.0
+  --camera-yaw-rad 0.0 \
+  --no-laser-fill-no-return
 ```
 
 Expected:

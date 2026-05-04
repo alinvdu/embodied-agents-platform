@@ -59,11 +59,15 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertFalse(config.allow_motion_commands)
         self.assertEqual(config.port, 8765)
         self.assertFalse(config.debug_motion)
+        self.assertTrue(config.use_degrees)
         self.assertEqual(config.calibration_prompt_response, "")
         self.assertEqual(config.imu_udp_host, "127.0.0.1")
         self.assertEqual(config.imu_udp_port, 8766)
         self.assertEqual(config.camera_max_frame_bytes, 16 * 1024 * 1024)
         self.assertEqual(config.camera_log_every, 30)
+        self.assertEqual(config.camera_pan_action_key, "head_motor_1.pos")
+        self.assertEqual(config.camera_pan_action_sign, 1.0)
+        self.assertEqual(config.base_angular_action_sign, 1.0)
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -87,6 +91,15 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(runtime.velocity_calls, [(0.02, 0.08)])
         self.assertEqual(response["metadata"], {"sent": True})
 
+    def test_agent_can_flip_base_angular_action_sign(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(RobotBrainAgentConfig(base_angular_action_sign=-1.0), runtime=runtime)
+
+        response = agent.velocity(linear_m_s=0.0, angular_rad_s=0.08)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.velocity_calls, [(0.0, -0.08)])
+
     def test_agent_commands_camera_pitch_and_updates_state(self) -> None:
         runtime = FakeRuntime()
         agent = RobotBrainAgent(
@@ -103,6 +116,96 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.actions, [{"head_tilt.pos": 0.5 * 180.0 / 3.141592653589793}])
         self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.5)
+
+    def test_agent_applies_camera_pitch_motor_offset_without_changing_state(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pitch_action_key="head_motor_2.pos",
+                camera_pitch_action_offset_deg=-25.0,
+                camera_pitch_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pitch_camera(pitch_rad=0.0)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_2.pos": -25.0}])
+        self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.0)
+
+    def test_agent_commands_camera_pan_and_updates_state(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=-0.5)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_1.pos": -0.5 * 180.0 / 3.141592653589793}])
+        self.assertAlmostEqual(agent.camera_state()["pan_rad"], -0.5)
+        self.assertAlmostEqual(agent.camera_state()["pitch_rad"], 0.0)
+
+    def test_agent_can_invert_camera_pan_motor_action_without_inverting_pose(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_action_sign=-1.0,
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=0.5)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_1.pos": -0.5 * 180.0 / 3.141592653589793}])
+        self.assertAlmostEqual(agent.camera_state()["pan_rad"], 0.5)
+
+    def test_agent_rejects_degree_pan_when_robot_is_not_in_degree_mode(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                use_degrees=False,
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=1.0)
+
+        self.assertFalse(response["succeeded"])
+        self.assertIn("--use-degrees", response["message"])
+        self.assertEqual(runtime.actions, [])
+
+    def test_agent_can_send_normalized_pan_when_degree_mode_is_disabled(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(
+            RobotBrainAgentConfig(
+                use_degrees=False,
+                allow_motion_commands=True,
+                camera_pan_action_key="head_motor_1.pos",
+                camera_pan_action_units="normalized",
+                camera_pan_settle_s=0.0,
+            ),
+            runtime=runtime,
+        )
+
+        response = agent.pan_camera(pan_rad=3.141592653589793)
+
+        self.assertTrue(response["succeeded"])
+        self.assertEqual(runtime.actions, [{"head_motor_1.pos": 100.0}])
 
     def test_agent_serves_expected_orbbec_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

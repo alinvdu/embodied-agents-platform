@@ -4,7 +4,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import time
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from .exploration import ExplorationBackend
 from .offload import OffloadClient
@@ -60,10 +60,24 @@ class ExplorationUIController(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
-    def __init__(self, backend: ExplorationBackend) -> None:
+    def __init__(
+        self,
+        backend: ExplorationBackend,
+        *,
+        waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
         self.backend = backend
+        self.waypoint_navigator = waypoint_navigator
+        self.waypoint_previewer = waypoint_previewer
 
     def snapshot(self) -> dict[str, Any]:
         return self.backend.snapshot()
@@ -118,6 +132,16 @@ class LocalExplorationUIController:
         cells: list[dict[str, Any]],
     ) -> dict[str, Any]:
         return self.backend.update_occupancy_edits(task_id=task_id, mode=mode, cells=cells)
+
+    def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        if self.waypoint_navigator is None:
+            return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
+        return self.waypoint_navigator(pose)
+
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        if self.waypoint_previewer is None:
+            return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
+        return self.waypoint_previewer(pose)
 
 
 class RemoteExplorationUIController:
@@ -178,6 +202,12 @@ class RemoteExplorationUIController:
         cells: list[dict[str, Any]],
     ) -> dict[str, Any]:
         raise NotImplementedError("Remote occupancy editing is not implemented yet.")
+
+    def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote waypoint navigation is not implemented yet."}
+
+    def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote waypoint previews are not implemented yet."}
 
 
 HTML_PAGE = """<!doctype html>
@@ -419,6 +449,8 @@ HTML_PAGE = """<!doctype html>
             <button class="secondary" id="edit-block">Draw Wall</button>
             <button class="secondary" id="edit-clear">Erase Wall</button>
             <button class="secondary" id="edit-reset">Reset Cell</button>
+            <button class="secondary" id="nav-preview">Preview Path</button>
+            <button class="primary" id="nav-waypoint">Waypoint</button>
           </div>
           <div id="edit-mode-summary" class="muted" style="margin-top:10px;">Click or drag on the map to add or remove occupancy overrides.</div>
         </section>
@@ -500,6 +532,7 @@ HTML_PAGE = """<!doctype html>
     let paintFlushTimer = null;
     let lastPaintedCellKey = null;
     let currentOccupancyCellStates = new Map();
+    let lastManualWaypoint = null;
 
     async function postJson(url, payload) {
       const response = await fetch(url, {
@@ -572,17 +605,23 @@ HTML_PAGE = """<!doctype html>
     }
 
     function cellFromMapEvent(map, event) {
-      const svg = document.getElementById('map-canvas');
-      const bounds = currentMapBounds || mapBounds(map);
-      const point = svgPointFromClient(svg, event.clientX, event.clientY);
-      const world = worldFromSvgViewPoint(bounds, point.x, point.y);
+      const world = worldFromMapEvent(map, event);
       const resolution = map.occupancy?.resolution || 0.5;
+      const originX = map.occupancy?.bounds?.min_x || 0;
+      const originY = map.occupancy?.bounds?.min_y || 0;
       const cell = {
-        cell_x: Math.floor(world.x / resolution),
-        cell_y: Math.floor(world.y / resolution),
+        cell_x: Math.floor((world.x - originX) / resolution),
+        cell_y: Math.floor((world.y - originY) / resolution),
       };
       cell.key = `${cell.cell_x}:${cell.cell_y}`;
       return cell;
+    }
+
+    function worldFromMapEvent(map, event) {
+      const svg = document.getElementById('map-canvas');
+      const bounds = currentMapBounds || mapBounds(map);
+      const point = svgPointFromClient(svg, event.clientX, event.clientY);
+      return worldFromSvgViewPoint(bounds, point.x, point.y);
     }
 
     function shouldPaintCell(cell) {
@@ -624,7 +663,8 @@ HTML_PAGE = """<!doctype html>
         ['Approved', map && map.approved ? 'yes' : 'no'],
         ['Regions', map ? (map.regions || []).length : 0],
         ['Coverage', map ? String(map.coverage || 0) : '0'],
-        ['Task', task ? (task.tool_id + ' ' + task.state) : 'idle']
+        ['Task', task ? (task.tool_id + ' ' + task.state) : 'idle'],
+        ['Paused', task && task.paused ? 'yes' : 'no']
       ];
       if (map && map.automatic_semantic_waypoints) {
         items.splice(4, 0, ['Automatic Semantic Places', ((map.semantic_memory || {}).named_places || []).length]);
@@ -677,8 +717,16 @@ HTML_PAGE = """<!doctype html>
       const blocked = (edits.blocked_cells || []).length;
       const cleared = (edits.cleared_cells || []).length;
       const activeFrontierId = frontierMemory.active_frontier_id || 'none';
-      const verb = mapEditMode === 'block' ? 'draw occupied wall cells' : mapEditMode === 'clear' ? 'erase wall cells into free space' : 'remove manual overrides';
-      document.getElementById('edit-mode-summary').textContent = `Edit mode: ${mapEditMode} (${verb}). Active frontier: ${activeFrontierId}. Manual walls ${blocked}, manual clears ${cleared}. Click or drag on the map to edit cells.`;
+      const verb = mapEditMode === 'block'
+        ? 'draw occupied wall cells'
+        : mapEditMode === 'clear'
+          ? 'erase wall cells into free space'
+          : mapEditMode === 'reset'
+            ? 'remove manual overrides'
+            : mapEditMode === 'preview'
+              ? 'click once to preview Nav2 path without moving'
+              : 'click once to send a Nav2 waypoint';
+      document.getElementById('edit-mode-summary').textContent = `Map mode: ${mapEditMode} (${verb}). Active frontier: ${activeFrontierId}. Manual walls ${blocked}, manual clears ${cleared}.`;
       const guardrails = ((map.artifacts || {}).guardrail_events || []).slice(-12).reverse();
       const guardrailElement = document.getElementById('guardrail-list');
       if (guardrailElement) {
@@ -704,8 +752,10 @@ HTML_PAGE = """<!doctype html>
       currentOccupancyCellStates = new Map();
       const occupancy = (map.occupancy?.cells || []).map((cell) => {
         const resolution = map.occupancy.resolution || 0.5;
-        const cellX = Math.floor(cell.x / resolution);
-        const cellY = Math.floor(cell.y / resolution);
+        const originX = map.occupancy?.bounds?.min_x || 0;
+        const originY = map.occupancy?.bounds?.min_y || 0;
+        const cellX = Math.floor((cell.x - originX) / resolution);
+        const cellY = Math.floor((cell.y - originY) / resolution);
         currentOccupancyCellStates.set(`${cellX}:${cellY}`, {
           state: cell.state,
           manual_override: cell.manual_override || null,
@@ -780,7 +830,29 @@ HTML_PAGE = """<!doctype html>
           <text x="${p.x + 10}" y="${p.y - 10}" font-size="12" fill="#172033">${escapeHtml(frontier.frontier_id || '')}</text>
         `;
       }).join('');
-      const robotPose = (map.trajectory || []).slice(-1)[0] || null;
+      const manualWaypoint = lastManualWaypoint ? (() => {
+        const p = project(lastManualWaypoint);
+        return `
+          <circle cx="${p.x}" cy="${p.y}" r="9" fill="#2563eb" opacity="0.88" />
+          <circle cx="${p.x}" cy="${p.y}" r="15" fill="none" stroke="#2563eb" stroke-width="2" opacity="0.6" />
+          <text x="${p.x + 12}" y="${p.y + 4}" font-size="12" fill="#1d4ed8" font-weight="700">waypoint</text>
+        `;
+      })() : '';
+      const preview = ((map.artifacts || {}).nav2_preview || {});
+      const previewPlan = preview.plan || null;
+      const previewPath = (previewPlan?.path_poses || []).map((pose) => {
+        const p = project(pose);
+        return `${p.x},${p.y}`;
+      }).join(' ');
+      const previewGoal = preview.requested_pose || null;
+      const previewGoalMarkup = previewGoal ? (() => {
+        const p = project(previewGoal);
+        return `
+          <circle cx="${p.x}" cy="${p.y}" r="8" fill="#f59e0b" opacity="0.92" />
+          <text x="${p.x + 12}" y="${p.y - 8}" font-size="12" fill="#92400e" font-weight="700">preview</text>
+        `;
+      })() : '';
+      const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || null;
       const robot = robotPose ? project(robotPose) : null;
       const headingLength = (map.occupancy?.resolution || 0.5) * 2.5;
       const robotHeading = robotPose ? project({
@@ -796,6 +868,9 @@ HTML_PAGE = """<!doctype html>
         ${semanticEvidence}
         ${semanticPlaces}
         ${frontiers}
+        ${previewPath ? `<polyline points="${previewPath}" fill="none" stroke="#f59e0b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="10 7" opacity="0.95" />` : ''}
+        ${previewGoalMarkup}
+        ${manualWaypoint}
         ${robot ? `<circle cx="${robot.x}" cy="${robot.y}" r="11" fill="#a52820" />` : ''}
         ${robot && robotHeading ? `<line x1="${robot.x}" y1="${robot.y}" x2="${robotHeading.x}" y2="${robotHeading.y}" stroke="#6d0f0a" stroke-width="4.5" stroke-linecap="round" />` : ''}
         ${robot && robotHeading ? `<circle cx="${robotHeading.x}" cy="${robotHeading.y}" r="4" fill="#6d0f0a" />` : ''}
@@ -812,6 +887,29 @@ HTML_PAGE = """<!doctype html>
       svg.onpointerdown = (event) => {
         if (!currentMapBounds) return;
         event.preventDefault();
+        if (mapEditMode === 'waypoint' || mapEditMode === 'preview') {
+          const world = worldFromMapEvent(map, event);
+          const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || {};
+          lastManualWaypoint = {x: world.x, y: world.y, yaw: Number(robotPose.yaw || 0)};
+          renderMap(currentState);
+          const endpoint = mapEditMode === 'preview' ? '/api/nav/preview' : '/api/nav/waypoint';
+          postJson(endpoint, {pose: lastManualWaypoint})
+            .then((response) => {
+              lastManualWaypoint = response.normalized_pose || response.requested_pose || lastManualWaypoint;
+              if (response.map) {
+                currentState.current_map = response.map;
+              }
+              renderMap(currentState);
+              if (response.status && response.status !== 'succeeded') {
+                alert((response.status || 'failed') + ': ' + (response.reason || 'Waypoint request failed.'));
+              }
+              return refresh();
+            })
+            .catch((error) => {
+              alert(error.message || String(error));
+            });
+          return;
+        }
         isPaintingMap = true;
         lastPaintedCellKey = null;
         const cell = cellFromMapEvent(map, event);
@@ -929,6 +1027,14 @@ HTML_PAGE = """<!doctype html>
     });
     document.getElementById('edit-reset').addEventListener('click', () => {
       mapEditMode = 'reset';
+      renderExploration(currentState || {});
+    });
+    document.getElementById('nav-preview').addEventListener('click', () => {
+      mapEditMode = 'preview';
+      renderExploration(currentState || {});
+    });
+    document.getElementById('nav-waypoint').addEventListener('click', () => {
+      mapEditMode = 'waypoint';
       renderExploration(currentState || {});
     });
     document.getElementById('save-region').addEventListener('click', async () => {
@@ -1117,6 +1223,18 @@ class ExplorationReviewServer:
                         task_id=payload.get("task_id"),
                         mode=str(payload.get("mode", "block")),
                         cells=list(payload.get("cells", [])),
+                    )
+                    self._send_json(response)
+                    return
+                if self.path == "/api/nav/waypoint":
+                    response = controller.navigate_to_waypoint(
+                        pose=dict(payload.get("pose", {})),
+                    )
+                    self._send_json(response)
+                    return
+                if self.path == "/api/nav/preview":
+                    response = controller.preview_waypoint(
+                        pose=dict(payload.get("pose", {})),
                     )
                     self._send_json(response)
                     return

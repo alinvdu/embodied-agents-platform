@@ -61,6 +61,10 @@ from xlerobot_playground.map_editing import (
     overlay_occupancy_payload,
 )
 from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
+from xlerobot_playground.point_cloud_fusion import (
+    PointCloudFusionConfig,
+    integrate_transformed_point_cloud_observation,
+)
 from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
@@ -117,7 +121,12 @@ class SimExplorationConfig:
     nav2_mode: str = "simulated"
     ros_navigation_map_source: str = "fused_scan"
     ros_map_topic: str = "/map"
+    ros_map_updates_topic: str | None = None
+    ros_fuse_external_projected_map_snapshots: bool = False
     ros_scan_topic: str = "/scan"
+    ros_point_cloud_topic: str = "/camera/head/points"
+    ros_scan_active_topic: str = "/xlerobot/scan_active"
+    ros_scan_active_release_delay_s: float = 3.0
     ros_rgb_topic: str = "/camera/head/image_raw"
     ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
@@ -132,6 +141,20 @@ class SimExplorationConfig:
     ros_turn_scan_settle_s: float = 1.0
     ros_manual_spin_angular_speed_rad_s: float = 0.25
     ros_manual_spin_publish_hz: float = 20.0
+    ros_turn_scan_mode: str = "camera_pan"
+    robot_brain_url: str | None = "http://127.0.0.1:8765"
+    camera_pan_action_key: str = "head_motor_1.pos"
+    camera_pan_settle_s: float = 0.5
+    camera_pan_step_deg: float = 60.0
+    camera_pan_compute_s: float = 2.0
+    camera_pan_sample_count: int = 12
+    point_cloud_range_min_m: float = 0.25
+    point_cloud_range_max_m: float = 4.0
+    point_cloud_floor_free_max_z_m: float = 0.08
+    point_cloud_obstacle_min_z_m: float = 0.08
+    point_cloud_robot_clearance_height_m: float = 1.50
+    point_cloud_obstacle_max_z_m: float = 1.80
+    point_cloud_max_rays: int = 2400
     sim_motion_speed: str = "normal"
     ros_allow_multiple_action_servers: bool = False
     experimental_free_space_semantic_waypoints: bool = False
@@ -399,6 +422,7 @@ class Nav2PlanResult:
     reason: str
     goal_cell: GridCell | None
     path_cells: tuple[GridCell, ...] = tuple()
+    path_poses: tuple[Pose2D, ...] = tuple()
     path_length_m: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -414,6 +438,7 @@ class Nav2PlanResult:
                 {"x": point.x, "y": point.y}
                 for point in self.path_cells
             ],
+            "path_poses": [pose.to_dict() for pose in self.path_poses],
         }
 
 
@@ -448,7 +473,13 @@ class Nav2NavigationModule:
     def compute_path(self, goal: Nav2GoalRequest, *, record: bool = True) -> Nav2PlanResult:
         raise NotImplementedError
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         raise NotImplementedError
 
     def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
@@ -551,13 +582,23 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             reason="planner computed a path on the current known-free occupancy map",
             goal_cell=validation.goal_cell,
             path_cells=tuple(path_cells),
+            path_poses=tuple(
+                point.center_pose(self.scenario.resolution, yaw=goal.target_pose.yaw)
+                for point in path_cells
+            ),
             path_length_m=max(len(path_cells) - 1, 0) * self.scenario.resolution,
         )
         if record:
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         recovery_events: list[dict[str, Any]] = []
@@ -622,14 +663,15 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
             self._on_motion_step(previous, nxt, goal, index, len(path_cells))
             travelled_distance_m += self.scenario.resolution
             remaining_distance_m = max((len(path_cells) - index - 1), 0) * self.scenario.resolution
-            feedback_samples.append(
-                {
-                    "step_index": index,
-                    "remaining_distance_m": round(remaining_distance_m, 3),
-                    "current_pose": nxt.center_pose(self.scenario.resolution).to_dict(),
-                    "status": "moving",
-                }
-            )
+            sample = {
+                "step_index": index,
+                "remaining_distance_m": round(remaining_distance_m, 3),
+                "current_pose": nxt.center_pose(self.scenario.resolution).to_dict(),
+                "status": "moving",
+            }
+            feedback_samples.append(sample)
+            if feedback_callback is not None:
+                feedback_callback(sample)
 
         reached_pose = path_cells[-1].center_pose(self.scenario.resolution, yaw=goal.target_pose.yaw)
         return Nav2NavigateResult(
@@ -760,13 +802,20 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             ),
             goal_cell=validation.goal_cell,
             path_cells=path_cells,
+            path_poses=tuple(path_poses),
             path_length_m=path_length_m(path_poses),
         )
         if record:
             self._plan_history.append(result.to_dict())
         return result
 
-    def navigate_to_pose(self, goal: Nav2GoalRequest) -> Nav2NavigateResult:
+    def navigate_to_pose(
+        self,
+        goal: Nav2GoalRequest,
+        *,
+        ignore_pause_cancel: bool = False,
+        feedback_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
         plan = self.compute_path(goal, record=True)
         if plan.status != "succeeded":
@@ -784,11 +833,16 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             )
         validation = self.validate_goal(goal)
         try:
-            outcome, feedback_samples = self.runtime.navigate_to_pose(
-                goal_pose=validation.normalized_pose or goal.target_pose,
-                behavior_tree=goal.behavior_tree,
-                should_cancel=self._should_cancel,
-            )
+            self.runtime.set_point_cloud_map_updates_enabled(False)
+            try:
+                outcome, feedback_samples = self.runtime.navigate_to_pose(
+                    goal_pose=validation.normalized_pose or goal.target_pose,
+                    behavior_tree=goal.behavior_tree,
+                    should_cancel=None if ignore_pause_cancel else self._should_cancel,
+                    feedback_callback=feedback_callback,
+                )
+            finally:
+                self.runtime.set_point_cloud_map_updates_enabled(True)
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
             recovery_events: list[dict[str, Any]] = []
@@ -2869,13 +2923,27 @@ class RosExplorationSession:
         self.pending_trace: dict[str, Any] | None = None
         self.applied_memory_updates: list[dict[str, Any]] = []
         self.last_error: str | None = None
+        self.last_nav2_preview: dict[str, Any] | None = None
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
         self._owns_rclpy = False
+        if config.ros_adapter_url and config.ros_navigation_map_source == "fused_point_cloud":
+            raise RuntimeError(
+                "`fused_point_cloud` requires the local ROS runtime because the HTTP ROS adapter "
+                "does not serialize large PointCloud2 observations. Run real_agentic_exploration without "
+                "--ros-adapter-url, or use --ros-navigation-map-source fused_scan with the adapter."
+            )
         if config.ros_adapter_url:
             self.runtime = RemoteRosExplorationRuntime(
                 config.ros_adapter_url,
                 timeout_s=config.ros_adapter_timeout_s,
+                turn_scan_mode=config.ros_turn_scan_mode,
+                robot_brain_url=config.robot_brain_url,
+                camera_pan_action_key=config.camera_pan_action_key,
+                camera_pan_settle_s=config.camera_pan_settle_s,
+                camera_pan_step_deg=config.camera_pan_step_deg,
+                camera_pan_compute_s=config.camera_pan_compute_s,
+                camera_pan_sample_count=config.camera_pan_sample_count,
             )
         else:
             require_ros_nav2_runtime_dependencies()
@@ -2885,7 +2953,11 @@ class RosExplorationSession:
             self.runtime = RosExplorationRuntime(
                 RosRuntimeConfig(
                     map_topic=config.ros_map_topic,
+                    map_updates_topic=config.ros_map_updates_topic,
                     scan_topic=config.ros_scan_topic,
+                    point_cloud_topic=config.ros_point_cloud_topic,
+                    scan_active_topic=config.ros_scan_active_topic,
+                    scan_active_release_delay_s=config.ros_scan_active_release_delay_s,
                     rgb_topic=config.ros_rgb_topic,
                     imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
@@ -2899,18 +2971,46 @@ class RosExplorationSession:
                     turn_scan_settle_s=config.ros_turn_scan_settle_s,
                     manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
                     manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
+                    turn_scan_mode=config.ros_turn_scan_mode,
+                    robot_brain_url=config.robot_brain_url,
+                    camera_pan_action_key=config.camera_pan_action_key,
+                    camera_pan_settle_s=config.camera_pan_settle_s,
+                    camera_pan_step_deg=config.camera_pan_step_deg,
+                    camera_pan_compute_s=config.camera_pan_compute_s,
+                    camera_pan_sample_count=config.camera_pan_sample_count,
                     allow_multiple_action_servers=config.ros_allow_multiple_action_servers,
-                    publish_internal_navigation_map=config.ros_navigation_map_source == "fused_scan",
+                    publish_internal_navigation_map=config.ros_navigation_map_source
+                    in ("fused_scan", "fused_point_cloud"),
+                    navigation_map_source=config.ros_navigation_map_source,
+                    fuse_external_projected_map_snapshots=config.ros_fuse_external_projected_map_snapshots,
                 )
             )
         self.scan_known_cells: dict[GridCell, str] = {}
         self.scan_occupancy_evidence: dict[GridCell, float] = {}
         self.scan_range_edge_cells: set[GridCell] = set()
+        self.point_cloud_integration_summaries: list[dict[str, Any]] = []
+        self._latest_fused_projected_map: RosOccupancyMap | None = None
+        self.point_cloud_fusion_config = PointCloudFusionConfig(
+            range_min_m=float(config.point_cloud_range_min_m),
+            range_max_m=float(config.point_cloud_range_max_m),
+            floor_free_max_z_m=float(config.point_cloud_floor_free_max_z_m),
+            obstacle_min_z_m=float(config.point_cloud_obstacle_min_z_m),
+            robot_clearance_height_m=float(config.point_cloud_robot_clearance_height_m),
+            obstacle_max_z_m=float(config.point_cloud_obstacle_max_z_m),
+            max_rays=int(config.point_cloud_max_rays),
+        )
         if self.runtime.latest_map is not None:
             self.scan_map_resolution = float(self.runtime.latest_map.resolution)
         else:
             self.scan_map_resolution = config.occupancy_resolution
         self.scan_observation_index = self.runtime.scan_observation_count()
+        self.point_cloud_observation_index = (
+            self.runtime.point_cloud_observation_count()
+            if hasattr(self.runtime, "point_cloud_observation_count")
+            else 0
+        )
+        self._last_map_payload_log_s = 0.0
+        self._last_live_pose_publish_s = 0.0
         self.nav2 = RosNav2NavigationModule(
             config,
             self.runtime,
@@ -2996,7 +3096,10 @@ class RosExplorationSession:
                         goal_type="return_waypoint",
                         reason=f"return_waypoint::{waypoint['waypoint_id']}",
                     )
-                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    return_result = self.nav2.navigate_to_pose(
+                        return_goal,
+                        feedback_callback=self._publish_navigation_feedback,
+                    )
                     self._consume_nav_result(return_result)
                     if return_result.status != "succeeded":
                         self.guardrail_events.append(
@@ -3025,7 +3128,10 @@ class RosExplorationSession:
                 goal_type="frontier",
                 reason=f"frontier::{record.frontier_id}",
             )
-            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            nav_result = self.nav2.navigate_to_pose(
+                frontier_goal,
+                feedback_callback=self._publish_navigation_feedback,
+            )
             self._consume_nav_result(nav_result)
             if nav_result.status != "succeeded":
                 _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
@@ -3081,11 +3187,18 @@ class RosExplorationSession:
             self.scan_known_cells = {}
             self.scan_occupancy_evidence = {}
             self.scan_range_edge_cells = set()
+            self.point_cloud_integration_summaries = []
             self.scan_observation_index = self.runtime.scan_observation_count()
+            self.point_cloud_observation_index = (
+                self.runtime.point_cloud_observation_count()
+                if hasattr(self.runtime, "point_cloud_observation_count")
+                else 0
+            )
             if self.runtime.latest_map is not None:
                 self.scan_map_resolution = float(self.runtime.latest_map.resolution)
             else:
                 self.scan_map_resolution = self.config.occupancy_resolution
+            self._latest_fused_projected_map = None
             self.total_distance_m = 0.0
             self.control_steps = 0
             self.decision_index = 0
@@ -3184,7 +3297,10 @@ class RosExplorationSession:
                         goal_type="return_waypoint",
                         reason=f"return_waypoint::{waypoint['waypoint_id']}",
                     )
-                    return_result = self.nav2.navigate_to_pose(return_goal)
+                    return_result = self.nav2.navigate_to_pose(
+                        return_goal,
+                        feedback_callback=self._publish_navigation_feedback,
+                    )
                     self._consume_nav_result(return_result)
                     if return_result.status != "succeeded":
                         self.guardrail_events.append(
@@ -3211,7 +3327,10 @@ class RosExplorationSession:
                 goal_type="frontier",
                 reason=f"frontier::{record.frontier_id}",
             )
-            nav_result = self.nav2.navigate_to_pose(frontier_goal)
+            nav_result = self.nav2.navigate_to_pose(
+                frontier_goal,
+                feedback_callback=self._publish_navigation_feedback,
+            )
             self._consume_nav_result(nav_result)
             if nav_result.status != "succeeded":
                 _mark_frontier_unreachable_as_visited(self.frontier_memory, record.frontier_id, nav_result.reason)
@@ -3270,6 +3389,105 @@ class RosExplorationSession:
             self._publish_navigation_map()
             self._prepare_decision_locked()
             return self.snapshot()
+
+    def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            try:
+                current_pose = self.runtime.current_pose()
+                target_pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", current_pose.yaw if current_pose is not None else 0.0)),
+                )
+            except Exception as exc:
+                return {"status": "rejected", "reason": f"Invalid waypoint pose: {exc}"}
+            print(
+                "[real_exploration] manual waypoint requested "
+                f"x={target_pose.x:.3f} y={target_pose.y:.3f} yaw={target_pose.yaw:.3f}",
+                flush=True,
+            )
+            goal = self._make_nav2_goal(
+                target_pose,
+                goal_type="manual_waypoint",
+                reason="operator_click_waypoint",
+            )
+            self.status = "manual_waypoint_active"
+            self._push_progress_update(
+                message=f"Sending clicked waypoint ({target_pose.x:.2f}, {target_pose.y:.2f}) to Nav2.",
+                frontier_id=None,
+            )
+            result = self.nav2.navigate_to_pose(
+                goal,
+                ignore_pause_cancel=True,
+                feedback_callback=self._publish_navigation_feedback,
+            )
+            self._consume_nav_result(result)
+            self.status = "manual_waypoint_succeeded" if result.status == "succeeded" else "manual_waypoint_failed"
+            print(
+                "[real_exploration] manual waypoint result "
+                f"status={result.status} reason={result.reason}",
+                flush=True,
+            )
+            self.guardrail_events.append(
+                {
+                    "type": "manual_waypoint_navigation",
+                    "requested_pose": target_pose.to_dict(),
+                    "nav2_result": result.to_dict(),
+                }
+            )
+            self._push_progress_update(
+                message=f"Clicked waypoint navigation {result.status}: {result.reason}",
+                frontier_id=None,
+            )
+            normalized_pose = None
+            if result.plan and result.plan.status == "succeeded" and result.plan.path_cells:
+                normalized_pose = self._require_effective_map().cell_to_pose(
+                    result.plan.path_cells[-1].x,
+                    result.plan.path_cells[-1].y,
+                    yaw=target_pose.yaw,
+                ).to_dict()
+            return {
+                "status": result.status,
+                "reason": result.reason,
+                "requested_pose": target_pose.to_dict(),
+                "normalized_pose": normalized_pose,
+                "nav2_result": result.to_dict(),
+                "map": self._build_map_payload(),
+            }
+
+    def preview_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            try:
+                current_pose = self.runtime.current_pose()
+                target_pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", current_pose.yaw if current_pose is not None else 0.0)),
+                )
+            except Exception as exc:
+                return {"status": "rejected", "reason": f"Invalid waypoint pose: {exc}"}
+            goal = self._make_nav2_goal(
+                target_pose,
+                goal_type="manual_waypoint_preview",
+                reason="operator_click_waypoint_preview",
+            )
+            plan = self.nav2.compute_path(goal, record=True)
+            self.last_nav2_preview = {
+                "requested_pose": target_pose.to_dict(),
+                "plan": plan.to_dict(),
+                "created_at": time.time(),
+            }
+            self._push_progress_update(
+                message=f"Previewed Nav2 path to clicked waypoint: {plan.status}.",
+                frontier_id=None,
+            )
+            return {
+                "status": plan.status,
+                "reason": plan.reason,
+                "requested_pose": target_pose.to_dict(),
+                "plan": plan.to_dict(),
+                "map": self._build_map_payload(),
+            }
 
     def call_semantic_llm(self) -> dict[str, Any]:
         with self._lock:
@@ -3350,11 +3568,17 @@ class RosExplorationSession:
         }
 
     def _current_ros_map(self) -> RosOccupancyMap | None:
+        if (
+            self.config.ros_navigation_map_source == "external"
+            and self.config.ros_fuse_external_projected_map_snapshots
+            and self._latest_fused_projected_map is not None
+        ):
+            return self._latest_fused_projected_map
         return self.runtime.latest_map
 
     def _current_map(self) -> RosOccupancyMap | None:
         self._consume_runtime_scan_observations()
-        if self.config.ros_navigation_map_source == "fused_scan":
+        if self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
             return self._current_scan_fused_map() or self._current_ros_map()
         return self._current_ros_map() or self._current_scan_fused_map()
 
@@ -3385,12 +3609,23 @@ class RosExplorationSession:
         if self.runtime.latest_map is not None:
             self.scan_map_resolution = float(self.runtime.latest_map.resolution)
         observations, stop_index = self.runtime.drain_scan_observations(self.scan_observation_index)
-        if not observations:
-            return
-        for observation in observations:
-            self._integrate_scan_observation(observation)
+        point_observations, point_stop_index = self._drain_point_cloud_observations()
+        if self.config.ros_navigation_map_source != "fused_point_cloud":
+            for observation in observations:
+                self._integrate_scan_observation(observation)
+        if self.config.ros_navigation_map_source == "fused_point_cloud":
+            for observation in point_observations:
+                self._integrate_point_cloud_observation(observation)
         self.scan_observation_index = stop_index
-        self._publish_navigation_map()
+        self.point_cloud_observation_index = point_stop_index
+        if observations or point_observations:
+            self._publish_navigation_map()
+
+    def _drain_point_cloud_observations(self) -> tuple[list[dict[str, Any]], int]:
+        drain = getattr(self.runtime, "drain_point_cloud_observations", None)
+        if drain is None:
+            return [], getattr(self, "point_cloud_observation_index", 0)
+        return drain(getattr(self, "point_cloud_observation_index", 0))
 
     def _integrate_scan_observation(self, observation: dict[str, Any]) -> None:
         pose = observation.get("pose")
@@ -3414,6 +3649,38 @@ class RosExplorationSession:
             beam_stride=2,
             config=ACTIVE_RGBD_SCAN_FUSION_CONFIG,
         )
+
+    def _integrate_point_cloud_observation(self, observation: dict[str, Any]) -> None:
+        points = observation.get("points_xyz")
+        origin = observation.get("sensor_origin_xyz")
+        if points is None or origin is None:
+            return
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=origin,
+            points_xyz_map=points,
+            map_resolution_m=self.scan_map_resolution,
+            cell_from_world=lambda x, y: self._scan_world_cell(x, y),
+            known_cells=self.scan_known_cells,
+            evidence_scores=self.scan_occupancy_evidence,
+            range_edge_cells=self.scan_range_edge_cells,
+            config=self.point_cloud_fusion_config,
+        )
+        self.point_cloud_integration_summaries.append(
+            {
+                "raw_point_count": summary.raw_point_count,
+                "valid_point_count": summary.valid_point_count,
+                "voxel_point_count": summary.voxel_point_count,
+                "floor_point_count": summary.floor_point_count,
+                "obstacle_point_count": summary.obstacle_point_count,
+                "occupied_cell_count": summary.occupied_cell_count,
+                "free_cell_count": summary.free_cell_count,
+                "invalid_point_count": summary.invalid_point_count,
+                "integrated_rays": summary.integrated_rays,
+                "frame_id": str(observation.get("frame_id", "")),
+            }
+        )
+        if len(self.point_cloud_integration_summaries) > 64:
+            self.point_cloud_integration_summaries = self.point_cloud_integration_summaries[-64:]
 
     def _current_scan_fused_map(self) -> RosOccupancyMap | None:
         if not self.scan_known_cells:
@@ -3463,7 +3730,7 @@ class RosExplorationSession:
         )
 
     def _publish_navigation_map(self) -> None:
-        if self.config.ros_navigation_map_source != "fused_scan":
+        if self.config.ros_navigation_map_source not in ("fused_scan", "fused_point_cloud"):
             return
         raw_map = self._current_scan_fused_map() or self._current_ros_map()
         if raw_map is None:
@@ -3523,13 +3790,13 @@ class RosExplorationSession:
 
     def _require_pose(self) -> Pose2D:
         pose = self.runtime.current_pose()
-        if pose is None and self.config.ros_navigation_map_source == "fused_scan":
+        if pose is None and self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
             pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
         if pose is None:
             raise RuntimeError(
                 (
                     f"Robot pose in `{self.config.ros_map_frame}` is not available from TF yet"
-                    if self.config.ros_navigation_map_source != "fused_scan"
+                    if self.config.ros_navigation_map_source not in ("fused_scan", "fused_point_cloud")
                     else (
                         f"Robot pose is not available from TF yet in either `{self.config.ros_map_frame}` "
                         f"or `{self.config.ros_odom_frame}`."
@@ -3550,14 +3817,24 @@ class RosExplorationSession:
             reason=reason,
             should_cancel=self._pause_requested_or_canceled,
         )
+        fused_projected_map = event.pop("fused_projected_map", None)
+        if self.config.ros_fuse_external_projected_map_snapshots and isinstance(fused_projected_map, RosOccupancyMap):
+            self._latest_fused_projected_map = fused_projected_map
         observations = list(event.pop("observations", []))
         self.guardrail_events.append({"type": "turnaround_scan", "event": event})
         self.runtime.spin_for(0.25)
-        for observation in observations:
-            self._integrate_scan_observation(observation)
+        if self.config.ros_navigation_map_source != "fused_point_cloud":
+            for observation in observations:
+                self._integrate_scan_observation(observation)
+        point_observations, point_stop_index = self._drain_point_cloud_observations()
+        if self.config.ros_navigation_map_source == "fused_point_cloud":
+            for observation in point_observations:
+                self._integrate_point_cloud_observation(observation)
         self.scan_observation_index = int(event.get("observation_stop_index", self.scan_observation_index))
+        self.point_cloud_observation_index = point_stop_index
         event["selected_count"] = len(observations)
         event["raw_count"] = len(observations)
+        event["point_cloud_observation_count"] = len(point_observations)
         self._publish_navigation_map()
         self._capture_keyframe(reason=reason)
         pose = self.runtime.current_pose()
@@ -3569,13 +3846,19 @@ class RosExplorationSession:
         if pose is None:
             return
         scan = self.runtime.latest_scan
+        latest_point_cloud = getattr(self.runtime, "latest_point_cloud_stats", None)
+        point_count = (
+            int(latest_point_cloud.get("point_count", 0))
+            if isinstance(latest_point_cloud, dict) and self.config.ros_navigation_map_source == "fused_point_cloud"
+            else len(getattr(scan, "ranges", []) or [])
+        )
         frame_id = f"kf_{len(self.keyframes) + 1:03d}"
         frame = {
             "frame_id": frame_id,
             "pose": pose.to_dict(),
             "region_id": "unknown",
             "visible_objects": [],
-            "point_count": len(getattr(scan, "ranges", []) or []),
+            "point_count": point_count,
             "depth_min_m": float(getattr(scan, "range_min", 0.0) or 0.0),
             "depth_max_m": float(getattr(scan, "range_max", self.config.sensor_range_m) or self.config.sensor_range_m),
             "description": (
@@ -3584,6 +3867,12 @@ class RosExplorationSession:
             ),
             "thumbnail_data_url": self.runtime.latest_image_data_url or "",
         }
+        if isinstance(latest_point_cloud, dict):
+            frame["rgbd_summary"] = {
+                "source": "orbbec_gemini2_point_cloud",
+                "latest_point_cloud": latest_point_cloud,
+                "recent_fusion": list(self.point_cloud_integration_summaries[-4:]),
+            }
         self.keyframes.append(frame)
         if self.config.automatic_semantic_waypoints:
             self.semantic_observer.observe_keyframe(
@@ -4215,6 +4504,35 @@ class RosExplorationSession:
     def _publish_live_map(self, message: str) -> None:
         self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
 
+    def _live_robot_pose(self) -> Pose2D | None:
+        pose = self.runtime.current_pose()
+        if pose is None and self.config.ros_navigation_map_source in ("fused_scan", "fused_point_cloud"):
+            pose = self.runtime.current_pose_in_frame(self.config.ros_odom_frame)
+        return pose
+
+    def _publish_navigation_feedback(self, sample: dict[str, Any]) -> None:
+        now = time.time()
+        if now - self._last_live_pose_publish_s < 0.35:
+            return
+        self._last_live_pose_publish_s = now
+        pose_payload = sample.get("current_pose")
+        if isinstance(pose_payload, dict):
+            try:
+                pose = Pose2D(
+                    float(pose_payload["x"]),
+                    float(pose_payload["y"]),
+                    float(pose_payload.get("yaw", 0.0)),
+                )
+            except Exception:
+                pose = None
+            if pose is not None:
+                self._update_pose_history(pose)
+        distance_remaining = sample.get("distance_remaining_m")
+        message = "Nav2 waypoint active."
+        if distance_remaining is not None:
+            message = f"Nav2 waypoint active, {float(distance_remaining):.2f} m remaining."
+        self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
+
     def _consume_nav_result(self, result: Nav2NavigateResult) -> None:
         if result.reached_pose is not None:
             self._update_pose_history(result.reached_pose)
@@ -4233,6 +4551,7 @@ class RosExplorationSession:
 
     def _build_map_payload(self) -> dict[str, Any]:
         occupancy_map = self._require_effective_map()
+        live_robot_pose = self._live_robot_pose()
         semantic_memory = self.semantic_observer.snapshot() if self.config.automatic_semantic_waypoints else {}
         occupancy_cells = []
         for y in range(occupancy_map.height):
@@ -4262,7 +4581,7 @@ class RosExplorationSession:
             f"ROS/Nav2 exploration completed with coverage {self._coverage(occupancy_map):.3f}, "
             f"{len(self.frontier_memory.records)} tracked frontiers, and {len(self.decision_log)} decisions."
         )
-        return {
+        payload = {
             "map_id": self.config.session,
             "frame": self.config.ros_map_frame,
             "resolution": float(occupancy_map.resolution),
@@ -4272,6 +4591,7 @@ class RosExplorationSession:
             "created_at": time.time(),
             "source": self.config.source,
             "mode": "ros_nav2_agentic",
+            "robot_pose": None if live_robot_pose is None else live_robot_pose.to_dict(),
             "trajectory": self.trajectory,
             "keyframes": self.keyframes,
             "regions": [],
@@ -4297,15 +4617,20 @@ class RosExplorationSession:
                     "total_distance_m": round(self.total_distance_m, 3),
                 },
                 "nav2": self.nav2.snapshot(),
+                "nav2_preview": self.last_nav2_preview,
                 "ros_runtime": {
                     "map_topic": self.config.ros_map_topic,
                     "scan_topic": self.config.ros_scan_topic,
+                    "point_cloud_topic": self.config.ros_point_cloud_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
                     "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
                     "odom_frame": self.config.ros_odom_frame,
                     "map_frame": self.config.ros_map_frame,
+                    "point_cloud_fusion": {
+                        "recent_summaries": list(self.point_cloud_integration_summaries[-8:]),
+                    },
                 },
                 "llm_policy": {
                     "explorer_policy": self.config.explorer_policy,
@@ -4314,6 +4639,42 @@ class RosExplorationSession:
                 },
             },
         }
+        now = time.time()
+        if now - self._last_map_payload_log_s >= 2.0:
+            self._last_map_payload_log_s = now
+            raw_summary = self.runtime.latest_map_summary() if hasattr(self.runtime, "latest_map_summary") else None
+            fused_summary = None
+            if self._latest_fused_projected_map is not None:
+                fused_summary = {
+                    "resolution": round(float(self._latest_fused_projected_map.resolution), 4),
+                    "width": int(self._latest_fused_projected_map.width),
+                    "height": int(self._latest_fused_projected_map.height),
+                    "free_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) == 0),
+                    "occupied_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) > 50),
+                    "unknown_cells": sum(1 for item in self._latest_fused_projected_map.data if int(item) < 0),
+                    "bounds": self._latest_fused_projected_map.bounds(),
+                }
+            free_cells = 0
+            occupied_cells = 0
+            unknown_cells = 0
+            for y in range(occupancy_map.height):
+                for x in range(occupancy_map.width):
+                    value = occupancy_map.value(x, y)
+                    if value == 0:
+                        free_cells += 1
+                    elif value > 50:
+                        occupied_cells += 1
+                    elif value < 0:
+                        unknown_cells += 1
+            print(
+                "[ros_exploration_session] UI map payload "
+                f"source_topic={self.config.ros_map_topic} raw_summary={raw_summary} "
+                f"fused_projected_summary={fused_summary} "
+                f"payload_cells={len(occupancy_cells)} free={free_cells} "
+                f"occupied={occupied_cells} unknown={unknown_cells} "
+                f"coverage={payload['coverage']} bounds={payload['occupancy']['bounds']}"
+            )
+        return payload
 
     def _make_nav2_goal(self, pose: Pose2D, *, goal_type: str, reason: str) -> Nav2GoalRequest:
         self.nav2_goal_counter += 1
@@ -4369,8 +4730,15 @@ class _ExplorationStartGate:
 
 
 class _GatedExplorationUIController(LocalExplorationUIController):
-    def __init__(self, backend: ExplorationBackend, start_gate: _ExplorationStartGate) -> None:
-        super().__init__(backend)
+    def __init__(
+        self,
+        backend: ExplorationBackend,
+        start_gate: _ExplorationStartGate,
+        *,
+        waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        super().__init__(backend, waypoint_navigator=waypoint_navigator, waypoint_previewer=waypoint_previewer)
         self.start_gate = start_gate
 
     def start_explore(self, *, area: str, session: str | None = None, source: str = "operator") -> dict[str, Any]:
@@ -4388,6 +4756,40 @@ class ManiSkillExplorationRunner:
         self.config = config
         self.backend = backend
         self.start_gate = start_gate
+        self._active_session: _ApartmentExplorationSession | RosExplorationSession | None = None
+        self._active_session_lock = threading.RLock()
+
+    def navigate_to_waypoint(self, pose: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": (
+                    "No live exploration session is running. For click waypoint tests, keep the session alive "
+                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                ),
+            }
+        navigate = getattr(session, "navigate_to_manual_waypoint", None)
+        if not callable(navigate):
+            return {"status": "unavailable", "reason": "The active exploration session does not support waypoint navigation."}
+        return navigate(pose)
+
+    def preview_waypoint(self, pose: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": (
+                    "No live exploration session is running. For path previews, keep the session alive "
+                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                ),
+            }
+        preview = getattr(session, "preview_manual_waypoint", None)
+        if not callable(preview):
+            return {"status": "unavailable", "reason": "The active exploration session does not support waypoint previews."}
+        return preview(pose)
 
     def run(self) -> dict[str, Any]:
         if self.start_gate is not None:
@@ -4404,6 +4806,8 @@ class ManiSkillExplorationRunner:
             session = RosExplorationSession(self.config, self.backend, str(task["task_id"]))
         else:
             session = _ApartmentExplorationSession(self.config, self.backend, str(task["task_id"]))
+        with self._active_session_lock:
+            self._active_session = session
         try:
             map_payload = session.run()
         except Exception as exc:
@@ -4414,6 +4818,9 @@ class ManiSkillExplorationRunner:
             )
             raise
         finally:
+            with self._active_session_lock:
+                if self._active_session is session:
+                    self._active_session = None
             close = getattr(session, "close", None)
             if callable(close):
                 close()
@@ -4502,9 +4909,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument(
+        "--ros-map-updates-topic",
+        default=None,
+        help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
+    )
+    parser.add_argument(
+        "--ros-fuse-external-projected-map-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse external /projected_map snapshots captured during camera-pan scans. "
+            "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
+        ),
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
+    parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
+    parser.add_argument("--ros-scan-active-release-delay-s", type=float, default=3.0)
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
@@ -4519,6 +4947,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
+    parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-step-deg", type=float, default=60.0)
+    parser.add_argument("--camera-pan-compute-s", type=float, default=2.0)
+    parser.add_argument("--camera-pan-sample-count", type=int, default=12)
+    parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
+    parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
+    parser.add_argument("--point-cloud-floor-free-max-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-obstacle-min-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-robot-clearance-height-m", type=float, default=1.50)
+    parser.add_argument("--point-cloud-obstacle-max-z-m", type=float, default=1.80)
+    parser.add_argument("--point-cloud-max-rays", type=int, default=2400)
     parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--semantic-waypoints-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -4562,7 +5004,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     backend = ExplorationBackend(
         ExplorationBackendConfig(
-            mode="sim",
+            mode="ros" if args.nav2_mode == "ros" else "sim",
             persist_path=args.persist_path,
             restore_persisted_state=args.restore_persisted_state,
             occupancy_resolution=args.occupancy_resolution,
@@ -4617,7 +5059,12 @@ def main(argv: list[str] | None = None) -> int:
             nav2_recovery_enabled=args.nav2_recovery_enabled,
             ros_navigation_map_source=args.ros_navigation_map_source,
             ros_map_topic=args.ros_map_topic,
+            ros_map_updates_topic=args.ros_map_updates_topic,
+            ros_fuse_external_projected_map_snapshots=args.ros_fuse_external_projected_map_snapshots,
             ros_scan_topic=args.ros_scan_topic,
+            ros_point_cloud_topic=args.ros_point_cloud_topic,
+            ros_scan_active_topic=args.ros_scan_active_topic,
+            ros_scan_active_release_delay_s=args.ros_scan_active_release_delay_s,
             ros_rgb_topic=args.ros_rgb_topic,
             ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
@@ -4632,6 +5079,20 @@ def main(argv: list[str] | None = None) -> int:
             ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
             ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
             ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+            ros_turn_scan_mode=args.ros_turn_scan_mode,
+            robot_brain_url=args.robot_brain_url,
+            camera_pan_action_key=args.camera_pan_action_key,
+            camera_pan_settle_s=args.camera_pan_settle_s,
+            camera_pan_step_deg=args.camera_pan_step_deg,
+            camera_pan_compute_s=args.camera_pan_compute_s,
+            camera_pan_sample_count=args.camera_pan_sample_count,
+            point_cloud_range_min_m=args.point_cloud_range_min_m,
+            point_cloud_range_max_m=args.point_cloud_range_max_m,
+            point_cloud_floor_free_max_z_m=args.point_cloud_floor_free_max_z_m,
+            point_cloud_obstacle_min_z_m=args.point_cloud_obstacle_min_z_m,
+            point_cloud_robot_clearance_height_m=args.point_cloud_robot_clearance_height_m,
+            point_cloud_obstacle_max_z_m=args.point_cloud_obstacle_max_z_m,
+            point_cloud_max_rays=args.point_cloud_max_rays,
             sim_motion_speed=args.sim_motion_speed,
             ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
             experimental_free_space_semantic_waypoints=args.experimental_free_space_semantic_waypoints,
@@ -4653,9 +5114,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.serve_review_ui:
         if args.wait_for_ui_start:
             start_gate = _ExplorationStartGate(runner.config)
-            controller = _GatedExplorationUIController(backend, start_gate)
+            controller = _GatedExplorationUIController(
+                backend,
+                start_gate,
+                waypoint_navigator=runner.navigate_to_waypoint,
+                waypoint_previewer=runner.preview_waypoint,
+            )
         else:
-            controller = LocalExplorationUIController(backend)
+            controller = LocalExplorationUIController(
+                backend,
+                waypoint_navigator=runner.navigate_to_waypoint,
+                waypoint_previewer=runner.preview_waypoint,
+            )
         server = ExplorationReviewServer(
             controller,
             host=args.review_host,

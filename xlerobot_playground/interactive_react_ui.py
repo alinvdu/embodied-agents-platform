@@ -62,6 +62,9 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
     .thumbs img { width: 100%; border-radius: 8px; border: 1px solid var(--line); background: white; }
     .muted { color: var(--muted); }
     .error { color: var(--red); font-weight: 750; min-height: 1.4em; }
+    .map-legend { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-top: 10px; color: #3f4a56; font-weight: 650; }
+    .legend-item { display: inline-flex; align-items: center; gap: 7px; }
+    .legend-swatch { width: 12px; height: 12px; border-radius: 3px; border: 1px solid rgba(15,23,42,.16); }
     @media (max-width: 980px) { .layout { grid-template-columns: 1fr; } #map { height: 560px; } }
   </style>
 </head>
@@ -345,12 +348,12 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
         const p = project({x: cell.x, y: cell.y});
         const p2 = project({x: Number(cell.x) + resolution, y: Number(cell.y) + resolution});
         const fill = cell.manual_override === 'blocked'
-          ? 'rgba(24,35,15,.86)'
+          ? 'rgba(15,23,42,.92)'
           : cell.manual_override === 'cleared'
-            ? 'rgba(79,119,45,.16)'
+            ? 'rgba(20,184,166,.30)'
             : cell.state === 'occupied'
-              ? 'rgba(24,35,15,.58)'
-              : 'rgba(79,119,45,.16)';
+              ? 'rgba(15,23,42,.82)'
+              : 'rgba(20,184,166,.30)';
         return e('rect', {
           key: `${cellX}:${cellY}`,
           x: p.x,
@@ -653,7 +656,13 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
                 pendingSubwaypoint,
                 setPendingSubwaypoint,
                 onPost: post,
-              })
+              }),
+              e('div', {className: 'map-legend'},
+                e('span', {className: 'legend-item'}, e('span', {className: 'legend-swatch', style: {background: 'rgba(20,184,166,.30)'}}), 'known free'),
+                e('span', {className: 'legend-item'}, e('span', {className: 'legend-swatch', style: {background: 'rgba(15,23,42,.82)'}}), 'occupied'),
+                e('span', {className: 'legend-item'}, e('span', {className: 'legend-swatch', style: {background: '#4f772d'}}), 'trajectory'),
+                e('span', {className: 'legend-item'}, e('span', {className: 'legend-swatch', style: {background: '#f59e0b'}}), 'planned path')
+              )
             )
           )
         )

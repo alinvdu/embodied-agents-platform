@@ -40,6 +40,16 @@ def dump_yaml(path: str | Path, data: dict[str, Any]) -> None:
         yaml.safe_dump(data, handle, sort_keys=False)
 
 
+def _remove_critic(root: dict[str, Any], critic_name: str) -> None:
+    critics = root.get("critics")
+    if isinstance(critics, list):
+        root["critics"] = [item for item in critics if item != critic_name]
+    prefix = f"{critic_name}."
+    for key in list(root):
+        if key.startswith(prefix):
+            root.pop(key, None)
+
+
 def render_slam_toolbox_params(
     *,
     use_sim_time: bool = True,
@@ -82,6 +92,7 @@ def patch_nav2_params(
     odom_frame: str = "odom",
     base_frame: str = "base_link",
     scan_topic: str = "/scan",
+    global_map_topic: str = "/projected_map",
     robot_radius: float = 0.24,
     footprint: str | None = None,
     footprint_padding: float = 0.0,
@@ -96,11 +107,20 @@ def patch_nav2_params(
     voxel_z_voxels: int = 32,
     max_linear_velocity: float = 0.65,
     max_angular_velocity: float = 0.45,
+    min_linear_velocity_threshold: float = 0.01,
+    min_angular_velocity_threshold: float = 0.02,
+    min_speed_theta: float = 0.02,
     trans_stopped_velocity: float = 0.05,
     path_align_scale: float = 16.0,
     goal_align_scale: float = 12.0,
     rotate_to_goal_scale: float = 8.0,
     rotate_to_goal_slowing_factor: float = 3.0,
+    transform_tolerance_s: float = 0.5,
+    progress_required_movement_radius: float = 0.05,
+    progress_movement_time_allowance_s: float = 25.0,
+    xy_goal_tolerance_m: float = 0.18,
+    yaw_goal_tolerance_rad: float = 3.14,
+    enable_local_scan_obstacles: bool = False,
 ) -> dict[str, Any]:
     params = deepcopy(base_params)
 
@@ -156,6 +176,7 @@ def patch_nav2_params(
         root["global_frame"] = global_frame
         root["robot_base_frame"] = base_frame
         root["use_sim_time"] = use_sim_time
+        root["transform_tolerance"] = transform_tolerance_s
         if footprint:
             root["footprint"] = deepcopy(footprint)
             root.pop("robot_radius", None)
@@ -170,9 +191,33 @@ def patch_nav2_params(
         plugins = list(root.get("plugins", []))
         if costmap_name == "global_costmap":
             plugins = [plugin for plugin in plugins if plugin not in {"obstacle_layer", "voxel_layer"}]
+            if "static_layer" not in plugins:
+                plugins.insert(0, "static_layer")
             root["plugins"] = plugins
             root.pop("obstacle_layer", None)
             root.pop("voxel_layer", None)
+            static_layer = root.setdefault("static_layer", {})
+            static_layer["plugin"] = "nav2_costmap_2d::StaticLayer"
+            static_layer["map_topic"] = global_map_topic
+            static_layer["subscribe_to_updates"] = True
+            static_layer["map_subscribe_transient_local"] = False
+            static_layer["enabled"] = True
+            static_layer["transform_tolerance"] = transform_tolerance_s
+        else:
+            if not enable_local_scan_obstacles:
+                plugins = [plugin for plugin in plugins if plugin not in {"obstacle_layer", "voxel_layer"}]
+                if "static_layer" not in plugins:
+                    plugins.insert(0, "static_layer")
+                root["plugins"] = plugins
+                root.pop("obstacle_layer", None)
+                root.pop("voxel_layer", None)
+                static_layer = root.setdefault("static_layer", {})
+                static_layer["plugin"] = "nav2_costmap_2d::StaticLayer"
+                static_layer["map_topic"] = global_map_topic
+                static_layer["subscribe_to_updates"] = True
+                static_layer["map_subscribe_transient_local"] = False
+                static_layer["enabled"] = True
+                static_layer["transform_tolerance"] = transform_tolerance_s
         if inflation_radius <= 0.0 and "inflation_layer" in plugins:
             plugins = [plugin for plugin in plugins if plugin != "inflation_layer"]
             root["plugins"] = plugins
@@ -226,6 +271,7 @@ def patch_nav2_params(
     behavior = node_params("behavior_server")
     behavior["global_frame"] = odom_frame
     behavior["robot_base_frame"] = base_frame
+    behavior["transform_tolerance"] = transform_tolerance_s
     if "max_rotational_vel" in behavior:
         behavior["max_rotational_vel"] = max_angular_velocity
     if "min_rotational_vel" in behavior:
@@ -233,17 +279,37 @@ def patch_nav2_params(
 
     controller = node_params("controller_server")
     controller["odom_topic"] = "/odom"
+    controller["transform_tolerance"] = transform_tolerance_s
+    controller["min_x_velocity_threshold"] = min_linear_velocity_threshold
+    controller["min_theta_velocity_threshold"] = min_angular_velocity_threshold
+    progress_checker = controller.setdefault("progress_checker", {})
+    progress_checker["plugin"] = progress_checker.get("plugin", "nav2_controller::SimpleProgressChecker")
+    progress_checker["required_movement_radius"] = progress_required_movement_radius
+    progress_checker["movement_time_allowance"] = progress_movement_time_allowance_s
+    controller["goal_checker_plugins"] = ["goal_checker"]
+    controller.pop("general_goal_checker", None)
+    goal_checker = controller.setdefault("goal_checker", {})
+    goal_checker["plugin"] = "nav2_controller::PositionGoalChecker"
+    goal_checker["xy_goal_tolerance"] = xy_goal_tolerance_m
+    goal_checker["stateful"] = True
     follow_path = controller.get("FollowPath")
     if isinstance(follow_path, dict):
         follow_path["max_vel_x"] = max_linear_velocity
         follow_path["max_speed_xy"] = max_linear_velocity
         follow_path["max_vel_theta"] = max_angular_velocity
+        follow_path["min_speed_theta"] = min(min_speed_theta, max_angular_velocity)
         follow_path["trans_stopped_velocity"] = trans_stopped_velocity
-        if "PathAlign.scale" in follow_path:
+        if path_align_scale <= 0.0:
+            _remove_critic(follow_path, "PathAlign")
+        elif "PathAlign.scale" in follow_path:
             follow_path["PathAlign.scale"] = path_align_scale
-        if "GoalAlign.scale" in follow_path:
+        if goal_align_scale <= 0.0:
+            _remove_critic(follow_path, "GoalAlign")
+        elif "GoalAlign.scale" in follow_path:
             follow_path["GoalAlign.scale"] = goal_align_scale
-        if "RotateToGoal.scale" in follow_path:
+        if rotate_to_goal_scale <= 0.0:
+            _remove_critic(follow_path, "RotateToGoal")
+        elif "RotateToGoal.scale" in follow_path:
             follow_path["RotateToGoal.scale"] = rotate_to_goal_scale
         if "RotateToGoal.slowing_factor" in follow_path:
             follow_path["RotateToGoal.slowing_factor"] = rotate_to_goal_slowing_factor
@@ -258,6 +324,9 @@ def patch_nav2_params(
     if isinstance(velocity_smoother.get("min_velocity"), list) and len(velocity_smoother["min_velocity"]) >= 3:
         velocity_smoother["min_velocity"][0] = -max_linear_velocity
         velocity_smoother["min_velocity"][2] = -max_angular_velocity
+    if isinstance(velocity_smoother.get("deadband_velocity"), list) and len(velocity_smoother["deadband_velocity"]) >= 3:
+        velocity_smoother["deadband_velocity"][0] = min_linear_velocity_threshold
+        velocity_smoother["deadband_velocity"][2] = min_angular_velocity_threshold
 
     amcl = node_params("amcl")
     if amcl:

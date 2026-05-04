@@ -29,6 +29,10 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --no-file-output \
   --enable-depth \
   --enable-depth-registration \
+  --enable-point-cloud \
+  --point-cloud-format xyz \
+  --point-cloud-stride 2 \
+  --point-cloud-max-points 200000 \
   --enable-imu \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
@@ -41,3 +45,11 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
 This sends each RGB-D pair to the robot brain as a single in-memory frame at the camera capture rate. With `--enable-imu`, the sidecar also pushes each IMU callback as a non-blocking UDP datagram to the robot brain, which then serves `/imu` as an in-memory debug snapshot and `/ws/imu` as the high-rate stream.
 
 Use `--enable-depth-registration` to request Orbbec hardware depth-to-color alignment for RGB-D odometry. Depth defaults to the camera's first matching D2C-compatible Y16 profile at the selected RGB FPS. If you need to force a specific depth source mode, run `--list-profiles`, then pass one of the listed depth profiles with `--depth-width`, `--depth-height`, and `--depth-fps`.
+
+With `--enable-point-cloud`, the sidecar appends downsampled `xyz_float32` point cloud data in metres to the same RGB-D payload. The ROS bridge republishes it as `/camera/head/points` in the `head_camera_link` frame. A quick manual validation path is:
+
+```sh
+ros2 topic echo /camera/head/points --once
+ros2 topic hz /camera/head/points
+ros2 run rviz2 rviz2
+```

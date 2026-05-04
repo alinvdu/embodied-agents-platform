@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <fcntl.h>
@@ -55,6 +56,19 @@ struct Options {
     int camera_http_port = 8765;
     std::string camera_http_path = "/camera/rgbd";
     int camera_http_timeout_ms = 100;
+    bool enable_point_cloud = false;
+    std::string point_cloud_format = "xyz";
+    int point_cloud_stride = 1;
+    int point_cloud_max_points = 200000;
+    double point_cloud_min_z_m = 0.25;
+    double point_cloud_max_z_m = 4.0;
+};
+
+struct PointCloudPayload {
+    uint32_t format = 0;
+    uint32_t count = 0;
+    uint32_t stride_bytes = 0;
+    std::vector<uint8_t> bytes;
 };
 
 struct LatestImuSample {
@@ -181,6 +195,16 @@ void append_u64_be(std::vector<uint8_t> &buffer, uint64_t value) {
     }
 }
 
+void append_f32_le(std::vector<uint8_t> &buffer, float value) {
+    uint32_t raw = 0;
+    static_assert(sizeof(raw) == sizeof(value), "float32 payload requires 32-bit floats");
+    std::memcpy(&raw, &value, sizeof(value));
+    buffer.push_back(static_cast<uint8_t>(raw & 0xff));
+    buffer.push_back(static_cast<uint8_t>((raw >> 8) & 0xff));
+    buffer.push_back(static_cast<uint8_t>((raw >> 16) & 0xff));
+    buffer.push_back(static_cast<uint8_t>((raw >> 24) & 0xff));
+}
+
 uint64_t unix_time_us() {
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now).count());
@@ -207,35 +231,85 @@ std::vector<uint8_t> depth_frame_to_big_endian_mm(const std::shared_ptr<ob::Dept
     return out;
 }
 
-std::string camera_intrinsics_metadata_json(const std::shared_ptr<ob::ColorFrame> &rgb_frame) {
+std::string camera_metadata_json(const std::shared_ptr<ob::ColorFrame> &rgb_frame, const PointCloudPayload *point_cloud) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(9) << "{";
+    bool wrote_field = false;
     try {
         auto profile = rgb_frame->getStreamProfile();
-        if(!profile || !profile->is<ob::VideoStreamProfile>()) {
-            return "{}";
+        if(profile && profile->is<ob::VideoStreamProfile>()) {
+            auto video_profile = profile->as<ob::VideoStreamProfile>();
+            const auto intrinsic = video_profile->getIntrinsic();
+            out << "\"camera_intrinsics\":{"
+                << "\"fx\":" << intrinsic.fx << ","
+                << "\"fy\":" << intrinsic.fy << ","
+                << "\"cx\":" << intrinsic.cx << ","
+                << "\"cy\":" << intrinsic.cy << ","
+                << "\"width\":" << intrinsic.width << ","
+                << "\"height\":" << intrinsic.height
+                << "}";
+            wrote_field = true;
         }
-        auto video_profile = profile->as<ob::VideoStreamProfile>();
-        const auto intrinsic = video_profile->getIntrinsic();
-        std::ostringstream out;
-        out << std::fixed << std::setprecision(9)
-            << "{\"camera_intrinsics\":{"
-            << "\"fx\":" << intrinsic.fx << ","
-            << "\"fy\":" << intrinsic.fy << ","
-            << "\"cx\":" << intrinsic.cx << ","
-            << "\"cy\":" << intrinsic.cy << ","
-            << "\"width\":" << intrinsic.width << ","
-            << "\"height\":" << intrinsic.height
-            << "}}";
-        return out.str();
     }
     catch(const std::exception &) {
-        return "{}";
     }
+    if(point_cloud && point_cloud->count > 0) {
+        if(wrote_field) {
+            out << ",";
+        }
+        out << "\"point_cloud\":{"
+            << "\"format\":\"xyz_float32\","
+            << "\"units\":\"m\","
+            << "\"count\":" << point_cloud->count << ","
+            << "\"stride_bytes\":" << point_cloud->stride_bytes
+            << "}";
+        wrote_field = true;
+    }
+    out << "}";
+    return out.str();
+}
+
+PointCloudPayload build_xyz_point_cloud_payload(
+    const std::shared_ptr<ob::Frame> &cloud_frame,
+    const Options &options
+) {
+    PointCloudPayload payload;
+    payload.format = 1;
+    payload.stride_bytes = 12;
+    if(!cloud_frame || cloud_frame->dataSize() == 0) {
+        return payload;
+    }
+    const auto *points = reinterpret_cast<const OBPoint *>(cloud_frame->data());
+    const size_t raw_count = cloud_frame->dataSize() / sizeof(OBPoint);
+    const size_t sample_stride = static_cast<size_t>(std::max(1, options.point_cloud_stride));
+    const size_t max_points = static_cast<size_t>(std::max(0, options.point_cloud_max_points));
+    payload.bytes.reserve(std::min(raw_count / sample_stride + 1, max_points) * payload.stride_bytes);
+    for(size_t index = 0; index < raw_count; index += sample_stride) {
+        if(max_points > 0 && payload.count >= max_points) {
+            break;
+        }
+        const float x_m = static_cast<float>(points[index].x) / 1000.0f;
+        const float y_m = static_cast<float>(points[index].y) / 1000.0f;
+        const float z_m = static_cast<float>(points[index].z) / 1000.0f;
+        if(!std::isfinite(x_m) || !std::isfinite(y_m) || !std::isfinite(z_m) || z_m <= 0.0f) {
+            continue;
+        }
+        if(z_m < options.point_cloud_min_z_m || z_m > options.point_cloud_max_z_m) {
+            continue;
+        }
+        append_f32_le(payload.bytes, x_m);
+        append_f32_le(payload.bytes, y_m);
+        append_f32_le(payload.bytes, z_m);
+        ++payload.count;
+    }
+    return payload;
 }
 
 std::vector<uint8_t> build_rgbd_payload(
     const std::shared_ptr<ob::ColorFrame> &rgb_frame,
     const std::shared_ptr<ob::DepthFrame> &depth_frame,
-    uint64_t fallback_frame_index
+    uint64_t fallback_frame_index,
+    const PointCloudPayload *point_cloud = nullptr
 ) {
     const auto rgb_width = rgb_frame->getWidth();
     const auto rgb_height = rgb_frame->getHeight();
@@ -256,16 +330,20 @@ std::vector<uint8_t> build_rgbd_payload(
         depth_payload = depth_frame_to_big_endian_mm(depth_frame);
     }
 
-    const std::string metadata_json = camera_intrinsics_metadata_json(rgb_frame);
+    const std::string metadata_json = camera_metadata_json(rgb_frame, point_cloud);
+    const uint32_t point_format = point_cloud ? point_cloud->format : 0;
+    const uint32_t point_count = point_cloud ? point_cloud->count : 0;
+    const uint32_t point_stride_bytes = point_cloud ? point_cloud->stride_bytes : 0;
+    const uint64_t point_payload_size = point_cloud ? static_cast<uint64_t>(point_cloud->bytes.size()) : 0;
     std::vector<uint8_t> payload;
-    payload.reserve(static_cast<size_t>(68 + rgb_size + depth_payload.size() + metadata_json.size()));
+    payload.reserve(static_cast<size_t>(88 + rgb_size + depth_payload.size() + point_payload_size + metadata_json.size()));
     const char magic[8] = {'X', 'L', 'R', 'G', 'B', 'D', '1', '\0'};
     const uint64_t frame_index = rgb_frame->getIndex() > 0 ? rgb_frame->getIndex() : fallback_frame_index;
     const uint64_t timestamp_us = rgb_frame->getSystemTimeStampUs() > 0
         ? rgb_frame->getSystemTimeStampUs()
         : unix_time_us();
     payload.insert(payload.end(), magic, magic + 8);
-    append_u32_be(payload, 2);
+    append_u32_be(payload, 3);
     append_u64_be(payload, frame_index);
     append_u64_be(payload, timestamp_us);
     append_u32_be(payload, rgb_width);
@@ -274,10 +352,17 @@ std::vector<uint8_t> build_rgbd_payload(
     append_u32_be(payload, depth_height);
     append_u64_be(payload, rgb_size);
     append_u64_be(payload, static_cast<uint64_t>(depth_payload.size()));
+    append_u32_be(payload, point_format);
+    append_u32_be(payload, point_count);
+    append_u32_be(payload, point_stride_bytes);
+    append_u64_be(payload, point_payload_size);
     append_u64_be(payload, static_cast<uint64_t>(metadata_json.size()));
     const auto *rgb_data = reinterpret_cast<const uint8_t *>(rgb_frame->getData());
     payload.insert(payload.end(), rgb_data, rgb_data + rgb_size);
     payload.insert(payload.end(), depth_payload.begin(), depth_payload.end());
+    if(point_cloud) {
+        payload.insert(payload.end(), point_cloud->bytes.begin(), point_cloud->bytes.end());
+    }
     payload.insert(payload.end(), metadata_json.begin(), metadata_json.end());
     return payload;
 }
@@ -448,6 +533,20 @@ int parse_int(const std::string &value, const std::string &name) {
     }
 }
 
+double parse_double(const std::string &value, const std::string &name) {
+    try {
+        size_t consumed = 0;
+        double parsed = std::stod(value, &consumed);
+        if(consumed != value.size()) {
+            throw std::invalid_argument("trailing characters");
+        }
+        return parsed;
+    }
+    catch(const std::exception &) {
+        throw std::runtime_error("Invalid number for " + name + ": " + value);
+    }
+}
+
 Options parse_args(int argc, char **argv) {
     Options options;
     for(int i = 1; i < argc; ++i) {
@@ -535,6 +634,25 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--camera-http-timeout-ms") {
             options.camera_http_timeout_ms = parse_int(require_value(arg), arg);
         }
+        else if(arg == "--enable-point-cloud") {
+            options.enable_point_cloud = true;
+            options.enable_depth = true;
+        }
+        else if(arg == "--point-cloud-format") {
+            options.point_cloud_format = require_value(arg);
+        }
+        else if(arg == "--point-cloud-stride") {
+            options.point_cloud_stride = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--point-cloud-max-points") {
+            options.point_cloud_max_points = parse_int(require_value(arg), arg);
+        }
+        else if(arg == "--point-cloud-min-z-m") {
+            options.point_cloud_min_z_m = parse_double(require_value(arg), arg);
+        }
+        else if(arg == "--point-cloud-max-z-m") {
+            options.point_cloud_max_z_m = parse_double(require_value(arg), arg);
+        }
         else if(arg == "--help" || arg == "-h") {
             std::cout << "Usage: orbbec_rgb_test [--output-dir DIR] [--frames N]\n"
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
@@ -545,6 +663,9 @@ Options parse_args(int argc, char **argv) {
                       << "                       [--camera-http-enable] [--camera-http-host HOST]\n"
                       << "                       [--camera-http-port PORT] [--camera-http-path PATH]\n"
                       << "                       [--camera-http-timeout-ms MS]\n"
+                      << "                       [--enable-point-cloud] [--point-cloud-format xyz]\n"
+                      << "                       [--point-cloud-stride N] [--point-cloud-max-points N]\n"
+                      << "                       [--point-cloud-min-z-m M] [--point-cloud-max-z-m M]\n"
                       << "                       [--latest-only] [--no-file-output] [--enable-depth] [--enable-imu]\n"
                       << "                       [--enable-depth-registration] [--list-profiles]\n";
             std::exit(EXIT_SUCCESS);
@@ -577,6 +698,18 @@ Options parse_args(int argc, char **argv) {
     }
     if(options.camera_http_timeout_ms < 1) {
         throw std::runtime_error("--camera-http-timeout-ms must be positive");
+    }
+    if(options.point_cloud_format != "xyz") {
+        throw std::runtime_error("Only --point-cloud-format xyz is implemented in this milestone");
+    }
+    if(options.point_cloud_stride < 1) {
+        throw std::runtime_error("--point-cloud-stride must be positive");
+    }
+    if(options.point_cloud_max_points < 0) {
+        throw std::runtime_error("--point-cloud-max-points must be zero/unlimited or positive");
+    }
+    if(options.point_cloud_min_z_m < 0.0 || options.point_cloud_max_z_m <= options.point_cloud_min_z_m) {
+        throw std::runtime_error("--point-cloud-min-z-m and --point-cloud-max-z-m must define a positive range");
     }
     if(options.enable_depth_registration && !options.enable_depth) {
         throw std::runtime_error("--enable-depth-registration requires --enable-depth");
@@ -880,6 +1013,16 @@ int main(int argc, char **argv) try {
     }
 
     auto converter = std::make_shared<ob::FormatConvertFilter>();
+    std::shared_ptr<ob::PointCloudFilter> point_cloud_filter = nullptr;
+    if(options.enable_point_cloud) {
+        point_cloud_filter = std::make_shared<ob::PointCloudFilter>();
+        point_cloud_filter->setCreatePointFormat(OB_FORMAT_POINT);
+        std::cout << "Point cloud enabled: format=xyz_float32_m"
+                  << " stride=" << options.point_cloud_stride
+                  << " max_points=" << options.point_cloud_max_points
+                  << " z_range_m=[" << options.point_cloud_min_z_m
+                  << "," << options.point_cloud_max_z_m << "]\n";
+    }
 
     std::shared_ptr<ob::Pipeline> imu_pipeline = nullptr;
     std::unique_ptr<ImuDatagramPublisher> imu_publisher;
@@ -1011,6 +1154,13 @@ int main(int argc, char **argv) try {
         auto color_frame = frame->as<ob::ColorFrame>();
         const std::string source_format = format_name(color_frame->getFormat());
         auto rgb_frame = to_rgb_frame(color_frame, converter);
+        PointCloudPayload point_cloud_payload;
+        PointCloudPayload *point_cloud_ptr = nullptr;
+        if(point_cloud_filter) {
+            auto cloud_frame = point_cloud_filter->process(frame_set);
+            point_cloud_payload = build_xyz_point_cloud_payload(cloud_frame, options);
+            point_cloud_ptr = &point_cloud_payload;
+        }
 
         ++captured;
         const auto latest_path = options.output_dir / "latest.ppm";
@@ -1031,7 +1181,12 @@ int main(int argc, char **argv) try {
             }
         }
         if(camera_publisher) {
-            const auto payload = build_rgbd_payload(rgb_frame, depth_frame, static_cast<uint64_t>(captured));
+            const auto payload = build_rgbd_payload(
+                rgb_frame,
+                depth_frame,
+                static_cast<uint64_t>(captured),
+                point_cloud_ptr
+            );
             if(!camera_publisher->publish(payload) && options.log_every > 0) {
                 std::cout << "WARNING: camera RGB-D HTTP publish failed: "
                           << camera_publisher->last_error_message() << "\n";
@@ -1060,6 +1215,9 @@ int main(int argc, char **argv) try {
                 if(!options.no_file_output) {
                     std::cout << " saved=" << (options.output_dir / "latest_depth.pgm");
                 }
+            }
+            if(point_cloud_ptr) {
+                std::cout << " points=" << point_cloud_ptr->count;
             }
             std::cout << "\n";
         }

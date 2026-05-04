@@ -47,6 +47,32 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertEqual(config.min_matches, 8)
         self.assertAlmostEqual(config.max_yaw_step_rad, math.radians(15.0))
 
+    def test_parser_can_disable_jitter_threshold(self) -> None:
+        default_config = config_from_args(build_parser().parse_args([]))
+        debug_config = config_from_args(build_parser().parse_args(["--no-jitter-threshold"]))
+
+        self.assertTrue(default_config.jitter_threshold)
+        self.assertFalse(debug_config.jitter_threshold)
+
+    def test_parser_uses_scan_active_topic_for_orientation_freeze(self) -> None:
+        config = config_from_args(
+            build_parser().parse_args(
+                [
+                    "--scan-active-topic",
+                    "/scan/is_active",
+                    "--no-freeze-orientation-during-scan",
+                ]
+            )
+        )
+
+        self.assertEqual(config.scan_active_topic, "/scan/is_active")
+        self.assertFalse(config.freeze_orientation_during_scan)
+
+    def test_compat_freeze_flag_maps_to_scan_orientation_freeze(self) -> None:
+        config = config_from_args(build_parser().parse_args(["--no-freeze-during-head-motion"]))
+
+        self.assertFalse(config.freeze_orientation_during_scan)
+
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))
 
@@ -90,6 +116,52 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         node._latest_imu_received_s = 9.0
         self.assertIsNone(node._relative_imu_yaw_rad())
+
+    def test_imu_delta_yaw_uses_absolute_yaw_when_available(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(0.0, 0.0, math.radians(10.0))
+        node.latest_imu = None
+
+        delta = node._imu_delta_yaw_rad(
+            predicted_yaw_rad=math.radians(2.0),
+            absolute_imu_yaw_rad=math.radians(25.0),
+        )
+
+        self.assertAlmostEqual(delta, math.radians(15.0))
+
+    def test_imu_delta_yaw_uses_prediction_when_absolute_yaw_missing(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(0.0, 0.0, 0.0)
+        node.latest_imu = object()
+
+        delta = node._imu_delta_yaw_rad(
+            predicted_yaw_rad=math.radians(-3.0),
+            absolute_imu_yaw_rad=None,
+        )
+
+        self.assertAlmostEqual(delta, math.radians(-3.0))
+
+    def test_orientation_freeze_depends_on_scan_event_not_pan(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"freeze_orientation_during_scan": True})()
+        node._scan_orientation_frozen = False
+        node.camera_pan_rad = math.radians(90.0)
+
+        self.assertFalse(node._orientation_freeze_active())
+
+        node._scan_orientation_frozen = True
+        self.assertTrue(node._orientation_freeze_active())
+
+    def test_pan_callback_only_updates_camera_state(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.camera_pan_rad = 0.0
+        node._last_camera_pan_rad = 0.0
+
+        node._on_camera_pan(type("Message", (), {"data": math.radians(45.0)})())
+
+        self.assertAlmostEqual(node.camera_pan_rad, math.radians(45.0))
+        self.assertAlmostEqual(node._last_camera_pan_rad, math.radians(45.0))
+        self.assertFalse(hasattr(node, "_last_head_motion_s"))
 
 
 if __name__ == "__main__":

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 from io import BytesIO
+import math
 from pathlib import Path
+import struct
 import tempfile
+import time
 import unittest
 from urllib.error import HTTPError
 
@@ -10,9 +13,12 @@ import xlerobot_playground.real_ros_bridge as real_ros_bridge
 from xlerobot_playground.real_ros_bridge import (
     OrbbecFilesystemConfig,
     OrbbecFilesystemRgbdSource,
+    RealRosBridgeConfig,
     RobotBrainRgbdSource,
     _build_camera_info_from_metadata,
     _motion_result_error,
+    _orbbec_optical_xyz_to_ros_camera_link,
+    _point_field,
     build_parser,
     config_from_args,
     _format_runtime_error,
@@ -27,6 +33,7 @@ from xlerobot_playground.real_ros_bridge import (
     yaw_to_quaternion_xyzw,
 )
 from xlerobot_playground.rgbd_transport import pack_rgbd_frame
+from xlerobot_playground.rgbd_transport import POINT_CLOUD_FORMAT_XYZ_FLOAT32
 
 
 class _Vector:
@@ -68,11 +75,28 @@ class _FakeBrainClient:
                         "height": 480,
                     }
                 },
+                point_cloud_format=POINT_CLOUD_FORMAT_XYZ_FLOAT32,
+                point_cloud_points=struct.pack("<fff", 0.1, 0.2, 0.3),
+                point_cloud_count=1,
+                point_cloud_stride=12,
             )
 
     def get_bytes(self, path: str) -> bytes:
         self.requested_paths.append(path)
         return self.payloads[path]
+
+
+class _Frame:
+    def __init__(self, timestamp_s: float) -> None:
+        self.timestamp_s = timestamp_s
+
+
+class _Logger:
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def info(self, message: str) -> None:
+        self.messages.append(message)
 
 
 class RealRosBridgeTests(unittest.TestCase):
@@ -88,6 +112,8 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.max_linear_m_s, 0.05)
         self.assertEqual(config.max_angular_rad_s, 0.20)
         self.assertEqual(config.camera_z_m, 0.35)
+        self.assertEqual(config.camera_pan_topic, "/camera/head/pan_rad")
+        self.assertEqual(config.scan_active_topic, "/xlerobot/scan_active")
 
     def test_camera_mount_arguments_are_configurable(self) -> None:
         args = build_parser().parse_args(
@@ -105,6 +131,44 @@ class RealRosBridgeTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertEqual(config.odom_source, "commanded")
+
+    def test_settled_head_points_do_not_wait_for_pose_outside_scan(self) -> None:
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        logger = _Logger()
+        bridge.get_logger = lambda: logger
+        bridge.config = RealRosBridgeConfig(head_points_mode="settled", head_points_settled_delay_s=10.0)
+        bridge._head_points_update_map_enabled = True
+        bridge._base_motion_active = False
+        bridge._scan_active = False
+        bridge._camera_pose_moving = True
+        bridge._camera_pose_updated_s = None
+        bridge._camera_pose_received_s = None
+        bridge._last_head_points_skip_reason = "waiting for settled pose/frame"
+
+        self.assertTrue(bridge._head_points_publish_allowed(_Frame(time.monotonic())))
+        self.assertEqual(bridge._last_head_points_skip_reason, "")
+        self.assertEqual(logger.messages, [])
+
+    def test_settled_head_points_wait_for_pose_during_scan(self) -> None:
+        now_s = time.monotonic()
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        logger = _Logger()
+        bridge.get_logger = lambda: logger
+        bridge.config = RealRosBridgeConfig(head_points_mode="settled", head_points_settled_delay_s=10.0)
+        bridge._head_points_update_map_enabled = True
+        bridge._base_motion_active = False
+        bridge._scan_active = True
+        bridge._camera_pose_moving = False
+        bridge._camera_pose_updated_s = now_s
+        bridge._camera_pose_received_s = now_s
+        bridge._last_head_points_skip_reason = ""
+
+        self.assertFalse(bridge._head_points_publish_allowed(_Frame(now_s)))
+        self.assertEqual(bridge._last_head_points_skip_reason, "waiting for settled pose/frame")
+        self.assertEqual(
+            logger.messages,
+            ["Suppressing /camera/head/points in settled mode: waiting for settled pose/frame."],
+        )
 
     def test_robot_brain_url_selects_remote_hardware_endpoint(self) -> None:
         args = build_parser().parse_args(
@@ -191,6 +255,30 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(ranges[0], 4.0)
         self.assertLess(ranges[2], 1.1)
         self.assertEqual(ranges[-1], 4.0)
+
+    def test_depth_rows_can_leave_no_return_beams_infinite(self) -> None:
+        depth = tuple(
+            tuple(1000 if column == 2 else 0 for column in range(5))
+            for _row in range(7)
+        )
+
+        ranges, _angles = synthesize_scan_from_depth_rows(
+            depth,
+            horizontal_fov_rad=1.0,
+            band_height_px=3,
+            range_min_m=0.05,
+            range_max_m=4.0,
+            fill_no_return=False,
+        )
+
+        self.assertTrue(math.isinf(ranges[0]))
+        self.assertLess(ranges[2], 1.1)
+        self.assertTrue(math.isinf(ranges[-1]))
+
+    def test_real_bridge_defaults_do_not_clear_missing_depth(self) -> None:
+        config = RealRosBridgeConfig()
+
+        self.assertFalse(config.laser_fill_no_return)
 
     def test_reads_16_bit_depth_pgm_as_millimetres(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -286,9 +374,43 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(frame.depth_be, (1234).to_bytes(2, "big"))
         self.assertEqual(frame.depth_width, 1)
         self.assertEqual(frame.metadata["camera_intrinsics"]["fy"], 510.0)
+        self.assertEqual(frame.point_cloud_format, POINT_CLOUD_FORMAT_XYZ_FLOAT32)
+        self.assertEqual(frame.point_cloud_count, 1)
+        self.assertEqual(frame.point_cloud_stride, 12)
+        self.assertEqual(frame.point_cloud_points, struct.pack("<fff", 0.1, 0.2, 0.3))
         self.assertEqual(frame.frame_index, 7)
         self.assertAlmostEqual(frame.timestamp_s, 1.25)
         self.assertEqual(client.requested_paths, ["/rgbd"])
+
+    def test_point_field_uses_ros_float32_layout(self) -> None:
+        class _PointField:
+            FLOAT32 = 7
+
+            def __init__(self) -> None:
+                self.name = ""
+                self.offset = 0
+                self.datatype = 0
+                self.count = 0
+
+        original_point_field = real_ros_bridge.PointField
+        real_ros_bridge.PointField = _PointField
+        try:
+            field = _point_field("z", 8)
+        finally:
+            real_ros_bridge.PointField = original_point_field
+
+        self.assertEqual(field.name, "z")
+        self.assertEqual(field.offset, 8)
+        self.assertEqual(field.datatype, _PointField.FLOAT32)
+        self.assertEqual(field.count, 1)
+
+    def test_orbbec_optical_points_convert_to_ros_camera_link_axes(self) -> None:
+        converted = _orbbec_optical_xyz_to_ros_camera_link(
+            struct.pack("<fff", 1.0, 2.0, 3.0),
+            count=1,
+        )
+
+        self.assertEqual(struct.unpack("<fff", converted), (3.0, -1.0, -2.0))
 
     def test_camera_info_from_metadata_scales_intrinsics(self) -> None:
         class _Header:

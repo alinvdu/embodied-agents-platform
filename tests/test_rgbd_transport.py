@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import unittest
+import struct
 
-from xlerobot_playground.rgbd_transport import pack_rgbd_frame, unpack_rgbd_frame
+from xlerobot_playground.rgbd_transport import (
+    POINT_CLOUD_FORMAT_XYZ_FLOAT32,
+    pack_rgbd_frame,
+    unpack_rgbd_frame,
+)
 
 
 class RgbdTransportTests(unittest.TestCase):
@@ -47,6 +52,29 @@ class RgbdTransportTests(unittest.TestCase):
         frame = unpack_rgbd_frame(payload)
 
         self.assertEqual(frame.metadata["camera_intrinsics"]["fx"], 500.0)
+
+    def test_round_trip_xyz_point_cloud(self) -> None:
+        points = struct.pack("<ffffff", 0.1, 0.2, 0.3, 1.0, 2.0, 3.0)
+        payload = pack_rgbd_frame(
+            frame_index=6,
+            timestamp_us=3_000_000,
+            rgb=b"abc",
+            rgb_width=1,
+            rgb_height=1,
+            point_cloud_format=POINT_CLOUD_FORMAT_XYZ_FLOAT32,
+            point_cloud_points=points,
+            point_cloud_count=2,
+            point_cloud_stride=12,
+            metadata={"point_cloud": {"format": "xyz_float32", "units": "m"}},
+        )
+
+        frame = unpack_rgbd_frame(payload)
+
+        self.assertEqual(frame.point_cloud_format, POINT_CLOUD_FORMAT_XYZ_FLOAT32)
+        self.assertEqual(frame.point_cloud_points, points)
+        self.assertEqual(frame.point_cloud_count, 2)
+        self.assertEqual(frame.point_cloud_stride, 12)
+        self.assertEqual(frame.point_cloud_units, "m")
 
     def test_pack_rejects_mismatched_rgb_size(self) -> None:
         with self.assertRaisesRegex(ValueError, "RGB payload size"):

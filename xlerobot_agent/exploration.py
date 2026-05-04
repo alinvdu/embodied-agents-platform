@@ -222,6 +222,33 @@ def _overlay_occupancy_payload_with_manual_edits(
     return payload
 
 
+def _summarize_map_payload(map_payload: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(map_payload, dict):
+        return None
+    occupancy = map_payload.get("occupancy")
+    cells = occupancy.get("cells", []) if isinstance(occupancy, dict) else []
+    free = 0
+    occupied = 0
+    for item in cells:
+        if not isinstance(item, dict):
+            continue
+        state = item.get("state")
+        if state == "free":
+            free += 1
+        elif state == "occupied":
+            occupied += 1
+    return {
+        "map_id": map_payload.get("map_id"),
+        "mode": map_payload.get("mode"),
+        "frame": map_payload.get("frame"),
+        "coverage": map_payload.get("coverage"),
+        "cell_count": len(cells) if isinstance(cells, list) else 0,
+        "free_cells": free,
+        "occupied_cells": occupied,
+        "bounds": occupancy.get("bounds") if isinstance(occupancy, dict) else None,
+    }
+
+
 class ExplorationBackend:
     def __init__(
         self,
@@ -848,6 +875,7 @@ class ExplorationBackend:
         self._rebuild_named_places()
         if self._current_map is not None:
             self._maps[self._current_map["map_id"]] = json.loads(json.dumps(self._current_map))
+        print(f"[exploration_backend] stored current_map summary={_summarize_map_payload(self._current_map)}")
 
     def _attach_manual_edits(self, map_payload: dict[str, Any], task_id: str) -> None:
         artifacts = map_payload.setdefault("artifacts", {})

@@ -16,6 +16,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--slam-output", default="xlerobot_slam_toolbox.yaml")
     parser.add_argument("--nav2-output", default="xlerobot_nav2_params.yaml")
     parser.add_argument("--scan-topic", default="/scan")
+    parser.add_argument("--global-map-topic", default="/projected_map")
     parser.add_argument("--map-frame", default="map")
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
@@ -24,9 +25,56 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-length-m", type=float, default=0.3913)
     parser.add_argument("--robot-width-m", type=float, default=0.459)
     parser.add_argument("--max-linear-velocity", type=float, default=0.03)
-    parser.add_argument("--max-angular-velocity", type=float, default=0.10)
+    parser.add_argument("--max-angular-velocity", type=float, default=0.18)
+    parser.add_argument(
+        "--min-linear-velocity-threshold",
+        type=float,
+        default=0.01,
+        help="Controller velocity threshold below which tiny x commands are treated as zero.",
+    )
+    parser.add_argument(
+        "--min-angular-velocity-threshold",
+        type=float,
+        default=0.02,
+        help="Controller velocity threshold below which tiny theta commands are treated as zero.",
+    )
+    parser.add_argument(
+        "--min-speed-theta",
+        type=float,
+        default=0.02,
+        help="Smallest nonzero angular speed sampled by DWB; keep above the real base deadband.",
+    )
+    parser.add_argument(
+        "--rotate-to-goal-slowing-factor",
+        type=float,
+        default=1.0,
+        help="DWB RotateToGoal slowdown factor. Lower values reduce near-goal crawling on the real base.",
+    )
+    parser.add_argument(
+        "--path-align-scale",
+        type=float,
+        default=16.0,
+        help="DWB PathAlign critic scale. Set 0 to remove path heading alignment while debugging.",
+    )
+    parser.add_argument(
+        "--goal-align-scale",
+        type=float,
+        default=12.0,
+        help="DWB GoalAlign critic scale. Set 0 to remove final heading alignment while debugging.",
+    )
+    parser.add_argument(
+        "--rotate-to-goal-scale",
+        type=float,
+        default=8.0,
+        help="DWB RotateToGoal critic scale. Goal completion is still XY-only via PositionGoalChecker.",
+    )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
+    parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
+    parser.add_argument("--progress-required-movement-radius", type=float, default=0.05)
+    parser.add_argument("--progress-movement-time-allowance-s", type=float, default=25.0)
+    parser.add_argument("--xy-goal-tolerance-m", type=float, default=0.18)
+    parser.add_argument("--yaw-goal-tolerance-rad", type=float, default=3.14)
     return parser
 
 
@@ -62,6 +110,7 @@ def main(argv: list[str] | None = None) -> int:
         base_nav2,
         use_sim_time=False,
         scan_topic=args.scan_topic,
+        global_map_topic=args.global_map_topic,
         map_frame=args.map_frame,
         odom_frame=args.odom_frame,
         base_frame=args.base_frame,
@@ -70,8 +119,20 @@ def main(argv: list[str] | None = None) -> int:
         raytrace_max_range=args.max_laser_range,
         max_linear_velocity=args.max_linear_velocity,
         max_angular_velocity=args.max_angular_velocity,
+        min_linear_velocity_threshold=args.min_linear_velocity_threshold,
+        min_angular_velocity_threshold=args.min_angular_velocity_threshold,
+        min_speed_theta=args.min_speed_theta,
+        path_align_scale=args.path_align_scale,
+        goal_align_scale=args.goal_align_scale,
+        rotate_to_goal_scale=args.rotate_to_goal_scale,
+        rotate_to_goal_slowing_factor=args.rotate_to_goal_slowing_factor,
         local_costmap_width=args.local_costmap_width,
         local_costmap_height=args.local_costmap_height,
+        transform_tolerance_s=args.transform_tolerance_s,
+        progress_required_movement_radius=args.progress_required_movement_radius,
+        progress_movement_time_allowance_s=args.progress_movement_time_allowance_s,
+        xy_goal_tolerance_m=args.xy_goal_tolerance_m,
+        yaw_goal_tolerance_rad=args.yaw_goal_tolerance_rad,
         inflation_radius=0.0,
     )
     nav2_path = output_dir / args.nav2_output

@@ -56,8 +56,10 @@ def integrate_planar_scan(
     point_count = 0
     for index in range(0, len(ranges), normalized_beam_stride):
         beam_range = float(ranges[index])
+        if not math.isfinite(beam_range):
+            continue
         hit_obstacle = math.isfinite(beam_range) and beam_range < normalized_range_max * obstacle_hit_ratio
-        ray_max_m = min(beam_range, normalized_range_max) if math.isfinite(beam_range) else normalized_range_max
+        ray_max_m = min(beam_range, normalized_range_max)
         ray_max_m = max(ray_max_m, normalized_range_min)
         if ray_max_m <= normalized_range_min:
             continue

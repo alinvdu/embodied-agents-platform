@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,10 @@ from xlerobot_playground.ros_nav2_adapter import (
     serialize_scan_observation,
 )
 from xlerobot_playground.ros_nav2_runtime import RosOccupancyMap
+from xlerobot_playground.point_cloud_fusion import (
+    PointCloudFusionConfig,
+    integrate_transformed_point_cloud_observation,
+)
 from xlerobot_playground.scan_fusion import integrate_planar_scan
 
 
@@ -479,6 +484,157 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertTrue(any(state == "occupied" for state in known_cells.values()))
         self.assertTrue(range_edge_cells)
         self.assertTrue(visited_cells)
+
+    def test_common_scan_fusion_does_not_clear_infinite_no_return_beams(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        range_edge_cells: set[GridCell] = set()
+
+        summary = integrate_planar_scan(
+            pose=Pose2D(0.5, 0.5, 0.0),
+            ranges=(math.inf,),
+            angle_min=0.0,
+            angle_increment=0.0,
+            range_min_m=0.05,
+            range_max_m=2.0,
+            resolution_m=0.5,
+            cell_from_world=lambda x, y: GridCell(int(x / 0.5), int(y / 0.5)),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            range_edge_cells=range_edge_cells,
+            beam_stride=1,
+            config=DEFAULT_OCCUPANCY_FUSION_CONFIG,
+        )
+
+        self.assertEqual(summary.scan_beams, 1)
+        self.assertEqual(summary.integrated_beams, 1)
+        self.assertEqual(known_cells, {GridCell(1, 1): "free"})
+        self.assertFalse(range_edge_cells)
+
+    def test_point_cloud_fusion_marks_floor_free_and_furniture_bulk_occupied(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        points = np.asarray(
+            [
+                [0.5, -0.1, 0.0],
+                [0.5, 0.1, 0.0],
+                [1.0, 0.0, 0.7],
+                [1.16, 0.02, 0.72],
+                [1.03, 0.16, 0.68],
+            ],
+            dtype=np.float32,
+        )
+
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=(0.0, 0.0, 0.35),
+            points_xyz_map=points,
+            map_resolution_m=0.25,
+            cell_from_world=lambda x, y: GridCell(int(math.floor(x / 0.25)), int(math.floor(y / 0.25))),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            config=PointCloudFusionConfig(
+                min_points_per_occupied_cell=2,
+                obstacle_inflation_radius_m=0.0,
+                max_rays=64,
+            ),
+        )
+
+        self.assertGreater(summary.free_cell_count, 0)
+        self.assertGreater(summary.occupied_cell_count, 0)
+        self.assertEqual(known_cells[GridCell(4, 0)], "occupied")
+        self.assertTrue(any(state == "free" for state in known_cells.values()))
+
+    def test_point_cloud_fusion_ignores_obstacles_above_robot_clearance(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        points = np.asarray([[1.0, 0.0, 1.7], [1.02, 0.0, 1.72]], dtype=np.float32)
+
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=(0.0, 0.0, 0.35),
+            points_xyz_map=points,
+            map_resolution_m=0.25,
+            cell_from_world=lambda x, y: GridCell(int(math.floor(x / 0.25)), int(math.floor(y / 0.25))),
+            known_cells=known_cells,
+            evidence_scores={},
+            config=PointCloudFusionConfig(robot_clearance_height_m=1.5, obstacle_inflation_radius_m=0.0),
+        )
+
+        self.assertEqual(summary.obstacle_point_count, 0)
+        self.assertNotIn(GridCell(4, 0), known_cells)
+
+    def test_point_cloud_fusion_only_marks_far_free_endpoints_as_range_edges(self) -> None:
+        range_edge_cells: set[GridCell] = set()
+
+        integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=(0.0, 0.0, 0.35),
+            points_xyz_map=np.asarray([[0.8, 0.0, 0.0], [3.95, 0.0, 0.0]], dtype=np.float32),
+            map_resolution_m=0.25,
+            cell_from_world=lambda x, y: GridCell(int(math.floor(x / 0.25)), int(math.floor(y / 0.25))),
+            known_cells={},
+            evidence_scores={},
+            range_edge_cells=range_edge_cells,
+            config=PointCloudFusionConfig(max_rays=64),
+        )
+
+        self.assertIn(GridCell(15, 0), range_edge_cells)
+        self.assertNotIn(GridCell(3, 0), range_edge_cells)
+
+    def test_point_cloud_fusion_does_not_clear_to_obstacle_only_points(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        points = np.asarray(
+            [
+                [1.0, 0.03, 0.7],
+                [1.12, 0.05, 0.72],
+                [1.20, 0.08, 0.68],
+            ],
+            dtype=np.float32,
+        )
+
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=(0.0, 0.0, 0.35),
+            points_xyz_map=points,
+            map_resolution_m=0.25,
+            cell_from_world=lambda x, y: GridCell(int(math.floor(x / 0.25)), int(math.floor(y / 0.25))),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            config=PointCloudFusionConfig(
+                min_points_per_occupied_cell=2,
+                obstacle_inflation_radius_m=0.0,
+                max_rays=64,
+            ),
+        )
+
+        self.assertEqual(summary.free_cell_count, 0)
+        self.assertEqual(known_cells[GridCell(4, 0)], "occupied")
+        self.assertNotIn(GridCell(1, 0), known_cells)
+        self.assertNotIn(GridCell(2, 0), known_cells)
+        self.assertNotIn(GridCell(3, 0), known_cells)
+
+    def test_point_cloud_fusion_estimates_tilted_floor_before_height_filtering(self) -> None:
+        known_cells: dict[GridCell, str] = {}
+        evidence: dict[GridCell, float] = {}
+        floor_points = [[x * 0.1 + 0.5, y * 0.1 - 0.3, 0.20 * (x * 0.1 + 0.5) - 0.12] for x in range(8) for y in range(6)]
+        obstacle_points = [[1.0, 0.0, 0.20 * 1.0 - 0.12 + 0.75], [1.16, 0.02, 0.20 * 1.16 - 0.12 + 0.76]]
+        points = np.asarray(floor_points + obstacle_points, dtype=np.float32)
+
+        summary = integrate_transformed_point_cloud_observation(
+            sensor_origin_xyz=(0.0, 0.0, 0.35),
+            points_xyz_map=points,
+            map_resolution_m=0.25,
+            cell_from_world=lambda x, y: GridCell(int(math.floor(x / 0.25)), int(math.floor(y / 0.25))),
+            known_cells=known_cells,
+            evidence_scores=evidence,
+            config=PointCloudFusionConfig(
+                min_points_per_occupied_cell=2,
+                obstacle_inflation_radius_m=0.0,
+                floor_plane_min_points=12,
+                max_rays=64,
+            ),
+        )
+
+        self.assertGreater(summary.floor_point_count, 20)
+        self.assertEqual(summary.obstacle_point_count, 2)
+        self.assertEqual(known_cells[GridCell(4, 0)], "occupied")
 
     def test_ros_adapter_serialization_round_trips_pose_map_and_scan(self) -> None:
         pose = Pose2D(1.0, 2.0, 0.5)

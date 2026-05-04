@@ -4797,7 +4797,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--nav2-controller-id", default="FollowPath")
     parser.add_argument("--nav2-behavior-tree", default=default_nav2_behavior_tree())
     parser.add_argument("--nav2-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
@@ -4820,6 +4824,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
+    parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-sample-count", type=int, default=12)
     parser.add_argument("--sim-motion-speed", choices=("normal", "faster", "fastest"), default="normal")
     parser.add_argument("--ros-allow-multiple-action-servers", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--host", default="127.0.0.1")
@@ -4902,6 +4911,11 @@ def main(argv: list[str] | None = None) -> int:
         ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
         ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
         ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+        ros_turn_scan_mode=args.ros_turn_scan_mode,
+        robot_brain_url=args.robot_brain_url,
+        camera_pan_action_key=args.camera_pan_action_key,
+        camera_pan_settle_s=args.camera_pan_settle_s,
+        camera_pan_sample_count=args.camera_pan_sample_count,
         sim_motion_speed=args.sim_motion_speed,
         ros_allow_multiple_action_servers=args.ros_allow_multiple_action_servers,
         realtime_sleep_s=0.0,

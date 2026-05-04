@@ -41,10 +41,11 @@ class RobotBrainAgentConfig:
     robot_kind: str = "xlerobot_2wheels"
     port1: str = "/dev/tty.usbmodem5B140330101"
     port2: str = "/dev/tty.usbmodem5B140332271"
-    use_degrees: bool = False
+    use_degrees: bool = True
     allow_motion_commands: bool = False
     max_linear_m_s: float = 0.05
     max_angular_rad_s: float = 0.20
+    base_angular_action_sign: float = 1.0
     debug_motion: bool = False
     calibration_prompt_response: str | None = ""
     orbbec_output_dir: Path = Path("artifacts/orbbec_rgbd")
@@ -58,9 +59,16 @@ class RobotBrainAgentConfig:
     camera_max_frame_bytes: int = 16 * 1024 * 1024
     camera_log_every: int = 30
     initial_camera_pitch_rad: float = 0.0
+    initial_camera_pan_rad: float = 0.0
     camera_pitch_action_key: str | None = None
     camera_pitch_action_units: str = "deg"
+    camera_pitch_action_sign: float = 1.0
+    camera_pitch_action_offset_deg: float = 0.0
     camera_pitch_settle_s: float = 2.0
+    camera_pan_action_key: str | None = "head_motor_1.pos"
+    camera_pan_action_units: str = "deg"
+    camera_pan_action_sign: float = 1.0
+    camera_pan_settle_s: float = 0.5
 
 
 class ImuStreamState:
@@ -177,7 +185,8 @@ class RgbdStreamState:
                 "[robot_brain_agent] RGB-D rx "
                 f"rate~={delta / dt:.1f}Hz total={self._received_count} "
                 f"rgb={frame.rgb_width}x{frame.rgb_height} "
-                f"depth={frame.depth_width or 0}x{frame.depth_height or 0}",
+                f"depth={frame.depth_width or 0}x{frame.depth_height or 0} "
+                f"points={frame.point_cloud_count}",
                 flush=True,
             )
             self._last_rx_log_at = now
@@ -217,6 +226,14 @@ class RgbdStreamState:
             "depth": None
             if frame is None or frame.depth_width is None or frame.depth_height is None
             else {"width": frame.depth_width, "height": frame.depth_height},
+            "point_cloud": None
+            if frame is None or frame.point_cloud_count <= 0
+            else {
+                "format": frame.point_cloud_format,
+                "count": frame.point_cloud_count,
+                "stride": frame.point_cloud_stride,
+                "units": frame.point_cloud_units,
+            },
         }
 
 
@@ -246,15 +263,25 @@ class RobotBrainAgent:
         self.rgbd_stream = RgbdStreamState(log_every=config.camera_log_every)
         self._camera_state_lock = threading.Lock()
         self._camera_pitch_rad = float(config.initial_camera_pitch_rad)
-        self._camera_pitch_updated_s = time.time()
+        self._camera_pan_rad = float(config.initial_camera_pan_rad)
+        self._camera_pose_updated_s = time.time()
+        self._camera_motion_axis: str | None = None
+        self._camera_motion_started_s: float | None = None
+        self._camera_motion_until_s: float | None = None
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
+        commanded_angular_rad_s = float(angular_rad_s) * float(self.config.base_angular_action_sign)
         if self.config.debug_motion:
-            print(f"[robot_brain_agent] /cmd_vel requested linear={linear_m_s} angular={angular_rad_s}", flush=True)
+            print(
+                "[robot_brain_agent] /cmd_vel requested "
+                f"linear={linear_m_s} angular={angular_rad_s} "
+                f"sent_angular={commanded_angular_rad_s}",
+                flush=True,
+            )
         with self._motion_lock:
             if self.config.debug_motion:
                 print("[robot_brain_agent] /cmd_vel acquired motion lock", flush=True)
-            result = self.runtime.drive_velocity(linear_m_s=linear_m_s, angular_rad_s=angular_rad_s)
+            result = self.runtime.drive_velocity(linear_m_s=linear_m_s, angular_rad_s=commanded_angular_rad_s)
         if self.config.debug_motion:
             print(f"[robot_brain_agent] /cmd_vel done succeeded={result.succeeded}", flush=True)
         return {
@@ -292,20 +319,58 @@ class RobotBrainAgent:
 
     def camera_state(self) -> dict[str, Any]:
         with self._camera_state_lock:
+            now_s = time.time()
+            moving = self._camera_motion_axis is not None or (
+                self._camera_motion_until_s is not None and now_s < self._camera_motion_until_s
+            )
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
-                "updated_s": self._camera_pitch_updated_s,
+                "pan_rad": self._camera_pan_rad,
+                "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pose_updated_s,
+                "moving": moving,
+                "motion_axis": self._camera_motion_axis if moving else None,
+                "motion_started_s": self._camera_motion_started_s,
+                "motion_until_s": self._camera_motion_until_s,
             }
 
-    def update_camera_state(self, *, pitch_rad: float) -> dict[str, Any]:
+    def update_camera_state(
+        self,
+        *,
+        pitch_rad: float | None = None,
+        pan_rad: float | None = None,
+        moving: bool | None = None,
+        motion_axis: str | None = None,
+        motion_until_s: float | None = None,
+    ) -> dict[str, Any]:
         with self._camera_state_lock:
-            self._camera_pitch_rad = float(pitch_rad)
-            self._camera_pitch_updated_s = time.time()
+            if pitch_rad is not None:
+                self._camera_pitch_rad = float(pitch_rad)
+            if pan_rad is not None:
+                self._camera_pan_rad = float(pan_rad)
+            self._camera_pose_updated_s = time.time()
+            if moving is not None:
+                if moving:
+                    self._camera_motion_axis = motion_axis
+                    self._camera_motion_started_s = self._camera_pose_updated_s
+                    self._camera_motion_until_s = motion_until_s
+                else:
+                    self._camera_motion_axis = None
+                    self._camera_motion_until_s = None
             return {
                 "pitch_rad": self._camera_pitch_rad,
                 "pitch_deg": self._camera_pitch_rad * 180.0 / math.pi,
-                "updated_s": self._camera_pitch_updated_s,
+                "pan_rad": self._camera_pan_rad,
+                "pan_deg": self._camera_pan_rad * 180.0 / math.pi,
+                "updated_s": self._camera_pose_updated_s,
+                "moving": bool(
+                    self._camera_motion_axis is not None
+                    or (self._camera_motion_until_s is not None and time.time() < self._camera_motion_until_s)
+                ),
+                "motion_axis": self._camera_motion_axis,
+                "motion_started_s": self._camera_motion_started_s,
+                "motion_until_s": self._camera_motion_until_s,
             }
 
     def pitch_camera(
@@ -330,13 +395,38 @@ class RobotBrainAgent:
             }
         pitch_deg = float(pitch_rad) * 180.0 / math.pi
         units = str(self.config.camera_pitch_action_units).strip().lower()
-        action_value = pitch_deg if units == "deg" else float(pitch_rad)
+        compatibility_error = self._head_action_mode_error(units)
+        if compatibility_error:
+            return {
+                "succeeded": False,
+                "message": compatibility_error,
+                "metadata": {"requested_pitch_rad": float(pitch_rad), "action_units": units},
+            }
+        action_value = (
+            self._head_action_value(rad=float(pitch_rad), deg=pitch_deg, units=units)
+            * self._head_action_sign(self.config.camera_pitch_action_sign)
+            + self._head_action_offset_value(
+                offset_deg=self.config.camera_pitch_action_offset_deg,
+                units=units,
+            )
+        )
         action = {resolved_action_key: action_value}
-        with self._motion_lock:
-            self.runtime.connect()
-            sent = self.runtime.robot.send_action(action)
-            time.sleep(max(0.0, self.config.camera_pitch_settle_s if settle_s is None else float(settle_s)))
-        state = self.update_camera_state(pitch_rad=pitch_rad)
+        settle_duration_s = max(0.0, self.config.camera_pitch_settle_s if settle_s is None else float(settle_s))
+        self.update_camera_state(
+            pitch_rad=pitch_rad,
+            moving=True,
+            motion_axis="pitch",
+            motion_until_s=time.time() + settle_duration_s,
+        )
+        try:
+            with self._motion_lock:
+                self.runtime.connect()
+                sent = self.runtime.robot.send_action(action)
+                time.sleep(settle_duration_s)
+        except Exception:
+            self.update_camera_state(moving=False)
+            raise
+        state = self.update_camera_state(pitch_rad=pitch_rad, moving=False)
         return {
             "succeeded": True,
             "message": "Camera pitch command sent and state updated.",
@@ -346,6 +436,102 @@ class RobotBrainAgent:
                 "camera": state,
             },
         }
+
+    def pan_camera(
+        self,
+        *,
+        pan_rad: float,
+        action_key: str | None = None,
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.config.allow_motion_commands:
+            return {
+                "succeeded": False,
+                "message": "Real camera pan commands are disabled. Set --allow-motion-commands after hardware checks.",
+                "metadata": {"requested_pan_rad": float(pan_rad)},
+            }
+        resolved_action_key = action_key or self.config.camera_pan_action_key
+        if not resolved_action_key:
+            return {
+                "succeeded": False,
+                "message": "No camera pan action key configured. Set --camera-pan-action-key or pass action_key.",
+                "metadata": {"requested_pan_rad": float(pan_rad)},
+            }
+        pan_rad = max(-math.pi, min(math.pi, float(pan_rad)))
+        pan_deg = pan_rad * 180.0 / math.pi
+        units = str(self.config.camera_pan_action_units).strip().lower()
+        compatibility_error = self._head_action_mode_error(units)
+        if compatibility_error:
+            return {
+                "succeeded": False,
+                "message": compatibility_error,
+                "metadata": {"requested_pan_rad": float(pan_rad), "action_units": units},
+            }
+        action_value = self._head_action_value(rad=pan_rad, deg=pan_deg, units=units) * self._head_action_sign(
+            self.config.camera_pan_action_sign
+        )
+        action = {resolved_action_key: action_value}
+        settle_duration_s = max(0.0, self.config.camera_pan_settle_s if settle_s is None else float(settle_s))
+        self.update_camera_state(
+            pan_rad=pan_rad,
+            moving=True,
+            motion_axis="pan",
+            motion_until_s=time.time() + settle_duration_s,
+        )
+        try:
+            with self._motion_lock:
+                self.runtime.connect()
+                sent = self.runtime.robot.send_action(action)
+                time.sleep(settle_duration_s)
+        except Exception:
+            self.update_camera_state(moving=False)
+            raise
+        state = self.update_camera_state(pan_rad=pan_rad, moving=False)
+        return {
+            "succeeded": True,
+            "message": "Camera pan command sent and state updated.",
+            "metadata": {
+                "requested_action": action,
+                "sent_action": sent,
+                "camera": state,
+            },
+        }
+
+    def _head_action_mode_error(self, units: str) -> str | None:
+        if self.config.use_degrees:
+            return None
+        if units == "normalized":
+            return None
+        return (
+            "Camera head action units are configured as "
+            f"{units!r}, but the XLeRobot interface is not in degree mode. "
+            "Restart robot_brain_agent with --use-degrees, or use --camera-pan-action-units normalized "
+            "only if the head calibration maps -100..100 to the desired physical sweep."
+        )
+
+    @staticmethod
+    def _head_action_value(*, rad: float, deg: float, units: str) -> float:
+        if units == "deg":
+            return float(deg)
+        if units == "rad":
+            return float(rad)
+        if units == "normalized":
+            return max(-100.0, min(100.0, float(rad) / math.pi * 100.0))
+        raise ValueError(f"Unsupported camera head action units: {units!r}")
+
+    @staticmethod
+    def _head_action_offset_value(*, offset_deg: float, units: str) -> float:
+        if units == "deg":
+            return float(offset_deg)
+        if units == "rad":
+            return math.radians(float(offset_deg))
+        if units == "normalized":
+            return max(-100.0, min(100.0, float(offset_deg) / 180.0 * 100.0))
+        raise ValueError(f"Unsupported camera head action units: {units!r}")
+
+    @staticmethod
+    def _head_action_sign(value: float) -> float:
+        return -1.0 if float(value) < 0.0 else 1.0
 
     def close(self) -> None:
         with self._motion_lock:
@@ -452,6 +638,14 @@ async def _handle_rgbd_ingest(request: web.Request) -> web.Response:
             "depth": None
             if frame.depth_width is None or frame.depth_height is None
             else {"width": frame.depth_width, "height": frame.depth_height},
+            "point_cloud": None
+            if frame.point_cloud_count <= 0
+            else {
+                "format": frame.point_cloud_format,
+                "count": frame.point_cloud_count,
+                "stride": frame.point_cloud_stride,
+                "units": frame.point_cloud_units,
+            },
         }
     )
 
@@ -472,13 +666,19 @@ async def _handle_camera_head_pose_post(request: web.Request) -> web.Response:
     agent: RobotBrainAgent = request.app["agent"]
     raw = await request.read() if request.can_read_body else b""
     payload = json.loads(raw.decode("utf-8")) if raw else {}
+    pitch_rad = None
+    pan_rad = None
     if "pitch_rad" in payload:
         pitch_rad = float(payload["pitch_rad"])
     elif "pitch_deg" in payload:
         pitch_rad = float(payload["pitch_deg"]) * math.pi / 180.0
-    else:
-        raise web.HTTPBadRequest(text="Expected pitch_rad or pitch_deg.")
-    return web.json_response(agent.update_camera_state(pitch_rad=pitch_rad))
+    if "pan_rad" in payload:
+        pan_rad = float(payload["pan_rad"])
+    elif "pan_deg" in payload:
+        pan_rad = float(payload["pan_deg"]) * math.pi / 180.0
+    if pitch_rad is None and pan_rad is None:
+        raise web.HTTPBadRequest(text="Expected pitch_rad, pitch_deg, pan_rad, or pan_deg.")
+    return web.json_response(agent.update_camera_state(pitch_rad=pitch_rad, pan_rad=pan_rad))
 
 
 async def _handle_camera_head_pitch(request: web.Request) -> web.Response:
@@ -494,6 +694,26 @@ async def _handle_camera_head_pitch(request: web.Request) -> web.Response:
     response = await asyncio.to_thread(
         agent.pitch_camera,
         pitch_rad=pitch_rad,
+        action_key=payload.get("action_key"),
+        settle_s=payload.get("settle_s"),
+    )
+    status = 200 if response.get("succeeded") else 400
+    return web.json_response(response, status=status)
+
+
+async def _handle_camera_head_pan(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    if "pan_rad" in payload:
+        pan_rad = float(payload["pan_rad"])
+    elif "pan_deg" in payload:
+        pan_rad = float(payload["pan_deg"]) * math.pi / 180.0
+    else:
+        raise web.HTTPBadRequest(text="Expected pan_rad or pan_deg.")
+    response = await asyncio.to_thread(
+        agent.pan_camera,
+        pan_rad=pan_rad,
         action_key=payload.get("action_key"),
         settle_s=payload.get("settle_s"),
     )
@@ -590,6 +810,7 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_get("/camera/head/pose", _handle_camera_head_pose_get)
     app.router.add_post("/camera/head/pose", _handle_camera_head_pose_post)
     app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
+    app.router.add_post("/camera/head/pan", _handle_camera_head_pan)
     app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
@@ -604,10 +825,28 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--robot-kind", choices=("xlerobot", "xlerobot_2wheels"), default="xlerobot_2wheels")
     parser.add_argument("--port1", default="/dev/tty.usbmodem5B140330101")
     parser.add_argument("--port2", default="/dev/tty.usbmodem5B140332271")
-    parser.add_argument("--use-degrees", action="store_true")
+    parser.add_argument(
+        "--use-degrees",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Configure XLeRobot arm/head motors in degree mode. This is enabled by default because "
+            "camera pan scans command head_motor_1.pos in degrees."
+        ),
+    )
     parser.add_argument("--allow-motion-commands", action="store_true")
     parser.add_argument("--max-linear-m-s", type=float, default=0.05)
     parser.add_argument("--max-angular-rad-s", type=float, default=0.20)
+    parser.add_argument(
+        "--base-angular-action-sign",
+        type=float,
+        choices=(-1.0, 1.0),
+        default=1.0,
+        help=(
+            "Multiply requested base angular velocity before sending theta.vel to hardware. "
+            "Use -1 if positive ROS/angular commands physically rotate right instead of left."
+        ),
+    )
     parser.add_argument("--debug-motion", action="store_true")
     parser.add_argument(
         "--calibration-prompt-response",
@@ -634,13 +873,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-log-every", type=int, default=30)
     parser.add_argument("--initial-camera-pitch-rad", type=float, default=0.0)
     parser.add_argument("--initial-camera-pitch-deg", type=float, default=None)
+    parser.add_argument("--initial-camera-pan-rad", type=float, default=0.0)
+    parser.add_argument("--initial-camera-pan-deg", type=float, default=None)
     parser.add_argument(
         "--camera-pitch-action-key",
         default=None,
         help="Robot send_action key used for absolute head/camera pitch, for example a head tilt joint position key.",
     )
-    parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad"), default="deg")
+    parser.add_argument("--camera-pitch-action-units", choices=("deg", "rad", "normalized"), default="deg")
+    parser.add_argument(
+        "--camera-pitch-action-sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Set to -1 if positive ROS/head pitch commands physically tilt the camera down instead of up. "
+            "The published camera pose keeps the requested ROS sign; only the motor action is inverted."
+        ),
+    )
+    parser.add_argument(
+        "--camera-pitch-action-offset-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Raw motor offset, in degrees, added after pitch sign conversion. "
+            "Use this when geometric pitch 0 deg does not equal motor command 0 deg."
+        ),
+    )
     parser.add_argument("--camera-pitch-settle-s", type=float, default=2.0)
+    parser.add_argument(
+        "--camera-pan-action-key",
+        default="head_motor_1.pos",
+        help="Robot send_action key used for absolute head/camera pan; defaults to head_motor_1.pos.",
+    )
+    parser.add_argument("--camera-pan-action-units", choices=("deg", "rad", "normalized"), default="deg")
+    parser.add_argument(
+        "--camera-pan-action-sign",
+        type=float,
+        default=1.0,
+        help=(
+            "Set to -1 if positive ROS/head pan commands physically turn the camera right instead of left. "
+            "The published camera pose keeps the requested ROS sign; only the motor action is inverted."
+        ),
+    )
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     return parser
 
 
@@ -656,6 +931,7 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         allow_motion_commands=args.allow_motion_commands,
         max_linear_m_s=args.max_linear_m_s,
         max_angular_rad_s=args.max_angular_rad_s,
+        base_angular_action_sign=args.base_angular_action_sign,
         debug_motion=args.debug_motion,
         calibration_prompt_response=None if args.interactive_calibration else args.calibration_prompt_response,
         orbbec_output_dir=Path(args.orbbec_output_dir),
@@ -673,9 +949,20 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
             if args.initial_camera_pitch_deg is None
             else args.initial_camera_pitch_deg * math.pi / 180.0
         ),
+        initial_camera_pan_rad=(
+            args.initial_camera_pan_rad
+            if args.initial_camera_pan_deg is None
+            else args.initial_camera_pan_deg * math.pi / 180.0
+        ),
         camera_pitch_action_key=args.camera_pitch_action_key,
         camera_pitch_action_units=args.camera_pitch_action_units,
+        camera_pitch_action_sign=args.camera_pitch_action_sign,
+        camera_pitch_action_offset_deg=args.camera_pitch_action_offset_deg,
         camera_pitch_settle_s=args.camera_pitch_settle_s,
+        camera_pan_action_key=args.camera_pan_action_key,
+        camera_pan_action_units=args.camera_pan_action_units,
+        camera_pan_action_sign=args.camera_pan_action_sign,
+        camera_pan_settle_s=args.camera_pan_settle_s,
     )
 
 

@@ -42,9 +42,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--review-ui-flavor", choices=("user", "developer"), default="user")
     parser.add_argument("--open-browser", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--wait-for-ui-start", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--ros-navigation-map-source", choices=("fused_scan", "external"), default="fused_scan")
+    parser.add_argument(
+        "--ros-navigation-map-source",
+        choices=("fused_scan", "fused_point_cloud", "external"),
+        default="fused_scan",
+    )
     parser.add_argument("--ros-map-topic", default="/map")
+    parser.add_argument(
+        "--ros-map-updates-topic",
+        default=None,
+        help="OccupancyGridUpdate topic paired with --ros-map-topic. Defaults to '<ros-map-topic>_updates'.",
+    )
+    parser.add_argument(
+        "--ros-fuse-external-projected-map-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Fuse external /projected_map snapshots captured during camera-pan scans. "
+            "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
+        ),
+    )
     parser.add_argument("--ros-scan-topic", default="/scan")
+    parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
+    parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
+    parser.add_argument("--ros-scan-active-release-delay-s", type=float, default=3.0)
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
@@ -57,6 +78,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
+    parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
+    parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
+    parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--camera-pan-step-deg", type=float, default=60.0)
+    parser.add_argument("--camera-pan-compute-s", type=float, default=2.0)
+    parser.add_argument("--camera-pan-sample-count", type=int, default=12)
+    parser.add_argument("--point-cloud-range-min-m", type=float, default=0.25)
+    parser.add_argument("--point-cloud-range-max-m", type=float, default=4.0)
+    parser.add_argument("--point-cloud-floor-free-max-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-obstacle-min-z-m", type=float, default=0.08)
+    parser.add_argument("--point-cloud-robot-clearance-height-m", type=float, default=1.50)
+    parser.add_argument("--point-cloud-obstacle-max-z-m", type=float, default=1.80)
+    parser.add_argument("--point-cloud-max-rays", type=int, default=2400)
     parser.add_argument("--pause-for-operator-approval", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--stop-after-initial-scan", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--nav2-planner-id", default="GridBased")
@@ -114,6 +149,12 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_map_topic,
         "--ros-scan-topic",
         args.ros_scan_topic,
+        "--ros-point-cloud-topic",
+        args.ros_point_cloud_topic,
+        "--ros-scan-active-topic",
+        args.ros_scan_active_topic,
+        "--ros-scan-active-release-delay-s",
+        str(args.ros_scan_active_release_delay_s),
         "--ros-rgb-topic",
         args.ros_rgb_topic,
         "--ros-imu-topic",
@@ -138,6 +179,34 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.ros_manual_spin_angular_speed_rad_s),
         "--ros-manual-spin-publish-hz",
         str(args.ros_manual_spin_publish_hz),
+        "--ros-turn-scan-mode",
+        args.ros_turn_scan_mode,
+        "--robot-brain-url",
+        args.robot_brain_url,
+        "--camera-pan-action-key",
+        args.camera_pan_action_key,
+        "--camera-pan-settle-s",
+        str(args.camera_pan_settle_s),
+        "--camera-pan-step-deg",
+        str(args.camera_pan_step_deg),
+        "--camera-pan-compute-s",
+        str(args.camera_pan_compute_s),
+        "--camera-pan-sample-count",
+        str(args.camera_pan_sample_count),
+        "--point-cloud-range-min-m",
+        str(args.point_cloud_range_min_m),
+        "--point-cloud-range-max-m",
+        str(args.point_cloud_range_max_m),
+        "--point-cloud-floor-free-max-z-m",
+        str(args.point_cloud_floor_free_max_z_m),
+        "--point-cloud-obstacle-min-z-m",
+        str(args.point_cloud_obstacle_min_z_m),
+        "--point-cloud-robot-clearance-height-m",
+        str(args.point_cloud_robot_clearance_height_m),
+        "--point-cloud-obstacle-max-z-m",
+        str(args.point_cloud_obstacle_max_z_m),
+        "--point-cloud-max-rays",
+        str(args.point_cloud_max_rays),
         "--explorer-policy",
         args.explorer_policy,
         "--llm-provider",
@@ -158,6 +227,7 @@ def translated_args(args: argparse.Namespace) -> list[str]:
     optional_pairs = [
         ("--max-control-steps", args.max_control_steps),
         ("--max-episode-steps", args.max_episode_steps),
+        ("--ros-map-updates-topic", args.ros_map_updates_topic),
         ("--llm-base-url", args.llm_base_url),
         ("--llm-api-key", args.llm_api_key),
         ("--llm-reasoning-effort", args.llm_reasoning_effort),
@@ -184,6 +254,11 @@ def translated_args(args: argparse.Namespace) -> list[str]:
             "--stop-after-initial-scan",
             "--no-stop-after-initial-scan",
             args.stop_after_initial_scan,
+        ),
+        (
+            "--ros-fuse-external-projected-map-snapshots",
+            "--no-ros-fuse-external-projected-map-snapshots",
+            args.ros_fuse_external_projected_map_snapshots,
         ),
         ("--nav2-recovery-enabled", "--no-nav2-recovery-enabled", args.nav2_recovery_enabled),
         ("--ros-allow-multiple-action-servers", "--no-ros-allow-multiple-action-servers", args.ros_allow_multiple_action_servers),
