@@ -110,11 +110,12 @@ def patch_nav2_params(
     min_linear_velocity_threshold: float = 0.01,
     min_angular_velocity_threshold: float = 0.02,
     min_speed_theta: float = 0.02,
-    trans_stopped_velocity: float = 0.05,
+    trans_stopped_velocity: float = 0.01,
+    follow_path_xy_goal_tolerance_m: float = 0.10,
     path_align_scale: float = 16.0,
     goal_align_scale: float = 12.0,
-    rotate_to_goal_scale: float = 8.0,
-    rotate_to_goal_slowing_factor: float = 3.0,
+    rotate_to_goal_scale: float = 0.0,
+    rotate_to_goal_slowing_factor: float = 1.0,
     transform_tolerance_s: float = 0.5,
     progress_required_movement_radius: float = 0.05,
     progress_movement_time_allowance_s: float = 25.0,
@@ -299,6 +300,10 @@ def patch_nav2_params(
         follow_path["max_vel_theta"] = max_angular_velocity
         follow_path["min_speed_theta"] = min(min_speed_theta, max_angular_velocity)
         follow_path["trans_stopped_velocity"] = trans_stopped_velocity
+        follow_path["xy_goal_tolerance"] = max(
+            0.0,
+            min(float(follow_path_xy_goal_tolerance_m), float(xy_goal_tolerance_m)),
+        )
         if path_align_scale <= 0.0:
             _remove_critic(follow_path, "PathAlign")
         elif "PathAlign.scale" in follow_path:
@@ -324,9 +329,10 @@ def patch_nav2_params(
     if isinstance(velocity_smoother.get("min_velocity"), list) and len(velocity_smoother["min_velocity"]) >= 3:
         velocity_smoother["min_velocity"][0] = -max_linear_velocity
         velocity_smoother["min_velocity"][2] = -max_angular_velocity
-    if isinstance(velocity_smoother.get("deadband_velocity"), list) and len(velocity_smoother["deadband_velocity"]) >= 3:
-        velocity_smoother["deadband_velocity"][0] = min_linear_velocity_threshold
-        velocity_smoother["deadband_velocity"][2] = min_angular_velocity_threshold
+    if not isinstance(velocity_smoother.get("deadband_velocity"), list) or len(velocity_smoother["deadband_velocity"]) < 3:
+        velocity_smoother["deadband_velocity"] = [0.0, 0.0, 0.0]
+    velocity_smoother["deadband_velocity"][0] = min_linear_velocity_threshold
+    velocity_smoother["deadband_velocity"][2] = min_angular_velocity_threshold
 
     amcl = node_params("amcl")
     if amcl:

@@ -45,6 +45,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Smallest nonzero angular speed sampled by DWB; keep above the real base deadband.",
     )
     parser.add_argument(
+        "--trans-stopped-velocity",
+        type=float,
+        default=0.01,
+        help="DWB translational stopped threshold. Keep below the real max linear velocity.",
+    )
+    parser.add_argument(
+        "--follow-path-xy-goal-tolerance-m",
+        type=float,
+        default=0.10,
+        help=(
+            "DWB internal XY goal tolerance. Keep below PositionGoalChecker tolerance so DWB "
+            "does not enter near-goal behavior before the action can succeed."
+        ),
+    )
+    parser.add_argument(
         "--rotate-to-goal-slowing-factor",
         type=float,
         default=1.0,
@@ -65,8 +80,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--rotate-to-goal-scale",
         type=float,
-        default=8.0,
-        help="DWB RotateToGoal critic scale. Goal completion is still XY-only via PositionGoalChecker.",
+        default=0.0,
+        help="DWB RotateToGoal critic scale. Default disables final-yaw rotation for XY-only exploration goals.",
     )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
@@ -122,6 +137,8 @@ def main(argv: list[str] | None = None) -> int:
         min_linear_velocity_threshold=args.min_linear_velocity_threshold,
         min_angular_velocity_threshold=args.min_angular_velocity_threshold,
         min_speed_theta=args.min_speed_theta,
+        trans_stopped_velocity=args.trans_stopped_velocity,
+        follow_path_xy_goal_tolerance_m=args.follow_path_xy_goal_tolerance_m,
         path_align_scale=args.path_align_scale,
         goal_align_scale=args.goal_align_scale,
         rotate_to_goal_scale=args.rotate_to_goal_scale,

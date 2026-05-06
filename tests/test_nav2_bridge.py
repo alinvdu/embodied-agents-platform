@@ -116,6 +116,8 @@ class Nav2BridgeTests(unittest.TestCase):
                         "max_speed_xy": 0.26,
                         "max_vel_theta": 1.0,
                         "trans_stopped_velocity": 0.25,
+                        "xy_goal_tolerance": 0.25,
+                        "critics": ["RotateToGoal", "Oscillation", "GoalAlign", "PathAlign", "PathDist", "GoalDist"],
                         "PathAlign.scale": 32.0,
                         "GoalAlign.scale": 24.0,
                         "RotateToGoal.scale": 32.0,
@@ -190,6 +192,18 @@ class Nav2BridgeTests(unittest.TestCase):
             0.02,
         )
         self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["FollowPath"]["trans_stopped_velocity"],
+            0.01,
+        )
+        self.assertEqual(
+            patched["controller_server"]["ros__parameters"]["FollowPath"]["xy_goal_tolerance"],
+            0.10,
+        )
+        self.assertNotIn(
+            "RotateToGoal",
+            patched["controller_server"]["ros__parameters"]["FollowPath"]["critics"],
+        )
+        self.assertEqual(
             patched["velocity_smoother"]["ros__parameters"]["max_velocity"][0],
             0.65,
         )
@@ -201,9 +215,9 @@ class Nav2BridgeTests(unittest.TestCase):
             patched["velocity_smoother"]["ros__parameters"]["deadband_velocity"],
             [0.01, 0.0, 0.02],
         )
-        self.assertEqual(
-            patched["controller_server"]["ros__parameters"]["FollowPath"]["RotateToGoal.scale"],
-            8.0,
+        self.assertNotIn(
+            "RotateToGoal.scale",
+            patched["controller_server"]["ros__parameters"]["FollowPath"],
         )
         self.assertEqual(
             patched["controller_server"]["ros__parameters"]["progress_checker"]["required_movement_radius"],
