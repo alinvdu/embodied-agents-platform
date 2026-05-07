@@ -63,6 +63,7 @@ class RgbdVoConfig:
     camera_pitch_topic: str = "/camera/head/pitch_rad"
     camera_pan_topic: str = "/camera/head/pan_rad"
     scan_active_topic: str = "/xlerobot/scan_active"
+    freeze_odom_during_scan: bool = True
     freeze_orientation_during_scan: bool = True
     publish_rate_hz: float = 30.0
     min_depth_m: float = 0.15
@@ -420,6 +421,7 @@ class RgbdVisualOdometryNode(Node):
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
             f"camera_pitch={config.camera_pitch_topic} camera_pan={config.camera_pan_topic} "
             f"scan_active={config.scan_active_topic} "
+            f"freeze_odom_during_scan={config.freeze_odom_during_scan} "
             f"freeze_orientation_during_scan={config.freeze_orientation_during_scan} "
             f"imu={config.imu_topic} odom={config.odom_topic}"
         )
@@ -556,10 +558,10 @@ class RgbdVisualOdometryNode(Node):
         self.previous_frame = None
         self._last_prediction_stamp_s = None
         if active:
-            self.get_logger().info("Freezing odom orientation while scan_active is true; translation updates remain enabled.")
+            self.get_logger().info("Freezing odom pose while scan_active is true; RGB-D translation and IMU yaw updates are ignored.")
         else:
             self._reset_imu_origin_to_current_pose()
-            self.get_logger().info("Resuming odom orientation after scan_active returned false; reset VO keyframe and IMU yaw origin.")
+            self.get_logger().info("Resuming odom pose after scan_active returned false; reset VO keyframe and IMU yaw origin.")
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
@@ -656,7 +658,10 @@ class RgbdVisualOdometryNode(Node):
         return float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s * dt
 
     def _orientation_freeze_active(self) -> bool:
-        return bool(self.config.freeze_orientation_during_scan and self._scan_orientation_frozen)
+        return bool((self.config.freeze_odom_during_scan or self.config.freeze_orientation_during_scan) and self._scan_orientation_frozen)
+
+    def _translation_freeze_active(self) -> bool:
+        return bool(self.config.freeze_odom_during_scan and self._scan_orientation_frozen)
 
     def _log_scan_orientation_freeze(self, *, now_s: float) -> None:
         if self._last_scan_freeze_log_s is not None and now_s - self._last_scan_freeze_log_s < 1.0:
@@ -684,6 +689,7 @@ class RgbdVisualOdometryNode(Node):
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
         orientation_frozen = self._orientation_freeze_active()
+        translation_frozen = self._translation_freeze_active()
         if orientation_frozen:
             self._last_prediction_stamp_s = stamp_s
             self._log_scan_orientation_freeze(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
@@ -714,30 +720,36 @@ class RgbdVisualOdometryNode(Node):
                 if orientation_frozen:
                     imu_yaw_rad = 0.0
                 if self.previous_frame is not None:
-                    estimate = self.estimator.estimate(self.previous_frame, frame)
-                    if isinstance(estimate, VisualOdomEstimate):
-                        base_forward_m, base_left_m = camera_optical_translation_to_base_planar(
-                            camera_x_m=estimate.camera_translation_x_m,
-                            camera_y_m=estimate.camera_translation_y_m,
-                            camera_z_m=estimate.camera_translation_z_m,
-                            pitch_rad=self.camera_pitch_rad,
-                        )
-                        self.pose = compose_planar_local(
-                            self.pose,
-                            delta_x_m=base_forward_m,
-                            delta_y_m=base_left_m,
-                            delta_yaw_rad=imu_yaw_rad,
-                        )
-                        dt = max(stamp_s - stamp_to_seconds(self.previous_frame.stamp), 1e-6)
-                        self.planar_velocity_x_m_s = base_forward_m / dt
-                        self.planar_velocity_y_m_s = base_left_m / dt
-                        self.accepted_updates += 1
-                        self._record_estimate(estimate)
+                    if translation_frozen:
                         self.previous_frame = frame
+                        self.planar_velocity_x_m_s = 0.0
+                        self.planar_velocity_y_m_s = 0.0
                         imu_yaw_applied = True
                     else:
-                        self.rejected_updates += 1
-                        self._record_rejection(estimate)
+                        estimate = self.estimator.estimate(self.previous_frame, frame)
+                        if isinstance(estimate, VisualOdomEstimate):
+                            base_forward_m, base_left_m = camera_optical_translation_to_base_planar(
+                                camera_x_m=estimate.camera_translation_x_m,
+                                camera_y_m=estimate.camera_translation_y_m,
+                                camera_z_m=estimate.camera_translation_z_m,
+                                pitch_rad=self.camera_pitch_rad,
+                            )
+                            self.pose = compose_planar_local(
+                                self.pose,
+                                delta_x_m=base_forward_m,
+                                delta_y_m=base_left_m,
+                                delta_yaw_rad=imu_yaw_rad,
+                            )
+                            dt = max(stamp_s - stamp_to_seconds(self.previous_frame.stamp), 1e-6)
+                            self.planar_velocity_x_m_s = base_forward_m / dt
+                            self.planar_velocity_y_m_s = base_left_m / dt
+                            self.accepted_updates += 1
+                            self._record_estimate(estimate)
+                            self.previous_frame = frame
+                            imu_yaw_applied = True
+                        else:
+                            self.rejected_updates += 1
+                            self._record_rejection(estimate)
                 else:
                     self.previous_frame = frame
                 stamp = frame.stamp
@@ -828,15 +840,24 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help=(
-            "Compatibility alias for --freeze-orientation-during-scan. This no longer freezes "
-            "position from camera pan alone."
+            "Compatibility alias for --freeze-orientation-during-scan. Camera pan alone no longer freezes odom; "
+            "--freeze-odom-during-scan controls full pose freeze from scan-active events."
         ),
     )
     parser.add_argument(
         "--freeze-orientation-during-scan",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Freeze odom yaw only while --scan-active-topic publishes true; RGB-D translation remains enabled.",
+        help="Freeze odom yaw while --scan-active-topic publishes true.",
+    )
+    parser.add_argument(
+        "--freeze-odom-during-scan",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Freeze both RGB-D translation and odom yaw while --scan-active-topic publishes true. "
+            "The exploration runtime keeps scan_active true briefly after scans to provide a settle buffer."
+        ),
     )
     parser.add_argument(
         "--head-motion-freeze-settle-s",
@@ -919,6 +940,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_pitch_topic=args.camera_pitch_topic,
         camera_pan_topic=args.camera_pan_topic,
         scan_active_topic=args.scan_active_topic,
+        freeze_odom_during_scan=args.freeze_odom_during_scan,
         freeze_orientation_during_scan=(
             bool(args.freeze_during_head_motion)
             if args.freeze_orientation_during_scan is None
