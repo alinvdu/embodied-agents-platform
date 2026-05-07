@@ -218,6 +218,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --head-points-topic /camera/head/points \
   --head-points-mode settled \
   --head-points-settled-delay-s 0.20 \
+  --head-points-only-during-scan \
   --scan-active-topic /xlerobot/scan_active \
   --no-head-points-update-map-while-base-moving \
   --cmd-vel-timeout-s 0.5 \
@@ -235,7 +236,7 @@ python -m xlerobot_playground.real_ros_bridge \
 
 This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
 
-For OctoMap camera-pan scans, keep `--head-points-mode settled` and `--scan-active-topic /xlerobot/scan_active`. In this mode the bridge applies pose-settle suppression only while `/xlerobot/scan_active` is true; outside scan windows, `/camera/head/points` publishes normally unless the waypoint pause or base-motion gates below are active. During scans, the bridge suppresses `/camera/head/points` while the head is moving and only resumes after robot brain reports the target head pose as settled, so OctoMap integrates stable snapshots instead of smearing point clouds during pan motion.
+For OctoMap camera-pan scans, keep `--head-points-mode settled`, `--head-points-only-during-scan`, and `--scan-active-topic /xlerobot/scan_active`. In this mode `/camera/head/points` is published only while `/xlerobot/scan_active` is true. During scans, the bridge still suppresses `/camera/head/points` while the head is moving and only resumes after robot brain reports the target head pose as settled, so OctoMap integrates stable snapshots instead of smearing point clouds during pan motion.
 
 Keep `--no-head-points-update-map-while-base-moving` for waypoint/Nav2 tests. This temporarily freezes OctoMap input while `/cmd_vel` is moving the base. It prevents base-motion TF/odometry lag from corrupting the already-built map; later live mapping can switch to `--head-points-update-map-while-base-moving` once base pose tracking is validated during motion.
 

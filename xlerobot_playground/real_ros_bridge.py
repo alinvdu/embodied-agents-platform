@@ -98,6 +98,7 @@ class RealRosBridgeConfig:
     head_points_stale_tolerance_s: float = 0.10
     head_points_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     head_points_update_map_while_base_moving: bool = False
+    head_points_only_during_scan: bool = False
     scan_active_topic: str = "/xlerobot/scan_active"
     head_laser_frame: str = "head_laser"
     camera_x_m: float = 0.0
@@ -1142,6 +1143,9 @@ class RealXLeRobotRosBridge(Node):
         if self._base_motion_active and not self.config.head_points_update_map_while_base_moving:
             self._log_head_points_skip_once("base moving")
             return False
+        if self.config.head_points_only_during_scan and not self._scan_active:
+            self._log_head_points_skip_once("scan inactive")
+            return False
         if self.config.head_points_mode == "continuous":
             return True
         if self.config.head_points_mode != "settled":
@@ -1363,6 +1367,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--head-points-only-during-scan",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Publish /camera/head/points only while scan-active is true. Use this for OctoMap validation "
+            "runs where the map should change only during intentional scan windows."
+        ),
+    )
+    parser.add_argument(
         "--scan-active-topic",
         default="/xlerobot/scan_active",
         help=(
@@ -1439,6 +1452,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         head_points_stale_tolerance_s=args.head_points_stale_tolerance_s,
         head_points_update_map_enabled_topic=args.head_points_update_map_enabled_topic,
         head_points_update_map_while_base_moving=args.head_points_update_map_while_base_moving,
+        head_points_only_during_scan=args.head_points_only_during_scan,
         scan_active_topic=args.scan_active_topic,
         head_laser_frame=args.head_laser_frame,
         camera_x_m=args.camera_x_m,

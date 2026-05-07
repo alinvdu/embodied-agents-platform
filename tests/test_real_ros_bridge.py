@@ -149,6 +149,20 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(bridge._last_head_points_skip_reason, "")
         self.assertEqual(logger.messages, [])
 
+    def test_head_points_can_be_limited_to_scan_windows(self) -> None:
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        logger = _Logger()
+        bridge.get_logger = lambda: logger
+        bridge.config = RealRosBridgeConfig(head_points_only_during_scan=True)
+        bridge._head_points_update_map_enabled = True
+        bridge._base_motion_active = False
+        bridge._scan_active = False
+        bridge._last_head_points_skip_reason = ""
+
+        self.assertFalse(bridge._head_points_publish_allowed(_Frame(time.monotonic())))
+        self.assertEqual(bridge._last_head_points_skip_reason, "scan inactive")
+        self.assertEqual(logger.messages, ["Suppressing /camera/head/points in settled mode: scan inactive."])
+
     def test_settled_head_points_wait_for_pose_during_scan(self) -> None:
         now_s = time.monotonic()
         bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)

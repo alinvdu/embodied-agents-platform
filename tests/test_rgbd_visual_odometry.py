@@ -156,6 +156,32 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         self.assertAlmostEqual(delta, math.radians(-3.0))
 
+    def test_trusted_filtered_yaw_sets_pose_yaw_directly(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(1.0, 2.0, math.radians(5.0))
+
+        applied = node._apply_trusted_imu_yaw(
+            absolute_imu_yaw_rad=math.radians(45.0),
+            orientation_frozen=False,
+        )
+
+        self.assertTrue(applied)
+        self.assertAlmostEqual(node.pose.x, 1.0)
+        self.assertAlmostEqual(node.pose.y, 2.0)
+        self.assertAlmostEqual(node.pose.yaw, math.radians(45.0))
+
+    def test_trusted_filtered_yaw_does_not_override_scan_freeze(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.pose = PlanarPose(1.0, 2.0, math.radians(5.0))
+
+        applied = node._apply_trusted_imu_yaw(
+            absolute_imu_yaw_rad=math.radians(45.0),
+            orientation_frozen=True,
+        )
+
+        self.assertFalse(applied)
+        self.assertAlmostEqual(node.pose.yaw, math.radians(5.0))
+
     def test_orientation_freeze_depends_on_scan_event_not_pan(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
         node.config = type("Config", (), {"freeze_orientation_during_scan": True, "freeze_odom_during_scan": False, "scan_active_stale_timeout_s": 0.0})()

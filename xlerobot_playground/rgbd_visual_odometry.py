@@ -543,6 +543,34 @@ class RgbdVisualOdometryNode(Node):
             f"yaw:{diagnostics.yaw_step_too_large},"
             f"exceptions:{diagnostics.exceptions}"
         )
+        imu_age_s = self._latest_imu_age_s()
+        imu_age_text = "none" if imu_age_s is None else f"{imu_age_s:.3f}"
+        absolute_yaw_text = (
+            "none"
+            if self._latest_imu_orientation_unwrapped_yaw_rad is None
+            else f"{math.degrees(self._latest_imu_orientation_unwrapped_yaw_rad):.1f}"
+        )
+        origin_yaw_text = (
+            "none"
+            if self._imu_orientation_origin_yaw_rad is None
+            else f"{math.degrees(self._imu_orientation_origin_yaw_rad):.1f}"
+        )
+        yaw_rate_rad_s = 0.0
+        if self.latest_imu is not None:
+            _, _, yaw_rate_rad_s = imu_to_base_components(
+                frame_convention=self.config.imu_frame_convention,
+                x=float(self.latest_imu.angular_velocity.x) - self._imu_bias_x_rad_s,
+                y=float(self.latest_imu.angular_velocity.y) - self._imu_bias_y_rad_s,
+                z=float(self.latest_imu.angular_velocity.z) - self._imu_bias_z_rad_s,
+            )
+            yaw_rate_rad_s *= float(getattr(self.config, "odom_yaw_sign", 1.0))
+        self.get_logger().info(
+            "RGB-D VO IMU: "
+            f"topic={self.config.imu_topic} received={self.latest_imu is not None} age_s={imu_age_text} "
+            f"bias_ready={self._imu_bias_ready} absolute_yaw_deg={absolute_yaw_text} "
+            f"origin_yaw_deg={origin_yaw_text} yaw_rate_rad_s={yaw_rate_rad_s:.4f} "
+            f"scan_freeze={self._scan_orientation_frozen}"
+        )
 
     def _on_rgb(self, message: Any) -> None:
         self.latest_rgb = message
@@ -720,6 +748,12 @@ class RgbdVisualOdometryNode(Node):
             return predicted_yaw_rad
         return 0.0
 
+    def _apply_trusted_imu_yaw(self, *, absolute_imu_yaw_rad: float | None, orientation_frozen: bool) -> bool:
+        if orientation_frozen or absolute_imu_yaw_rad is None:
+            return False
+        self.pose = PlanarPose(self.pose.x, self.pose.y, angle_wrap(absolute_imu_yaw_rad))
+        return True
+
     def step(self) -> None:
         stamp = self.get_clock().now().to_msg()
         stamp_s = stamp_to_seconds(stamp)
@@ -801,6 +835,10 @@ class RgbdVisualOdometryNode(Node):
             )
             self.planar_velocity_x_m_s = 0.0
             self.planar_velocity_y_m_s = 0.0
+        self._apply_trusted_imu_yaw(
+            absolute_imu_yaw_rad=absolute_imu_yaw_rad,
+            orientation_frozen=orientation_frozen,
+        )
         self._log_diagnostics(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
         self._publish_odom(stamp)
 
