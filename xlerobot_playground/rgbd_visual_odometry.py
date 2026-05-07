@@ -24,6 +24,7 @@ try:
     from geometry_msgs.msg import Quaternion, TransformStamped
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
+    from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import CameraInfo, Image, Imu
     from std_msgs.msg import Bool, Float32
     from tf2_ros import TransformBroadcaster
@@ -34,12 +35,22 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     TransformStamped = None
     Odometry = None
     Node = object
+    DurabilityPolicy = None
+    QoSProfile = None
+    ReliabilityPolicy = None
     CameraInfo = None
     Image = None
     Imu = None
     Bool = None
     Float32 = None
     TransformBroadcaster = None
+
+
+def scan_active_qos_profile() -> Any:
+    qos = QoSProfile(depth=1)
+    qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    qos.reliability = ReliabilityPolicy.RELIABLE
+    return qos
 
 
 @dataclass(frozen=True)
@@ -63,6 +74,7 @@ class RgbdVoConfig:
     camera_pitch_topic: str = "/camera/head/pitch_rad"
     camera_pan_topic: str = "/camera/head/pan_rad"
     scan_active_topic: str = "/xlerobot/scan_active"
+    scan_active_stale_timeout_s: float = 10.0
     freeze_odom_during_scan: bool = True
     freeze_orientation_during_scan: bool = True
     publish_rate_hz: float = 30.0
@@ -383,6 +395,7 @@ class RgbdVisualOdometryNode(Node):
         self._last_camera_pitch_rad = self.camera_pitch_rad
         self._last_camera_pan_rad = self.camera_pan_rad
         self._scan_orientation_frozen = False
+        self._scan_active_last_true_s: float | None = None
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
         self.planar_velocity_x_m_s = 0.0
@@ -413,7 +426,7 @@ class RgbdVisualOdometryNode(Node):
         self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, 10)
         self.create_subscription(Float32, config.camera_pitch_topic, self._on_camera_pitch, 10)
         self.create_subscription(Float32, config.camera_pan_topic, self._on_camera_pan, 10)
-        self.create_subscription(Bool, config.scan_active_topic, self._on_scan_active, 10)
+        self.create_subscription(Bool, config.scan_active_topic, self._on_scan_active, scan_active_qos_profile())
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
@@ -552,6 +565,9 @@ class RgbdVisualOdometryNode(Node):
 
     def _on_scan_active(self, message: Any) -> None:
         active = bool(message.data)
+        now_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
+        if active:
+            self._scan_active_last_true_s = now_s
         if active == self._scan_orientation_frozen:
             return
         self._scan_orientation_frozen = active
@@ -560,6 +576,7 @@ class RgbdVisualOdometryNode(Node):
         if active:
             self.get_logger().info("Freezing odom pose while scan_active is true; RGB-D translation and IMU yaw updates are ignored.")
         else:
+            self._scan_active_last_true_s = None
             self._reset_imu_origin_to_current_pose()
             self.get_logger().info("Resuming odom pose after scan_active returned false; reset VO keyframe and IMU yaw origin.")
 
@@ -657,11 +674,29 @@ class RgbdVisualOdometryNode(Node):
         )
         return float(getattr(self.config, "odom_yaw_sign", 1.0)) * yaw_rate_rad_s * dt
 
+    def _scan_freeze_active(self) -> bool:
+        if not self._scan_orientation_frozen:
+            return False
+        timeout_s = max(float(getattr(self.config, "scan_active_stale_timeout_s", 0.0)), 0.0)
+        if timeout_s <= 0.0 or self._scan_active_last_true_s is None:
+            return True
+        now_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
+        if now_s - self._scan_active_last_true_s <= timeout_s:
+            return True
+        self._scan_orientation_frozen = False
+        self._scan_active_last_true_s = None
+        self.previous_frame = None
+        self._reset_imu_origin_to_current_pose()
+        self.get_logger().warning(
+            f"scan_active freeze timed out after {timeout_s:.1f}s without a true refresh; resuming odom pose."
+        )
+        return False
+
     def _orientation_freeze_active(self) -> bool:
-        return bool((self.config.freeze_odom_during_scan or self.config.freeze_orientation_during_scan) and self._scan_orientation_frozen)
+        return bool((self.config.freeze_odom_during_scan or self.config.freeze_orientation_during_scan) and self._scan_freeze_active())
 
     def _translation_freeze_active(self) -> bool:
-        return bool(self.config.freeze_odom_during_scan and self._scan_orientation_frozen)
+        return bool(self.config.freeze_odom_during_scan and self._scan_freeze_active())
 
     def _log_scan_orientation_freeze(self, *, now_s: float) -> None:
         if self._last_scan_freeze_log_s is not None and now_s - self._last_scan_freeze_log_s < 1.0:
@@ -836,6 +871,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bool topic that is true only while an intentional scan is active.",
     )
     parser.add_argument(
+        "--scan-active-stale-timeout-s",
+        type=float,
+        default=10.0,
+        help=(
+            "Failsafe timeout for scan-active odom freeze. The exploration runtime refreshes scan_active=true "
+            "during scans; if the false event is missed, odom resumes after this timeout."
+        ),
+    )
+    parser.add_argument(
         "--freeze-during-head-motion",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -940,6 +984,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_pitch_topic=args.camera_pitch_topic,
         camera_pan_topic=args.camera_pan_topic,
         scan_active_topic=args.scan_active_topic,
+        scan_active_stale_timeout_s=args.scan_active_stale_timeout_s,
         freeze_odom_during_scan=args.freeze_odom_during_scan,
         freeze_orientation_during_scan=(
             bool(args.freeze_during_head_motion)

@@ -84,6 +84,13 @@ except Exception as exc:  # pragma: no cover - optional ROS runtime dependency.
     OccupancyGridUpdate = None
 
 
+def scan_active_qos_profile() -> Any:
+    qos = QoSProfile(depth=1)
+    qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    qos.reliability = ReliabilityPolicy.RELIABLE
+    return qos
+
+
 def require_runtime_dependencies() -> None:
     if IMPORT_ERROR is not None:
         raise RuntimeError(
@@ -480,7 +487,10 @@ class RosExplorationRuntime(Node):
             config.point_cloud_update_map_enabled_topic,
             10,
         )
-        self._scan_active_pub = self.create_publisher(Bool, config.scan_active_topic, 10)
+        self._scan_active_pub = self.create_publisher(Bool, config.scan_active_topic, scan_active_qos_profile())
+        self._scan_active_heartbeat_enabled = False
+        self._last_scan_active_heartbeat_s = 0.0
+        self.set_scan_active(False)
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -837,6 +847,15 @@ class RosExplorationRuntime(Node):
     def _set_scan_active_if_available(self, active: bool) -> None:
         self.set_scan_active(active)
 
+    def _refresh_scan_active_heartbeat(self) -> None:
+        if not self._scan_active_heartbeat_enabled:
+            return
+        now_s = time.time()
+        if now_s - self._last_scan_active_heartbeat_s < 1.0:
+            return
+        self._last_scan_active_heartbeat_s = now_s
+        self._set_scan_active_if_available(True)
+
     def _release_scan_active_after_delay(self) -> None:
         delay_s = max(float(getattr(self.config, "scan_active_release_delay_s", 0.0)), 0.0)
         if delay_s > 0.0:
@@ -999,6 +1018,8 @@ class RosExplorationRuntime(Node):
         if mode != "robot_spin":
             raise ValueError(f"Unsupported turn scan mode: {mode!r}")
         self._set_scan_active_if_available(True)
+        self._scan_active_heartbeat_enabled = True
+        self._last_scan_active_heartbeat_s = 0.0
         self._use_turn_feedback_for_scan_pose = True
         try:
             spin_event = self._manual_spin(should_cancel=should_cancel)
@@ -1006,6 +1027,7 @@ class RosExplorationRuntime(Node):
             raw_observations, observation_stop_index = self.drain_scan_observations(observation_start_index)
         finally:
             self._use_turn_feedback_for_scan_pose = False
+            self._scan_active_heartbeat_enabled = False
             self._release_scan_active_after_delay()
         observations = _select_turnaround_scan_observations(raw_observations, sample_count=sample_count)
         end_pose = self.current_pose()
@@ -1092,7 +1114,10 @@ class RosExplorationRuntime(Node):
         try:
             if hasattr(self, "_set_scan_active_if_available"):
                 self._set_scan_active_if_available(True)
+                self._scan_active_heartbeat_enabled = True
+                self._last_scan_active_heartbeat_s = 0.0
             for pan_rad in scan_angles:
+                self._refresh_scan_active_heartbeat()
                 if should_cancel is not None and should_cancel():
                     event["scan_stop_reason"] = "canceled"
                     break
@@ -1110,7 +1135,9 @@ class RosExplorationRuntime(Node):
                     point_cloud_start_index,
                     timeout_s=max(pan_compute_s + 2.0, 3.0),
                 )
+                self._refresh_scan_active_heartbeat()
                 self.spin_for(pan_compute_s)
+                self._refresh_scan_active_heartbeat()
                 map_updated = self.latest_map_stamp_s > map_before_command_s
                 settled_sample_events.append(
                     {
@@ -1150,6 +1177,7 @@ class RosExplorationRuntime(Node):
             except Exception as exc:
                 event["restore_error"] = str(exc)
             finally:
+                self._scan_active_heartbeat_enabled = False
                 if hasattr(self, "_set_scan_active_if_available"):
                     if hasattr(self, "_release_scan_active_after_delay"):
                         self._release_scan_active_after_delay()
@@ -1296,6 +1324,11 @@ class RosExplorationRuntime(Node):
         self._publish_internal_navigation_state()
 
     def close(self) -> None:
+        try:
+            self._scan_active_heartbeat_enabled = False
+            self.set_scan_active(False)
+        except Exception:
+            pass
         self.destroy_node()
 
     def _publish_internal_navigation_state(self) -> None:
@@ -1372,6 +1405,7 @@ class RosExplorationRuntime(Node):
                 break
             self._cmd_vel_pub.publish(twist)
             self._spin_once(timeout_sec=0.0)
+            self._refresh_scan_active_heartbeat()
             feedback_frame, current_yaw = self._current_turn_feedback()
             if current_yaw is not None and start_yaw is not None:
                 relative_yaw = math.atan2(

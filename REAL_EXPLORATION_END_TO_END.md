@@ -405,6 +405,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --camera-pan-topic /camera/head/pan_rad \
   --scan-active-topic /xlerobot/scan_active \
+  --scan-active-stale-timeout-s 10.0 \
   --freeze-orientation-during-scan \
   --freeze-odom-during-scan \
   --imu-frame-convention base_link \
@@ -417,7 +418,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
 
-Keep `--freeze-odom-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes odom yaw and RGB-D translation, while still refreshing the VO keyframe so scan-time camera motion is not accumulated into one post-scan jump. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias for yaw freezing, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after the configured release delay, giving odom a short settle buffer after scanning.
+Keep `--freeze-odom-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes odom yaw and RGB-D translation, while still refreshing the VO keyframe so scan-time camera motion is not accumulated into one post-scan jump. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias for yaw freezing, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts, refreshes it while scanning, and publishes `false` after the configured release delay. `--scan-active-stale-timeout-s 10.0` is a failsafe: if the odom node misses the final `false` and no scan-active refresh arrives for 10 seconds, it resumes odom instead of freezing forever.
 
 Quick checks:
 
