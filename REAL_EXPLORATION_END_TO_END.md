@@ -406,6 +406,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --camera-pan-topic /camera/head/pan_rad \
   --scan-active-topic /xlerobot/scan_active \
   --freeze-orientation-during-scan \
+  --freeze-odom-during-scan \
   --imu-frame-convention base_link \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
@@ -416,7 +417,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
 
-Keep `--freeze-orientation-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes only odom yaw, while RGB-D translation remains enabled. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after scanning finishes.
+Keep `--freeze-odom-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes odom yaw and RGB-D translation, while still refreshing the VO keyframe so scan-time camera motion is not accumulated into one post-scan jump. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias for yaw freezing, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts and publishes `false` after the configured release delay, giving odom a short settle buffer after scanning.
 
 Quick checks:
 
