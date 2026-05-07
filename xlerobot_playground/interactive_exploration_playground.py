@@ -4142,6 +4142,7 @@ INTERACTIVE_HTML = """<!doctype html>
     let selectedRegionCells = new Map();
     let pendingSubwaypoint = null;
     let draggingWaypoint = null;
+    let lastAlertId = 0;
 
     function esc(v) {
       return String(v ?? '').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
@@ -4150,12 +4151,21 @@ INTERACTIVE_HTML = """<!doctype html>
       const res = await fetch(url, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload || {})});
       if (!res.ok) throw new Error(await res.text());
       state = await res.json();
+      maybeAlert();
       render();
     }
     async function refresh() {
       const res = await fetch('/api/state');
       state = await res.json();
+      maybeAlert();
       render();
+    }
+    function maybeAlert() {
+      const alertMessage = state?.last_alert || '';
+      const alertId = Number(state?.last_alert_id || 0);
+      if (!alertMessage || !alertId || alertId === lastAlertId) return;
+      lastAlertId = alertId;
+      window.alert(alertMessage);
     }
     function bounds(map) {
       return map.occupancy.bounds || {min_x:0,max_x:10,min_y:0,max_y:8};

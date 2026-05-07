@@ -2923,6 +2923,8 @@ class RosExplorationSession:
         self.pending_trace: dict[str, Any] | None = None
         self.applied_memory_updates: list[dict[str, Any]] = []
         self.last_error: str | None = None
+        self.last_alert: str | None = None
+        self.last_alert_id = 0
         self.last_nav2_preview: dict[str, Any] | None = None
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
@@ -3210,6 +3212,8 @@ class RosExplorationSession:
             self.pending_trace = None
             self.applied_memory_updates = []
             self.last_error = None
+            self.last_alert: str | None = None
+            self.last_alert_id = 0
             self._last_pose = None
             self.backend.resume_task(self.task_id)
             self._initialize_scan_state()
@@ -3234,6 +3238,8 @@ class RosExplorationSession:
                 "pending_target": self._pending_target(),
                 "applied_memory_updates": list(self.applied_memory_updates),
                 "last_error": self.last_error,
+                "last_alert": self.last_alert,
+                "last_alert_id": self.last_alert_id,
                 "map": self._build_map_payload(),
             }
 
@@ -3362,6 +3368,7 @@ class RosExplorationSession:
             self.pending_decision = None
             self.pending_trace = None
             self.applied_memory_updates = []
+            self._set_alert("Waypoint achieved.")
             self._push_progress_update(
                 message=f"Explored {record.frontier_id} from live ROS/Nav2 state.",
                 frontier_id=record.frontier_id,
@@ -3423,6 +3430,8 @@ class RosExplorationSession:
             )
             self._consume_nav_result(result)
             self.status = "manual_waypoint_succeeded" if result.status == "succeeded" else "manual_waypoint_failed"
+            if result.status == "succeeded":
+                self._set_alert("Waypoint achieved.")
             print(
                 "[real_exploration] manual waypoint result "
                 f"status={result.status} reason={result.reason}",
@@ -4503,6 +4512,10 @@ class RosExplorationSession:
 
     def _publish_live_map(self, message: str) -> None:
         self._push_progress_update(message=message, frontier_id=self.frontier_memory.active_frontier_id)
+
+    def _set_alert(self, message: str) -> None:
+        self.last_alert = message
+        self.last_alert_id += 1
 
     def _live_robot_pose(self) -> Pose2D | None:
         pose = self.runtime.current_pose()

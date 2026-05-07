@@ -521,6 +521,7 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       const [showMapEditing, setShowMapEditing] = useState(false);
       const [showRegionEditing, setShowRegionEditing] = useState(false);
       const autoStepInFlight = useRef(false);
+      const lastAlertIdRef = useRef(0);
 
       const refresh = useCallback(async () => {
         const next = await requestJson('/api/state');
@@ -548,6 +549,14 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
           .catch((err) => setUiMessage(err.message))
           .finally(() => { autoStepInFlight.current = false; });
       }, [state?.status, state?.session, state?.pending_target?.frontier_id]);
+
+      useEffect(() => {
+        const alertMessage = state?.last_alert || '';
+        const alertId = Number(state?.last_alert_id || 0);
+        if (!alertMessage || !alertId || alertId === lastAlertIdRef.current) return;
+        lastAlertIdRef.current = alertId;
+        window.alert(alertMessage);
+      }, [state?.last_alert, state?.last_alert_id]);
 
       const startRegion = () => {
         setRegionMode('select');
