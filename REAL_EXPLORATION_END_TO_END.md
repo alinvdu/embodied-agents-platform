@@ -438,7 +438,7 @@ cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
-ppython -m xlerobot_playground.real_nav2_config \
+python -m xlerobot_playground.real_nav2_config \
   --base-nav2-params /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml \
   --output-dir /home/alin/Robot42/artifacts/nav2 \
   --scan-topic /scan \
@@ -454,17 +454,12 @@ ppython -m xlerobot_playground.real_nav2_config \
   --min-speed-theta 0.01 \
   --trans-stopped-velocity 0.02 \
   --follow-path-xy-goal-tolerance-m 0.15 \
-  --path-align-scale 0.0 \
-  --goal-align-scale 0.0 \
-  --rotate-to-goal-scale 0.0 \
-  --rotate-to-goal-slowing-factor 1.0 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
   --transform-tolerance-s 0.5 \
   --progress-required-movement-radius 0.05 \
   --progress-movement-time-allowance-s 10.0 \
-  --xy-goal-tolerance-m 0.20 \
-  --yaw-goal-tolerance-rad 3.14
+  --xy-goal-tolerance-m 0.20
 ```
 
 The minimum velocity settings stop DWB from choosing tiny near-zero commands that the real base cannot execute. With `max_angular_velocity=0.18`, the old `min_speed_theta=0.0` allowed the first nonzero angular sample to be `0.00947 rad/s`, which shows up as `theta.vel=0.5428 deg/s` on the robot brain and can make Nav2 crawl at the goal. `FollowPath.xy_goal_tolerance` is kept below the `PositionGoalChecker` XY tolerance so DWB does not switch into near-goal behavior before Nav2 can mark the waypoint reached. The generated controller uses Nav2's `PositionGoalChecker`, so exploration waypoints complete on XY position and ignore final yaw; `RotateToGoal` is disabled for the same reason.

@@ -117,8 +117,8 @@ def patch_nav2_params(
     # Conservative real-robot defaults.
     inflation_radius: float = 0.20,
     inflation_cost_scaling_factor: float = 3.0,
-    local_costmap_width: int = 4,
-    local_costmap_height: int = 4,
+    local_costmap_width: int = 2,
+    local_costmap_height: int = 2,
 
     max_linear_velocity: float = 0.10,
     max_angular_velocity: float = 0.35,
@@ -130,10 +130,10 @@ def patch_nav2_params(
 
     follow_path_xy_goal_tolerance_m: float = 0.15,
 
-    # Disable alignment critics initially. They often cause arcing/turning on short goals.
-    path_align_scale: float = 0.0,
-    goal_align_scale: float = 0.0,
-    rotate_to_goal_scale: float = 0.0,
+    # Path alignment critics -- ENABLED to prevent arcing/cutting corners.
+    path_align_scale: float = 32.0,
+    goal_align_scale: float = 24.0,
+    rotate_to_goal_scale: float = 32.0,
 
     oscillation_reset_dist_m: float = 0.05,
     oscillation_reset_angle_rad: float = 0.15,
@@ -148,7 +148,8 @@ def patch_nav2_params(
     progress_movement_time_allowance_s: float = 8.0,
 
     xy_goal_tolerance_m: float = 0.20,
-    yaw_goal_tolerance_rad: float = 3.14,
+    # Tightened so the robot actually rotates toward the goal orientation.
+    yaw_goal_tolerance_rad: float = 0.25,
 
     # Intentionally kept false. Your costmaps stay static/projected-map based.
     enable_local_scan_obstacles: bool = False,
@@ -355,7 +356,7 @@ def patch_nav2_params(
         else:
             follow_path["decel_lim_theta"] = -0.50
 
-        # Disable critics that commonly cause initial turning/arcing on short goals.
+        # PathAlign -- keep enabled so the robot tracks the path shape.
         if path_align_scale <= 0.0:
             _remove_critic(follow_path, "PathAlign")
         elif "PathAlign.scale" in follow_path:
@@ -365,11 +366,13 @@ def patch_nav2_params(
                 0.1,
             )
 
+        # GoalAlign -- keep enabled for final approach alignment.
         if goal_align_scale <= 0.0:
             _remove_critic(follow_path, "GoalAlign")
         elif "GoalAlign.scale" in follow_path:
             follow_path["GoalAlign.scale"] = goal_align_scale
 
+        # RotateToGoal -- keep enabled for final orientation correction.
         if rotate_to_goal_scale <= 0.0:
             _remove_critic(follow_path, "RotateToGoal")
         elif "RotateToGoal.scale" in follow_path:
