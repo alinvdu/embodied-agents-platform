@@ -438,7 +438,7 @@ cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
-python -m xlerobot_playground.real_nav2_config \
+ppython -m xlerobot_playground.real_nav2_config \
   --base-nav2-params /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml \
   --output-dir /home/alin/Robot42/artifacts/nav2 \
   --scan-topic /scan \
@@ -447,21 +447,23 @@ python -m xlerobot_playground.real_nav2_config \
   --odom-frame odom \
   --base-frame base_link \
   --max-laser-range 4.0 \
-  --max-linear-velocity 0.03 \
-  --max-angular-velocity 0.18 \
-  --min-linear-velocity-threshold 0.01 \
-  --min-angular-velocity-threshold 0.02 \
-  --min-speed-theta 0.02 \
-  --trans-stopped-velocity 0.01 \
-  --follow-path-xy-goal-tolerance-m 0.10 \
+  --max-linear-velocity 0.05 \
+  --max-angular-velocity 0.25 \
+  --min-linear-velocity-threshold 0.005 \
+  --min-angular-velocity-threshold 0.01 \
+  --min-speed-theta 0.01 \
+  --trans-stopped-velocity 0.02 \
+  --follow-path-xy-goal-tolerance-m 0.15 \
+  --path-align-scale 0.0 \
+  --goal-align-scale 0.0 \
   --rotate-to-goal-scale 0.0 \
   --rotate-to-goal-slowing-factor 1.0 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
   --transform-tolerance-s 0.5 \
   --progress-required-movement-radius 0.05 \
-  --progress-movement-time-allowance-s 25.0 \
-  --xy-goal-tolerance-m 0.18 \
+  --progress-movement-time-allowance-s 10.0 \
+  --xy-goal-tolerance-m 0.20 \
   --yaw-goal-tolerance-rad 3.14
 ```
 
