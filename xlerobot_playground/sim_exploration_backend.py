@@ -842,7 +842,7 @@ class RosNav2NavigationModule(Nav2NavigationModule):
                     feedback_callback=feedback_callback,
                 )
             finally:
-                self.runtime.set_point_cloud_map_updates_enabled(True)
+                self.runtime.set_point_cloud_map_updates_enabled(False)
         except Exception as exc:
             reason = f"ROS Nav2 navigate_to_pose call failed: {exc}"
             recovery_events: list[dict[str, Any]] = []
@@ -3822,10 +3822,14 @@ class RosExplorationSession:
         return False
 
     def _perform_turnaround_scan(self, *, reason: str) -> None:
-        event = self.runtime.perform_turnaround_scan(
-            reason=reason,
-            should_cancel=self._pause_requested_or_canceled,
-        )
+        self.runtime.set_point_cloud_map_updates_enabled(True)
+        try:
+            event = self.runtime.perform_turnaround_scan(
+                reason=reason,
+                should_cancel=self._pause_requested_or_canceled,
+            )
+        finally:
+            self.runtime.set_point_cloud_map_updates_enabled(False)
         fused_projected_map = event.pop("fused_projected_map", None)
         if self.config.ros_fuse_external_projected_map_snapshots and isinstance(fused_projected_map, RosOccupancyMap):
             self._latest_fused_projected_map = fused_projected_map
