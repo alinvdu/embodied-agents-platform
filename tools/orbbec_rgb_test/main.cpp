@@ -43,6 +43,7 @@ struct Options {
     int depth_fps = 0;
     int log_every = 1;
     int imu_log_every = 200;
+    std::string imu_aggregate_mode = "any";
     bool latest_only = false;
     bool enable_depth = false;
     bool enable_imu = false;
@@ -594,6 +595,9 @@ Options parse_args(int argc, char **argv) {
         else if(arg == "--imu-log-every") {
             options.imu_log_every = parse_int(require_value(arg), arg);
         }
+        else if(arg == "--imu-aggregate-mode") {
+            options.imu_aggregate_mode = require_value(arg);
+        }
         else if(arg == "--latest-only") {
             options.latest_only = true;
         }
@@ -658,7 +662,7 @@ Options parse_args(int argc, char **argv) {
                       << "                       [--warmup-frames N] [--timeout-ms MS]\n"
                       << "                       [--width PX] [--height PX] [--fps FPS]\n"
                       << "                       [--depth-width PX] [--depth-height PX] [--depth-fps FPS]\n"
-                      << "                       [--log-every N] [--imu-log-every N]\n"
+                      << "                       [--log-every N] [--imu-log-every N] [--imu-aggregate-mode any|all]\n"
                       << "                       [--imu-udp-host HOST] [--imu-udp-port PORT]\n"
                       << "                       [--camera-http-enable] [--camera-http-host HOST]\n"
                       << "                       [--camera-http-port PORT] [--camera-http-path PATH]\n"
@@ -689,6 +693,9 @@ Options parse_args(int argc, char **argv) {
     }
     if(options.imu_log_every < 0) {
         throw std::runtime_error("--imu-log-every must be 0 or positive");
+    }
+    if(options.imu_aggregate_mode != "any" && options.imu_aggregate_mode != "all") {
+        throw std::runtime_error("--imu-aggregate-mode must be 'any' or 'all'");
     }
     if(options.imu_udp_port < 1 || options.imu_udp_port > 65535) {
         throw std::runtime_error("--imu-udp-port must be between 1 and 65535");
@@ -1031,8 +1038,10 @@ int main(int argc, char **argv) try {
     LatestImuSample latest_imu_sample;
     bool imu_running = false;
     uint64_t imu_callback_count = 0;
+    uint64_t imu_total_callback_count = 0;
     uint64_t imu_udp_drop_count = 0;
     uint64_t imu_udp_error_count = 0;
+    bool imu_no_callback_warning_printed = false;
     auto imu_log_started_at = std::chrono::steady_clock::now();
     if(options.enable_imu) {
         try {
@@ -1047,7 +1056,13 @@ int main(int argc, char **argv) try {
             auto imu_config = std::make_shared<ob::Config>();
             imu_config->enableGyroStream();
             imu_config->enableAccelStream();
-            imu_config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+            if(options.imu_aggregate_mode == "all") {
+                imu_config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ALL_TYPE_FRAME_REQUIRE);
+            }
+            else {
+                imu_config->setFrameAggregateOutputMode(OB_FRAME_AGGREGATE_OUTPUT_ANY_SITUATION);
+            }
+            std::cout << "IMU aggregate mode: " << options.imu_aggregate_mode << "\n";
             imu_pipeline->start(imu_config, [&](std::shared_ptr<ob::FrameSet> frame_set) {
                 auto accel_frame_raw = frame_set->getFrame(OB_FRAME_ACCEL);
                 auto gyro_frame_raw = frame_set->getFrame(OB_FRAME_GYRO);
@@ -1080,6 +1095,7 @@ int main(int argc, char **argv) try {
                     return;
                 }
                 ++imu_callback_count;
+                ++imu_total_callback_count;
                 if(imu_publisher && !imu_publisher->publish(sample_to_publish)) {
                     if(imu_publisher->last_error_message().empty()) {
                         ++imu_udp_drop_count;
@@ -1220,6 +1236,12 @@ int main(int argc, char **argv) try {
                 std::cout << " points=" << point_cloud_ptr->count;
             }
             std::cout << "\n";
+            if(options.enable_imu && imu_running && !imu_no_callback_warning_printed && captured >= 90 && imu_total_callback_count == 0) {
+                std::cerr << "WARNING: IMU pipeline is running but no accel/gyro callbacks have arrived after "
+                          << captured << " RGB frames. Try --imu-aggregate-mode all, or run the SDK IMU example "
+                          << "to check whether this Orbbec SDK/device allows IMU streaming alongside RGB-D.\n";
+                imu_no_callback_warning_printed = true;
+            }
         }
     }
 

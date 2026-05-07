@@ -34,6 +34,7 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --point-cloud-stride 2 \
   --point-cloud-max-points 200000 \
   --enable-imu \
+  --imu-aggregate-mode any \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
   --camera-http-enable \
@@ -43,6 +44,8 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
 ```
 
 This sends each RGB-D pair to the robot brain as a single in-memory frame at the camera capture rate. With `--enable-imu`, the sidecar also pushes each IMU callback as a non-blocking UDP datagram to the robot brain, which then serves `/imu` as an in-memory debug snapshot and `/ws/imu` as the high-rate stream.
+
+`--imu-aggregate-mode any` lets the SDK deliver accel or gyro frames as soon as either stream is ready. If callbacks still do not arrive, try `--imu-aggregate-mode all` as a diagnostic and run the SDK IMU example to confirm whether this device/SDK can stream IMU alongside RGB-D.
 
 Use `--enable-depth-registration` to request Orbbec hardware depth-to-color alignment for RGB-D odometry. Depth defaults to the camera's first matching D2C-compatible Y16 profile at the selected RGB FPS. If you need to force a specific depth source mode, run `--list-profiles`, then pass one of the listed depth profiles with `--depth-width`, `--depth-height`, and `--depth-fps`.
 

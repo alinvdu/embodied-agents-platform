@@ -112,13 +112,17 @@ def patch_nav2_params(
     min_speed_theta: float = 0.02,
     trans_stopped_velocity: float = 0.01,
     follow_path_xy_goal_tolerance_m: float = 0.10,
-    path_align_scale: float = 16.0,
-    goal_align_scale: float = 12.0,
+    path_align_scale: float = 4.0,
+    goal_align_scale: float = 0.0,
+    oscillation_reset_dist_m: float = 0.01,
+    oscillation_reset_angle_rad: float = 0.05,
+    oscillation_reset_time_s: float = 5.0,
+    goal_dist_scale: float = 8.0,
     rotate_to_goal_scale: float = 0.0,
     rotate_to_goal_slowing_factor: float = 1.0,
     transform_tolerance_s: float = 0.5,
-    progress_required_movement_radius: float = 0.05,
-    progress_movement_time_allowance_s: float = 25.0,
+    progress_required_movement_radius: float = 0.01,
+    progress_movement_time_allowance_s: float = 60.0,
     xy_goal_tolerance_m: float = 0.18,
     yaw_goal_tolerance_rad: float = 3.14,
     enable_local_scan_obstacles: bool = False,
@@ -308,10 +312,20 @@ def patch_nav2_params(
             _remove_critic(follow_path, "PathAlign")
         elif "PathAlign.scale" in follow_path:
             follow_path["PathAlign.scale"] = path_align_scale
+            follow_path["PathAlign.forward_point_distance"] = min(
+                float(follow_path.get("PathAlign.forward_point_distance", 0.1)),
+                0.1,
+            )
         if goal_align_scale <= 0.0:
             _remove_critic(follow_path, "GoalAlign")
         elif "GoalAlign.scale" in follow_path:
             follow_path["GoalAlign.scale"] = goal_align_scale
+        if "Oscillation" in follow_path.get("critics", []):
+            follow_path["Oscillation.reset_dist"] = oscillation_reset_dist_m
+            follow_path["Oscillation.reset_angle"] = oscillation_reset_angle_rad
+            follow_path["Oscillation.reset_time"] = oscillation_reset_time_s
+        if "GoalDist.scale" in follow_path:
+            follow_path["GoalDist.scale"] = goal_dist_scale
         if rotate_to_goal_scale <= 0.0:
             _remove_critic(follow_path, "RotateToGoal")
         elif "RotateToGoal.scale" in follow_path:

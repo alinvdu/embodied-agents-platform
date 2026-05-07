@@ -68,14 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--path-align-scale",
         type=float,
-        default=16.0,
-        help="DWB PathAlign critic scale. Set 0 to remove path heading alignment while debugging.",
+        default=4.0,
+        help="DWB PathAlign critic scale. Low default keeps path following as a soft preference.",
     )
     parser.add_argument(
         "--goal-align-scale",
         type=float,
-        default=12.0,
-        help="DWB GoalAlign critic scale. Set 0 to remove final heading alignment while debugging.",
+        default=0.0,
+        help="DWB GoalAlign critic scale. Default 0 removes heading alignment for XY-only exploration goals.",
     )
     parser.add_argument(
         "--rotate-to-goal-scale",
@@ -83,11 +83,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help="DWB RotateToGoal critic scale. Default disables final-yaw rotation for XY-only exploration goals.",
     )
+    parser.add_argument("--oscillation-reset-dist-m", type=float, default=0.01)
+    parser.add_argument("--oscillation-reset-angle-rad", type=float, default=0.05)
+    parser.add_argument("--oscillation-reset-time-s", type=float, default=5.0)
+    parser.add_argument(
+        "--goal-dist-scale",
+        type=float,
+        default=8.0,
+        help="DWB GoalDist critic scale. Lower values make goal distance less greedy near the waypoint.",
+    )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
-    parser.add_argument("--progress-required-movement-radius", type=float, default=0.05)
-    parser.add_argument("--progress-movement-time-allowance-s", type=float, default=25.0)
+    parser.add_argument("--progress-required-movement-radius", type=float, default=0.01)
+    parser.add_argument("--progress-movement-time-allowance-s", type=float, default=60.0)
     parser.add_argument("--xy-goal-tolerance-m", type=float, default=0.18)
     parser.add_argument("--yaw-goal-tolerance-rad", type=float, default=3.14)
     return parser
@@ -141,6 +150,10 @@ def main(argv: list[str] | None = None) -> int:
         follow_path_xy_goal_tolerance_m=args.follow_path_xy_goal_tolerance_m,
         path_align_scale=args.path_align_scale,
         goal_align_scale=args.goal_align_scale,
+        oscillation_reset_dist_m=args.oscillation_reset_dist_m,
+        oscillation_reset_angle_rad=args.oscillation_reset_angle_rad,
+        oscillation_reset_time_s=args.oscillation_reset_time_s,
+        goal_dist_scale=args.goal_dist_scale,
         rotate_to_goal_scale=args.rotate_to_goal_scale,
         rotate_to_goal_slowing_factor=args.rotate_to_goal_slowing_factor,
         local_costmap_width=args.local_costmap_width,

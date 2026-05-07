@@ -134,6 +134,7 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --point-cloud-min-z-m 0.25 \
   --point-cloud-max-z-m 4.0 \
   --enable-imu \
+  --imu-aggregate-mode any \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
   --camera-http-enable \
@@ -163,6 +164,7 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --depth-width 640 \
   --depth-height 400 \
   --depth-fps 30 \
+  --imu-aggregate-mode any \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
   --camera-http-enable \
