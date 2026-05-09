@@ -84,8 +84,8 @@ python -m xlerobot_playground.robot_brain_agent \
   --robot-kind xlerobot_2wheels \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
-  --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.30 \
+  --max-linear-m-s 0.1 \
+  --max-angular-rad-s 0.50 \
   --base-angular-action-sign 1 \
   --camera-pan-action-key head_motor_1.pos \
   --camera-pan-action-units deg \
@@ -223,8 +223,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --scan-active-topic /xlerobot/scan_active \
   --no-head-points-update-map-while-base-moving \
   --cmd-vel-timeout-s 0.5 \
-  --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.30 \
+  --max-linear-m-s 0.1 \
+  --max-angular-rad-s 0.50 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 1.05 \
@@ -448,8 +448,8 @@ python -m xlerobot_playground.real_nav2_config \
   --odom-frame odom \
   --base-frame base_link \
   --max-laser-range 4.0 \
-  --max-linear-velocity 0.05 \
-  --max-angular-velocity 0.25 \
+  --max-linear-velocity 0.1 \
+  --max-angular-velocity 0.40 \
   --min-linear-velocity-threshold 0.005 \
   --trans-stopped-velocity 0.02 \
   --follow-path-xy-goal-tolerance-m 0.08 \
@@ -525,9 +525,9 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 1.5 \
+  --camera-pan-settle-s 1.2 \
   --camera-pan-step-deg 60 \
-  --camera-pan-compute-s 2.0 \
+  --camera-pan-compute-s 1.5 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
@@ -585,9 +585,9 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 1.5 \
+  --camera-pan-settle-s 0.25 \
   --camera-pan-step-deg 60 \
-  --camera-pan-compute-s 2.0 \
+  --camera-pan-compute-s 0.8 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --max-decisions 8
 ```
