@@ -1203,6 +1203,8 @@ class InteractiveNoNav2ExplorationSession:
                 "guardrail_events": self.guardrail_events,
                 "manual_occupancy_edits": edits.to_dict(
                     resolution=self.scenario.resolution,
+                    origin_x=self.scenario.bounds()["min_x"],
+                    origin_y=self.scenario.bounds()["min_y"],
                 ),
                 "navigation": {
                     "mode": "mock_direct_move_no_nav2",
@@ -3129,6 +3131,8 @@ class ManiSkillTeleportExplorationSession:
                 "guardrail_events": self.guardrail_events,
                 "manual_occupancy_edits": edits.to_dict(
                     resolution=resolution,
+                    origin_x=self._map_bounds()["min_x"],
+                    origin_y=self._map_bounds()["min_y"],
                 ),
                 "navigation": {
                     "mode": "maniskill_teleport_no_nav2",

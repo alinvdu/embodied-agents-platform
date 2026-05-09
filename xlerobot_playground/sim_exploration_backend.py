@@ -2828,6 +2828,8 @@ class _ApartmentExplorationSession:
                 "guardrail_events": self.guardrail_events,
                 "manual_occupancy_edits": self.manual_occupancy_edits.to_dict(
                     resolution=self.scenario.resolution,
+                    origin_x=self.scenario.bounds()["min_x"],
+                    origin_y=self.scenario.bounds()["min_y"],
                 ),
                 "navigation": {
                     "control_steps": self.control_steps,
@@ -4628,6 +4630,8 @@ class RosExplorationSession:
                 "guardrail_events": self.guardrail_events,
                 "manual_occupancy_edits": self.manual_occupancy_edits.to_dict(
                     resolution=occupancy_map.resolution,
+                    origin_x=occupancy_map.bounds()["min_x"],
+                    origin_y=occupancy_map.bounds()["min_y"],
                 ),
                 "navigation": {
                     "control_steps": self.control_steps,

@@ -90,7 +90,7 @@ class ManualOccupancyEdits:
             return "free"
         return base_state
 
-    def to_dict(self, *, resolution: float) -> dict[str, Any]:
+    def to_dict(self, *, resolution: float, origin_x: float = 0.0, origin_y: float = 0.0) -> dict[str, Any]:
         def _serialize(cells: set[Any]) -> list[dict[str, Any]]:
             payload: list[dict[str, Any]] = []
             for cell in sorted(cells, key=lambda item: (item.x, item.y)):
@@ -98,8 +98,8 @@ class ManualOccupancyEdits:
                     {
                         "cell_x": int(cell.x),
                         "cell_y": int(cell.y),
-                        "x": round(float(cell.x) * resolution, 3),
-                        "y": round(float(cell.y) * resolution, 3),
+                        "x": round(float(origin_x) + float(cell.x) * resolution, 3),
+                        "y": round(float(origin_y) + float(cell.y) * resolution, 3),
                     }
                 )
             return payload
@@ -237,22 +237,27 @@ def overlay_occupancy_payload(
     if not isinstance(occupancy, dict):
         return occupancy
     resolution = float(occupancy.get("resolution", 0.25) or 0.25)
+    bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+    origin_x = float(bounds.get("min_x", 0.0) or 0.0)
+    origin_y = float(bounds.get("min_y", 0.0) or 0.0)
     index: dict[tuple[int, int], dict[str, Any]] = {}
     for item in occupancy.get("cells", []):
-        cell_x = int(math.floor(float(item["x"]) / resolution))
-        cell_y = int(math.floor(float(item["y"]) / resolution))
+        if item.get("manual_override"):
+            continue
+        cell_x = int(math.floor((float(item["x"]) - origin_x) / resolution))
+        cell_y = int(math.floor((float(item["y"]) - origin_y) / resolution))
         index[(cell_x, cell_y)] = dict(item)
     for cell in edits.blocked_cells:
         index[(int(cell.x), int(cell.y))] = {
-            "x": round(float(cell.x) * resolution, 3),
-            "y": round(float(cell.y) * resolution, 3),
+            "x": round(origin_x + float(cell.x) * resolution, 3),
+            "y": round(origin_y + float(cell.y) * resolution, 3),
             "state": "occupied",
             "manual_override": "blocked",
         }
     for cell in edits.cleared_cells:
         index[(int(cell.x), int(cell.y))] = {
-            "x": round(float(cell.x) * resolution, 3),
-            "y": round(float(cell.y) * resolution, 3),
+            "x": round(origin_x + float(cell.x) * resolution, 3),
+            "y": round(origin_y + float(cell.y) * resolution, 3),
             "state": "free",
             "manual_override": "cleared",
         }

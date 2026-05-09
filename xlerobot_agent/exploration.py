@@ -186,13 +186,18 @@ def _overlay_occupancy_payload_with_manual_edits(
     if not isinstance(occupancy, dict):
         return occupancy
     resolution = float(occupancy.get("resolution", 0.25) or 0.25)
+    bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+    origin_x = float(bounds.get("min_x", 0.0) or 0.0)
+    origin_y = float(bounds.get("min_y", 0.0) or 0.0)
     index: dict[tuple[int, int], dict[str, Any]] = {}
     for item in occupancy.get("cells", []):
         if not isinstance(item, dict):
             continue
+        if item.get("manual_override"):
+            continue
         try:
-            cell_x = int(math.floor(float(item["x"]) / resolution))
-            cell_y = int(math.floor(float(item["y"]) / resolution))
+            cell_x = int(math.floor((float(item["x"]) - origin_x) / resolution))
+            cell_y = int(math.floor((float(item["y"]) - origin_y) / resolution))
         except Exception:
             continue
         index[(cell_x, cell_y)] = dict(item)
@@ -209,8 +214,8 @@ def _overlay_occupancy_payload_with_manual_edits(
             except Exception:
                 continue
             index[(cell_x, cell_y)] = {
-                "x": round(cell_x * resolution, 3),
-                "y": round(cell_y * resolution, 3),
+                "x": round(origin_x + cell_x * resolution, 3),
+                "y": round(origin_y + cell_y * resolution, 3),
                 "state": state,
                 "manual_override": override,
             }
@@ -607,10 +612,14 @@ class ExplorationBackend:
                     if "cell_x" in item and "cell_y" in item:
                         cell = (int(item["cell_x"]), int(item["cell_y"]))
                     else:
-                        resolution = float(self._current_map.get("occupancy", {}).get("resolution", self.config.occupancy_resolution)) if self._current_map else self.config.occupancy_resolution
+                        occupancy = self._current_map.get("occupancy", {}) if self._current_map else {}
+                        resolution = float(occupancy.get("resolution", self.config.occupancy_resolution))
+                        bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+                        origin_x = float(bounds.get("min_x", 0.0) or 0.0)
+                        origin_y = float(bounds.get("min_y", 0.0) or 0.0)
                         cell = (
-                            int(float(item["x"]) // resolution),
-                            int(float(item["y"]) // resolution),
+                            int(math.floor((float(item["x"]) - origin_x) / resolution)),
+                            int(math.floor((float(item["y"]) - origin_y) / resolution)),
                         )
                 except Exception:
                     continue
@@ -623,14 +632,18 @@ class ExplorationBackend:
                 elif normalized_mode == "reset":
                     blocked.discard(cell)
                     cleared.discard(cell)
-            resolution = float(self._current_map.get("occupancy", {}).get("resolution", self.config.occupancy_resolution)) if self._current_map else self.config.occupancy_resolution
+            occupancy = self._current_map.get("occupancy", {}) if self._current_map else {}
+            resolution = float(occupancy.get("resolution", self.config.occupancy_resolution))
+            bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+            origin_x = float(bounds.get("min_x", 0.0) or 0.0)
+            origin_y = float(bounds.get("min_y", 0.0) or 0.0)
             payload = {
                 "blocked_cells": [
                     {
                         "cell_x": cell_x,
                         "cell_y": cell_y,
-                        "x": round(cell_x * resolution, 3),
-                        "y": round(cell_y * resolution, 3),
+                        "x": round(origin_x + cell_x * resolution, 3),
+                        "y": round(origin_y + cell_y * resolution, 3),
                     }
                     for cell_x, cell_y in sorted(blocked)
                 ],
@@ -638,8 +651,8 @@ class ExplorationBackend:
                     {
                         "cell_x": cell_x,
                         "cell_y": cell_y,
-                        "x": round(cell_x * resolution, 3),
-                        "y": round(cell_y * resolution, 3),
+                        "x": round(origin_x + cell_x * resolution, 3),
+                        "y": round(origin_y + cell_y * resolution, 3),
                     }
                     for cell_x, cell_y in sorted(cleared)
                 ],
@@ -962,6 +975,7 @@ class ExplorationBackend:
             if isinstance(edits, dict):
                 latest_task_id = next(reversed(self._tasks))
                 self._manual_occupancy_edits[latest_task_id] = json.loads(json.dumps(edits))
+                self._attach_manual_edits(self._current_map, latest_task_id)
 
 
 def _build_scenario(*, session: str, area: str, current_pose: str) -> ExplorationScenario:
