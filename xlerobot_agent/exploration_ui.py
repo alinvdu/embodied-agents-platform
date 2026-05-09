@@ -587,13 +587,29 @@ HTML_PAGE = """<!doctype html>
       };
     }
 
-    function makeProjector(bounds) {
+    function mapViewport(bounds) {
       const width = Math.max(bounds.max_x - bounds.min_x, 1);
       const height = Math.max(bounds.max_y - bounds.min_y, 1);
       const pad = 36;
+      const innerWidth = Math.max(1000 - pad * 2, 1);
+      const innerHeight = Math.max(700 - pad * 2, 1);
+      const scale = Math.min(innerWidth / width, innerHeight / height);
+      const drawWidth = width * scale;
+      const drawHeight = height * scale;
+      return {
+        scale,
+        drawWidth,
+        drawHeight,
+        left: pad + (innerWidth - drawWidth) / 2,
+        top: pad + (innerHeight - drawHeight) / 2,
+      };
+    }
+
+    function makeProjector(bounds) {
+      const viewport = mapViewport(bounds);
       return function(point) {
-        const x = pad + ((point.x - bounds.min_x) / width) * (1000 - pad * 2);
-        const y = 700 - pad - ((point.y - bounds.min_y) / height) * (700 - pad * 2);
+        const x = viewport.left + (point.x - bounds.min_x) * viewport.scale;
+        const y = viewport.top + (bounds.max_y - point.y) * viewport.scale;
         return {x, y};
       };
     }
@@ -608,19 +624,21 @@ HTML_PAGE = """<!doctype html>
     }
 
     function worldFromSvgViewPoint(bounds, svgX, svgY) {
-      const pad = 36;
-      const width = Math.max(bounds.max_x - bounds.min_x, 1);
-      const height = Math.max(bounds.max_y - bounds.min_y, 1);
-      const normalizedX = Math.min(Math.max((svgX - pad) / Math.max(1000 - pad * 2, 1), 0), 1);
-      const normalizedY = Math.min(Math.max((svgY - pad) / Math.max(700 - pad * 2, 1), 0), 1);
+      const viewport = mapViewport(bounds);
+      const right = viewport.left + viewport.drawWidth;
+      const bottom = viewport.top + viewport.drawHeight;
+      if (svgX < viewport.left || svgX > right || svgY < viewport.top || svgY > bottom) {
+        return null;
+      }
       return {
-        x: bounds.min_x + normalizedX * width,
-        y: bounds.max_y - normalizedY * height,
+        x: bounds.min_x + (svgX - viewport.left) / viewport.scale,
+        y: bounds.max_y - (svgY - viewport.top) / viewport.scale,
       };
     }
 
     function cellFromMapEvent(map, event) {
       const world = worldFromMapEvent(map, event);
+      if (!world) return null;
       const resolution = map.occupancy?.resolution || 0.5;
       const originX = map.occupancy?.bounds?.min_x || 0;
       const originY = map.occupancy?.bounds?.min_y || 0;
@@ -640,6 +658,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function shouldPaintCell(cell) {
+      if (!cell) return false;
       if (mapEditMode !== 'clear') return true;
       const state = currentOccupancyCellStates.get(cell.key);
       return !!state && (state.state === 'occupied' || state.manual_override === 'blocked');
@@ -920,6 +939,7 @@ HTML_PAGE = """<!doctype html>
         event.preventDefault();
         if (mapEditMode === 'waypoint' || mapEditMode === 'preview') {
           const world = worldFromMapEvent(map, event);
+          if (!world) return;
           const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || {};
           lastManualWaypoint = {x: world.x, y: world.y, yaw: Number(robotPose.yaw || 0)};
           renderMap(currentState);
@@ -941,9 +961,10 @@ HTML_PAGE = """<!doctype html>
             });
           return;
         }
+        const cell = cellFromMapEvent(map, event);
+        if (!cell) return;
         isPaintingMap = true;
         lastPaintedCellKey = null;
-        const cell = cellFromMapEvent(map, event);
         lastPaintedCellKey = cell.key;
         enqueuePaintCell(cell);
       };
@@ -951,6 +972,7 @@ HTML_PAGE = """<!doctype html>
         if (!isPaintingMap) return;
         event.preventDefault();
         const cell = cellFromMapEvent(map, event);
+        if (!cell) return;
         if (cell.key === lastPaintedCellKey) return;
         lastPaintedCellKey = cell.key;
         enqueuePaintCell(cell);
