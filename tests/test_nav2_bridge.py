@@ -144,7 +144,7 @@ class Nav2BridgeTests(unittest.TestCase):
         )
 
         local_costmap = patched["local_costmap"]["local_costmap"]["ros__parameters"]
-        self.assertEqual(local_costmap["plugins"], ["static_layer"])
+        self.assertEqual(local_costmap["plugins"], ["static_layer", "inflation_layer"])
         self.assertNotIn("voxel_layer", local_costmap)
         self.assertNotIn("obstacle_layer", local_costmap)
         self.assertEqual(local_costmap["static_layer"]["map_topic"], "/projected_map")
@@ -162,10 +162,26 @@ class Nav2BridgeTests(unittest.TestCase):
         )
         self.assertNotIn("robot_radius", patched["global_costmap"]["global_costmap"]["ros__parameters"])
         self.assertNotIn("robot_radius", patched["local_costmap"]["local_costmap"]["ros__parameters"])
-        self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
-        self.assertNotIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"])
-        self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"]["plugins"])
-        self.assertNotIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"])
+        self.assertIn("inflation_layer", patched["global_costmap"]["global_costmap"]["ros__parameters"]["plugins"])
+        self.assertEqual(
+            patched["global_costmap"]["global_costmap"]["ros__parameters"]["inflation_layer"]["inflation_radius"],
+            0.08,
+        )
+        self.assertEqual(
+            patched["global_costmap"]["global_costmap"]["ros__parameters"]["inflation_layer"][
+                "cost_scaling_factor"
+            ],
+            4.0,
+        )
+        self.assertIn("inflation_layer", patched["local_costmap"]["local_costmap"]["ros__parameters"]["plugins"])
+        self.assertEqual(
+            patched["local_costmap"]["local_costmap"]["ros__parameters"]["inflation_layer"]["inflation_radius"],
+            0.08,
+        )
+        self.assertEqual(
+            patched["local_costmap"]["local_costmap"]["ros__parameters"]["inflation_layer"]["cost_scaling_factor"],
+            4.0,
+        )
         self.assertEqual(patched["global_costmap"]["global_costmap"]["ros__parameters"]["footprint_padding"], 0.0)
         self.assertEqual(patched["local_costmap"]["local_costmap"]["ros__parameters"]["global_frame"], "odom")
         self.assertEqual(patched["bt_navigator"]["ros__parameters"]["odom_topic"], "/odom")

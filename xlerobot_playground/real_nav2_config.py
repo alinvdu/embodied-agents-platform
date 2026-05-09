@@ -94,6 +94,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--local-costmap-width", type=int, default=2)
     parser.add_argument("--local-costmap-height", type=int, default=2)
+    parser.add_argument(
+        "--inflation-radius-m",
+        type=float,
+        default=0.08,
+        help="Obstacle inflation radius for both global and local costmaps.",
+    )
+    parser.add_argument(
+        "--inflation-cost-scaling-factor",
+        type=float,
+        default=4.0,
+        help="Nav2 inflation cost falloff. Larger values decay faster away from obstacles.",
+    )
     parser.add_argument("--transform-tolerance-s", type=float, default=0.5)
     parser.add_argument("--progress-required-movement-radius", type=float, default=0.01)
     parser.add_argument("--progress-movement-time-allowance-s", type=float, default=60.0)
@@ -163,7 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         progress_movement_time_allowance_s=args.progress_movement_time_allowance_s,
         xy_goal_tolerance_m=args.xy_goal_tolerance_m,
         yaw_goal_tolerance_rad=args.yaw_goal_tolerance_rad,
-        inflation_radius=0.0,
+        inflation_radius=args.inflation_radius_m,
+        inflation_cost_scaling_factor=args.inflation_cost_scaling_factor,
     )
     nav2_path = output_dir / args.nav2_output
     dump_yaml(nav2_path, nav2_params)

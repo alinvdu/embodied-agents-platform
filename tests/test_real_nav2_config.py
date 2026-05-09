@@ -28,6 +28,8 @@ class RealNav2ConfigTests(unittest.TestCase):
         self.assertEqual(args.oscillation_reset_time_s, 5.0)
         self.assertEqual(args.goal_dist_scale, 8.0)
         self.assertEqual(args.rotate_to_goal_scale, 0.0)
+        self.assertEqual(args.inflation_radius_m, 0.08)
+        self.assertEqual(args.inflation_cost_scaling_factor, 4.0)
         self.assertEqual(args.progress_required_movement_radius, 0.01)
         self.assertEqual(args.progress_movement_time_allowance_s, 60.0)
         self.assertEqual(args.xy_goal_tolerance_m, 0.18)

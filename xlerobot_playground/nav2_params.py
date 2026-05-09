@@ -115,8 +115,8 @@ def patch_nav2_params(
     voxel_z_voxels: int = 32,
 
     # Conservative real-robot defaults.
-    inflation_radius: float = 0.20,
-    inflation_cost_scaling_factor: float = 3.0,
+    inflation_radius: float = 0.08,
+    inflation_cost_scaling_factor: float = 4.0,
     local_costmap_width: int = 2,
     local_costmap_height: int = 2,
 
