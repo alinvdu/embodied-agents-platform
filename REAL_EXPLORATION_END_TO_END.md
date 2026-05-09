@@ -414,8 +414,9 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 30 \
-  --min-translation-update-m 0.01 \
-  --no-jitter-threshold
+  --min-translation-update-m 0.001 \
+  --jitter-threshold \
+  --min-yaw-update-deg 0.08
 ```
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
