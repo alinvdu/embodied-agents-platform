@@ -41,11 +41,12 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertAlmostEqual(yaw_from_quaternion_xyzw(x, y, z, w), math.radians(90.0))
 
     def test_parser_config_converts_degrees(self) -> None:
-        args = build_parser().parse_args(["--max-yaw-step-deg", "15", "--min-matches", "8"])
+        args = build_parser().parse_args(["--max-yaw-step-deg", "15", "--min-yaw-update-deg", "1.5", "--min-matches", "8"])
         config = config_from_args(args)
 
         self.assertEqual(config.min_matches, 8)
         self.assertAlmostEqual(config.max_yaw_step_rad, math.radians(15.0))
+        self.assertAlmostEqual(config.min_yaw_update_rad, math.radians(1.5))
 
     def test_parser_can_disable_jitter_threshold(self) -> None:
         default_config = config_from_args(build_parser().parse_args([]))
@@ -158,6 +159,7 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
     def test_trusted_filtered_yaw_sets_pose_yaw_directly(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"min_yaw_update_rad": 0.0})()
         node.pose = PlanarPose(1.0, 2.0, math.radians(5.0))
 
         applied = node._apply_trusted_imu_yaw(
@@ -172,6 +174,7 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
     def test_trusted_filtered_yaw_does_not_override_scan_freeze(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"min_yaw_update_rad": 0.0})()
         node.pose = PlanarPose(1.0, 2.0, math.radians(5.0))
 
         applied = node._apply_trusted_imu_yaw(
@@ -181,6 +184,33 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         self.assertFalse(applied)
         self.assertAlmostEqual(node.pose.yaw, math.radians(5.0))
+
+    def test_trusted_filtered_yaw_respects_min_yaw_threshold(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"min_yaw_update_rad": math.radians(2.0)})()
+        node.pose = PlanarPose(1.0, 2.0, math.radians(5.0))
+
+        applied = node._apply_trusted_imu_yaw(
+            absolute_imu_yaw_rad=math.radians(6.0),
+            orientation_frozen=False,
+        )
+
+        self.assertFalse(applied)
+        self.assertAlmostEqual(node.pose.yaw, math.radians(5.0))
+
+    def test_predicted_yaw_threshold_accumulates_small_updates(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"min_yaw_update_rad": math.radians(2.0)})()
+        node._pending_predicted_yaw_rad = 0.0
+
+        first = node._filter_imu_yaw_delta(math.radians(0.75), absolute_imu_yaw_rad=None)
+        second = node._filter_imu_yaw_delta(math.radians(0.75), absolute_imu_yaw_rad=None)
+        third = node._filter_imu_yaw_delta(math.radians(0.75), absolute_imu_yaw_rad=None)
+
+        self.assertAlmostEqual(first, 0.0)
+        self.assertAlmostEqual(second, 0.0)
+        self.assertAlmostEqual(third, math.radians(2.25))
+        self.assertAlmostEqual(node._pending_predicted_yaw_rad, 0.0)
 
     def test_orientation_freeze_depends_on_scan_event_not_pan(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)

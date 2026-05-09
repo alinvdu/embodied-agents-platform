@@ -85,6 +85,7 @@ class RgbdVoConfig:
     max_translation_step_m: float = 0.25
     min_translation_update_m: float = 0.005
     jitter_threshold: bool = True
+    min_yaw_update_rad: float = 0.0
     max_yaw_step_rad: float = math.radians(30.0)
     imu_stale_after_s: float = 0.5
     imu_frame_convention: str = "camera_optical"
@@ -416,6 +417,7 @@ class RgbdVisualOdometryNode(Node):
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
         self._imu_orientation_origin_yaw_rad: float | None = None
         self._latest_imu_received_s: float | None = None
+        self._pending_predicted_yaw_rad = 0.0
         self.accepted_updates = 0
         self.rejected_updates = 0
         self._diagnostics = RgbdVoDiagnostics()
@@ -748,8 +750,28 @@ class RgbdVisualOdometryNode(Node):
             return predicted_yaw_rad
         return 0.0
 
+    def _min_yaw_update_rad(self) -> float:
+        return max(float(getattr(self.config, "min_yaw_update_rad", 0.0)), 0.0)
+
+    def _filter_imu_yaw_delta(self, yaw_delta_rad: float, *, absolute_imu_yaw_rad: float | None) -> float:
+        threshold_rad = self._min_yaw_update_rad()
+        if threshold_rad <= 0.0:
+            return yaw_delta_rad
+        if absolute_imu_yaw_rad is not None:
+            self._pending_predicted_yaw_rad = 0.0
+            return yaw_delta_rad if abs(yaw_delta_rad) >= threshold_rad else 0.0
+        self._pending_predicted_yaw_rad = angle_wrap(self._pending_predicted_yaw_rad + yaw_delta_rad)
+        if abs(self._pending_predicted_yaw_rad) < threshold_rad:
+            return 0.0
+        filtered_yaw_rad = self._pending_predicted_yaw_rad
+        self._pending_predicted_yaw_rad = 0.0
+        return filtered_yaw_rad
+
     def _apply_trusted_imu_yaw(self, *, absolute_imu_yaw_rad: float | None, orientation_frozen: bool) -> bool:
         if orientation_frozen or absolute_imu_yaw_rad is None:
+            return False
+        yaw_delta_rad = angle_wrap(absolute_imu_yaw_rad - self.pose.yaw)
+        if self._min_yaw_update_rad() > 0.0 and abs(yaw_delta_rad) < self._min_yaw_update_rad():
             return False
         self.pose = PlanarPose(self.pose.x, self.pose.y, angle_wrap(absolute_imu_yaw_rad))
         return True
@@ -762,6 +784,8 @@ class RgbdVisualOdometryNode(Node):
         if orientation_frozen:
             self._last_prediction_stamp_s = stamp_s
             self._log_scan_orientation_freeze(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
+            self._pending_predicted_yaw_rad = 0.0
+        have_rgbd_frame = self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None
         predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
         absolute_imu_yaw_rad = self._relative_imu_yaw_rad()
         imu_yaw_rad = self._imu_delta_yaw_rad(
@@ -770,8 +794,10 @@ class RgbdVisualOdometryNode(Node):
         )
         if orientation_frozen:
             imu_yaw_rad = 0.0
+        elif not have_rgbd_frame:
+            imu_yaw_rad = self._filter_imu_yaw_delta(imu_yaw_rad, absolute_imu_yaw_rad=absolute_imu_yaw_rad)
         imu_yaw_applied = False
-        if self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None:
+        if have_rgbd_frame:
             try:
                 frame = VisualOdomFrame(
                     gray=image_to_array(self.latest_rgb),
@@ -788,6 +814,9 @@ class RgbdVisualOdometryNode(Node):
                 )
                 if orientation_frozen:
                     imu_yaw_rad = 0.0
+                    self._pending_predicted_yaw_rad = 0.0
+                else:
+                    imu_yaw_rad = self._filter_imu_yaw_delta(imu_yaw_rad, absolute_imu_yaw_rad=absolute_imu_yaw_rad)
                 if self.previous_frame is not None:
                     if translation_frozen:
                         self.previous_frame = frame
@@ -981,6 +1010,15 @@ def build_parser() -> argparse.ArgumentParser:
             "PnP translations while debugging slow real Nav2 motion."
         ),
     )
+    parser.add_argument(
+        "--min-yaw-update-deg",
+        type=float,
+        default=0.0,
+        help=(
+            "Suppress odom yaw updates smaller than this many degrees. "
+            "Use 0.0 to accept every filtered-yaw update."
+        ),
+    )
     parser.add_argument("--max-yaw-step-deg", type=float, default=30.0)
     parser.add_argument("--imu-stale-after-s", type=float, default=0.5)
     parser.add_argument("--imu-bias-calibration-s", type=float, default=2.0)
@@ -1037,6 +1075,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         max_translation_step_m=args.max_translation_step_m,
         min_translation_update_m=args.min_translation_update_m,
         jitter_threshold=args.jitter_threshold,
+        min_yaw_update_rad=math.radians(args.min_yaw_update_deg),
         max_yaw_step_rad=math.radians(args.max_yaw_step_deg),
         imu_stale_after_s=args.imu_stale_after_s,
         imu_bias_calibration_s=args.imu_bias_calibration_s,
