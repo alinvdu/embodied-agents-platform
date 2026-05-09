@@ -451,14 +451,14 @@ python -m xlerobot_playground.real_nav2_config \
   --max-angular-velocity 0.25 \
   --min-linear-velocity-threshold 0.005 \
   --trans-stopped-velocity 0.02 \
-  --follow-path-xy-goal-tolerance-m 0.06 \
+  --follow-path-xy-goal-tolerance-m 0.08 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
   --transform-tolerance-s 0.5 \
-  --progress-required-movement-radius 0.05 \
-  --progress-movement-time-allowance-s 10.0 \
-  --xy-goal-tolerance-m 0.07 \
-  --min-speed-theta 0.02 \
+  --progress-required-movement-radius 0.04 \
+  --progress-movement-time-allowance-s 14.0 \
+  --xy-goal-tolerance-m 0.09 \
+  --min-speed-theta 0.05 \
   --min-angular-velocity-threshold 0.05
 ```
 
