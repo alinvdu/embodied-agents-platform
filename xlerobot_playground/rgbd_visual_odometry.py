@@ -740,8 +740,12 @@ class RgbdVisualOdometryNode(Node):
 
     def _reset_imu_origin_to_current_pose(self) -> None:
         if self._latest_imu_orientation_unwrapped_yaw_rad is not None:
-            self._imu_orientation_origin_yaw_rad = self._latest_imu_orientation_unwrapped_yaw_rad - self.pose.yaw
+            yaw_sign = float(getattr(self.config, "odom_yaw_sign", 1.0))
+            if abs(yaw_sign) < 1e-6:
+                yaw_sign = 1.0
+            self._imu_orientation_origin_yaw_rad = self._latest_imu_orientation_unwrapped_yaw_rad - self.pose.yaw / yaw_sign
         self._last_prediction_stamp_s = None
+        self._pending_predicted_yaw_rad = 0.0
 
     def _imu_delta_yaw_rad(self, *, predicted_yaw_rad: float, absolute_imu_yaw_rad: float | None) -> float:
         if absolute_imu_yaw_rad is not None:

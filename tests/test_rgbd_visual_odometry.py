@@ -185,6 +185,20 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertFalse(applied)
         self.assertAlmostEqual(node.pose.yaw, math.radians(5.0))
 
+    def test_imu_origin_reset_respects_yaw_sign(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"odom_yaw_sign": -1.0})()
+        node.pose = PlanarPose(0.0, 0.0, math.radians(15.0))
+        node._latest_imu_orientation_unwrapped_yaw_rad = math.radians(30.0)
+        node._last_prediction_stamp_s = 123.0
+        node._pending_predicted_yaw_rad = math.radians(1.0)
+
+        node._reset_imu_origin_to_current_pose()
+
+        self.assertAlmostEqual(node._imu_orientation_origin_yaw_rad, math.radians(45.0))
+        self.assertIsNone(node._last_prediction_stamp_s)
+        self.assertAlmostEqual(node._pending_predicted_yaw_rad, 0.0)
+
     def test_trusted_filtered_yaw_respects_min_yaw_threshold(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
         node.config = type("Config", (), {"min_yaw_update_rad": math.radians(2.0)})()
