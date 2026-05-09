@@ -2169,6 +2169,20 @@ class _ApartmentExplorationSession:
             cell_type=GridCell,
         )
 
+    def perform_manual_scan(self) -> dict[str, Any]:
+        self._sync_manual_occupancy_edits()
+        self._perform_scan(
+            full_turnaround=True,
+            capture_frame=True,
+            reason="operator_manual_turnaround_scan",
+        )
+        self._publish_live_map("Manual 360 degree scan complete.")
+        return {
+            "status": "succeeded",
+            "message": "Manual 360 degree scan complete.",
+            "map": self._build_map_payload(),
+        }
+
     def _cell_state(self, cell: GridCell) -> str | None:
         return self.manual_occupancy_edits.state_for_cell(self.known_cells.get(cell), cell)
 
@@ -2930,6 +2944,7 @@ class RosExplorationSession:
         self.last_nav2_preview: dict[str, Any] | None = None
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
+        self._manual_scan_in_progress = False
         self._owns_rclpy = False
         if config.ros_adapter_url and config.ros_navigation_map_source == "fused_point_cloud":
             raise RuntimeError(
@@ -3399,6 +3414,54 @@ class RosExplorationSession:
             self._prepare_decision_locked()
             return self.snapshot()
 
+    def perform_manual_scan(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if self._manual_scan_in_progress:
+                return {"status": "busy", "reason": "A manual scan is already running."}
+            if self._task_canceled_or_aborted():
+                return {"status": "unavailable", "reason": "The exploration task is not active."}
+            self._sync_manual_occupancy_edits()
+            self.status = "manual_scan_active"
+            self._manual_scan_in_progress = True
+            try:
+                self._push_progress_update(message="Running operator-requested 360 degree scan.", frontier_id=None)
+            except Exception as exc:
+                self._manual_scan_in_progress = False
+                self.status = "manual_scan_failed"
+                self.last_error = f"Manual scan failed: {exc}"
+                return {"status": "failed", "reason": str(exc), "map": None}
+        try:
+            self._perform_turnaround_scan(reason="operator_manual_turnaround_scan", ignore_pause=True)
+            with self._lock:
+                self._sync_manual_occupancy_edits()
+                self.pending_decision = None
+                self.pending_trace = None
+                self.applied_memory_updates = []
+                self._prepare_decision_locked()
+                self._push_progress_update(message="Manual 360 degree scan complete.", frontier_id=None)
+                self._manual_scan_in_progress = False
+                return {
+                    "status": "succeeded",
+                    "message": "Manual 360 degree scan complete.",
+                    "map": self._build_map_payload(),
+                }
+        except Exception as exc:
+            with self._lock:
+                self._manual_scan_in_progress = False
+                self.status = "manual_scan_failed"
+                self.last_error = f"Manual scan failed: {exc}"
+                self.guardrail_events.append({"type": "manual_scan_failed", "reason": str(exc)})
+                try:
+                    self._push_progress_update(message=self.last_error, frontier_id=None)
+                except Exception:
+                    pass
+                try:
+                    map_payload = self._build_map_payload()
+                except Exception:
+                    map_payload = None
+                return {"status": "failed", "reason": str(exc), "map": map_payload}
+
     def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             try:
@@ -3793,6 +3856,12 @@ class RosExplorationSession:
             return True
         return bool(task.get("paused", False) or task.get("state") == "aborted")
 
+    def _task_canceled_or_aborted(self) -> bool:
+        task = self.backend.get_task(self.task_id)
+        if task is None:
+            return True
+        return bool(task.get("state") == "aborted" or task.get("canceled", False))
+
     def _require_map(self) -> RosOccupancyMap:
         occupancy_map = self._current_map()
         if occupancy_map is None:
@@ -3823,12 +3892,12 @@ class RosExplorationSession:
             return True
         return False
 
-    def _perform_turnaround_scan(self, *, reason: str) -> None:
+    def _perform_turnaround_scan(self, *, reason: str, ignore_pause: bool = False) -> None:
         self.runtime.set_point_cloud_map_updates_enabled(True)
         try:
             event = self.runtime.perform_turnaround_scan(
                 reason=reason,
-                should_cancel=self._pause_requested_or_canceled,
+                should_cancel=self._task_canceled_or_aborted if ignore_pause else self._pause_requested_or_canceled,
             )
         finally:
             self.runtime.set_point_cloud_map_updates_enabled(False)
@@ -4758,8 +4827,14 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         *,
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        scan_performer: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
-        super().__init__(backend, waypoint_navigator=waypoint_navigator, waypoint_previewer=waypoint_previewer)
+        super().__init__(
+            backend,
+            waypoint_navigator=waypoint_navigator,
+            waypoint_previewer=waypoint_previewer,
+            scan_performer=scan_performer,
+        )
         self.start_gate = start_gate
 
     def start_explore(self, *, area: str, session: str | None = None, source: str = "operator") -> dict[str, Any]:
@@ -4811,6 +4886,19 @@ class ManiSkillExplorationRunner:
         if not callable(preview):
             return {"status": "unavailable", "reason": "The active exploration session does not support waypoint previews."}
         return preview(pose)
+
+    def perform_manual_scan(self) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live exploration session is running yet. Wait for Start Explore to begin the session.",
+            }
+        perform_scan = getattr(session, "perform_manual_scan", None)
+        if not callable(perform_scan):
+            return {"status": "unavailable", "reason": "The active exploration session does not support manual scans."}
+        return perform_scan()
 
     def run(self) -> dict[str, Any]:
         if self.start_gate is not None:
@@ -5140,12 +5228,14 @@ def main(argv: list[str] | None = None) -> int:
                 start_gate,
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
+                scan_performer=runner.perform_manual_scan,
             )
         else:
             controller = LocalExplorationUIController(
                 backend,
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
+                scan_performer=runner.perform_manual_scan,
             )
         server = ExplorationReviewServer(
             controller,

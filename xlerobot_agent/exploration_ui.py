@@ -60,6 +60,9 @@ class ExplorationUIController(Protocol):
     ) -> dict[str, Any]:
         ...
 
+    def perform_scan(self) -> dict[str, Any]:
+        ...
+
     def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         ...
 
@@ -74,10 +77,12 @@ class LocalExplorationUIController:
         *,
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        scan_performer: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.backend = backend
         self.waypoint_navigator = waypoint_navigator
         self.waypoint_previewer = waypoint_previewer
+        self.scan_performer = scan_performer
 
     def snapshot(self) -> dict[str, Any]:
         return self.backend.snapshot()
@@ -132,6 +137,11 @@ class LocalExplorationUIController:
         cells: list[dict[str, Any]],
     ) -> dict[str, Any]:
         return self.backend.update_occupancy_edits(task_id=task_id, mode=mode, cells=cells)
+
+    def perform_scan(self) -> dict[str, Any]:
+        if self.scan_performer is None:
+            return {"status": "unavailable", "reason": "No live exploration session is attached to the review UI."}
+        return self.scan_performer()
 
     def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         if self.waypoint_navigator is None:
@@ -202,6 +212,9 @@ class RemoteExplorationUIController:
         cells: list[dict[str, Any]],
     ) -> dict[str, Any]:
         raise NotImplementedError("Remote occupancy editing is not implemented yet.")
+
+    def perform_scan(self) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote manual scanning is not implemented yet."}
 
     def navigate_to_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote waypoint navigation is not implemented yet."}
@@ -533,6 +546,8 @@ HTML_PAGE = """<!doctype html>
     let lastPaintedCellKey = null;
     let currentOccupancyCellStates = new Map();
     let lastManualWaypoint = null;
+    let exploreStartRequested = false;
+    let manualScanInFlight = false;
 
     async function postJson(url, payload) {
       const response = await fetch(url, {
@@ -675,6 +690,22 @@ HTML_PAGE = """<!doctype html>
           <div class="meta-value">${escapeHtml(value)}</div>
         </div>
       `).join('');
+      renderLaunchControls(state);
+    }
+
+    function renderLaunchControls(state) {
+      const startExplore = document.getElementById('start-explore');
+      const startMap = document.getElementById('start-map');
+      if (!startExplore) return;
+      const scanAvailable = exploreStartRequested || !!state?.active_task;
+      const scanReady = !!state?.active_task && !!state?.current_map && !manualScanInFlight;
+      startExplore.textContent = manualScanInFlight ? 'Scanning...' : scanAvailable ? 'Perform Scan' : 'Start Explore';
+      startExplore.dataset.mode = scanAvailable ? 'scan' : 'start';
+      startExplore.disabled = scanAvailable && !scanReady;
+      if (startMap) {
+        startMap.disabled = scanAvailable;
+        startMap.style.display = scanAvailable ? 'none' : '';
+      }
     }
 
     function renderRegions(state) {
@@ -983,10 +1014,32 @@ HTML_PAGE = """<!doctype html>
     }
 
     document.getElementById('start-explore').addEventListener('click', async () => {
-      await postJson('/api/explore/start', {
-        area: document.getElementById('area').value.trim(),
-        session: document.getElementById('session').value.trim() || null
-      });
+      const button = document.getElementById('start-explore');
+      if (button.dataset.mode === 'scan') {
+        manualScanInFlight = true;
+        renderLaunchControls(currentState || {});
+        try {
+          const response = await postJson('/api/scan/perform', {});
+          if (response.status && !['succeeded', 'started'].includes(response.status)) {
+            alert((response.status || 'failed') + ': ' + (response.reason || response.message || 'Manual scan request failed.'));
+          }
+        } finally {
+          manualScanInFlight = false;
+        }
+      } else {
+        exploreStartRequested = true;
+        renderLaunchControls(currentState || {});
+        try {
+          await postJson('/api/explore/start', {
+            area: document.getElementById('area').value.trim(),
+            session: document.getElementById('session').value.trim() || null
+          });
+        } catch (error) {
+          exploreStartRequested = false;
+          renderLaunchControls(currentState || {});
+          throw error;
+        }
+      }
       await refresh();
     });
     document.getElementById('start-map').addEventListener('click', async () => {
@@ -1225,6 +1278,9 @@ class ExplorationReviewServer:
                         cells=list(payload.get("cells", [])),
                     )
                     self._send_json(response)
+                    return
+                if self.path == "/api/scan/perform":
+                    self._send_json(controller.perform_scan())
                     return
                 if self.path == "/api/nav/waypoint":
                     response = controller.navigate_to_waypoint(
