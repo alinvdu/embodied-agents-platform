@@ -385,8 +385,8 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       const regionColors = ['#2563eb', '#0891b2', '#9333ea', '#db2777', '#0f766e'];
       const regionCells = (map.regions || []).flatMap((region, index) =>
         (region.selected_cells || []).map((cell) => {
-          const x = Number(cell.cell_x) * resolution;
-          const y = Number(cell.cell_y) * resolution;
+          const x = bounds.min_x + Number(cell.cell_x) * resolution;
+          const y = bounds.min_y + Number(cell.cell_y) * resolution;
           const p = project({x, y});
           const p2 = project({x: x + resolution, y: y + resolution});
           return e('rect', {
@@ -402,8 +402,8 @@ INTERACTIVE_REACT_HTML = """<!doctype html>
       );
 
       const selectedCells = Array.from(selectedRegionCells.values()).map((cell) => {
-        const x = Number(cell.cell_x) * resolution;
-        const y = Number(cell.cell_y) * resolution;
+        const x = bounds.min_x + Number(cell.cell_x) * resolution;
+        const y = bounds.min_y + Number(cell.cell_y) * resolution;
         const p = project({x, y});
         const p2 = project({x: x + resolution, y: y + resolution});
         return e('rect', {
