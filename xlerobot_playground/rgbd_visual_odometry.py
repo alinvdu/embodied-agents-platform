@@ -764,12 +764,8 @@ class RgbdVisualOdometryNode(Node):
         if absolute_imu_yaw_rad is not None:
             self._pending_predicted_yaw_rad = 0.0
             return yaw_delta_rad if abs(yaw_delta_rad) >= threshold_rad else 0.0
-        self._pending_predicted_yaw_rad = angle_wrap(self._pending_predicted_yaw_rad + yaw_delta_rad)
-        if abs(self._pending_predicted_yaw_rad) < threshold_rad:
-            return 0.0
-        filtered_yaw_rad = self._pending_predicted_yaw_rad
         self._pending_predicted_yaw_rad = 0.0
-        return filtered_yaw_rad
+        return yaw_delta_rad if abs(yaw_delta_rad) >= threshold_rad else 0.0
 
     def _apply_trusted_imu_yaw(self, *, absolute_imu_yaw_rad: float | None, orientation_frozen: bool) -> bool:
         if orientation_frozen or absolute_imu_yaw_rad is None:
@@ -1019,7 +1015,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.0,
         help=(
-            "Suppress odom yaw updates smaller than this many degrees. "
+            "Discard odom yaw updates smaller than this many degrees. "
+            "Small gyro deltas are treated as noise and are not accumulated. "
             "Use 0.0 to accept every filtered-yaw update."
         ),
     )
