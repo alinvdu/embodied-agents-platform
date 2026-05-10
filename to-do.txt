@@ -1,2 +1,9 @@
 To-DO:
-- How to solve region labeling?
+- Algorithm for exploring the environment representation for long memory of the place.
+    - Waypoints should be at the boundary of scans (2-3m) and they should be necessarily frontiers but they can be oriented towards frontiers. We don't actually go near edges we try to maintain ourselves in the middle for scans. Try to come up with a spec for this.
+- Label regions for semantics.
+- Store the above as long term memory of the environment.
+- Have agent reason over long term memories.
+- Have starting point designation.
+- Have long term memory as orientation towards goals selected by agent.
+- Have short term representations of space as delta for collision and space understanding, where collision could happen, local takes precedence. Long term and local should mostly agree.
