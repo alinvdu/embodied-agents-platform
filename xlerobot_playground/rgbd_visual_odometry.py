@@ -74,9 +74,11 @@ class RgbdVoConfig:
     camera_pitch_topic: str = "/camera/head/pitch_rad"
     camera_pan_topic: str = "/camera/head/pan_rad"
     scan_active_topic: str = "/xlerobot/scan_active"
+    nav_active_topic: str = "/xlerobot/nav_active"
     scan_active_stale_timeout_s: float = 10.0
     freeze_odom_during_scan: bool = True
     freeze_orientation_during_scan: bool = True
+    odom_requires_nav_active: bool = True
     publish_rate_hz: float = 30.0
     min_depth_m: float = 0.15
     max_depth_m: float = 4.0
@@ -397,6 +399,7 @@ class RgbdVisualOdometryNode(Node):
         self._last_camera_pan_rad = self.camera_pan_rad
         self._scan_orientation_frozen = False
         self._scan_active_last_true_s: float | None = None
+        self._nav_active = False
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
         self.planar_velocity_x_m_s = 0.0
@@ -429,15 +432,17 @@ class RgbdVisualOdometryNode(Node):
         self.create_subscription(Float32, config.camera_pitch_topic, self._on_camera_pitch, 10)
         self.create_subscription(Float32, config.camera_pan_topic, self._on_camera_pan, 10)
         self.create_subscription(Bool, config.scan_active_topic, self._on_scan_active, scan_active_qos_profile())
+        self.create_subscription(Bool, config.nav_active_topic, self._on_nav_active, scan_active_qos_profile())
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
             "RGB-D visual odometry ready: "
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
             f"camera_pitch={config.camera_pitch_topic} camera_pan={config.camera_pan_topic} "
-            f"scan_active={config.scan_active_topic} "
+            f"scan_active={config.scan_active_topic} nav_active={config.nav_active_topic} "
             f"freeze_odom_during_scan={config.freeze_odom_during_scan} "
             f"freeze_orientation_during_scan={config.freeze_orientation_during_scan} "
+            f"odom_requires_nav_active={config.odom_requires_nav_active} "
             f"imu={config.imu_topic} odom={config.odom_topic}"
         )
 
@@ -610,6 +615,18 @@ class RgbdVisualOdometryNode(Node):
             self._reset_imu_origin_to_current_pose()
             self.get_logger().info("Resuming odom pose after scan_active returned false; reset VO keyframe and IMU yaw origin.")
 
+    def _on_nav_active(self, message: Any) -> None:
+        active = bool(message.data)
+        if active == self._nav_active:
+            return
+        self._nav_active = active
+        self.previous_frame = None
+        self._reset_imu_origin_to_current_pose()
+        if active:
+            self.get_logger().info("Allowing odom pose updates while nav_active is true.")
+        else:
+            self.get_logger().info("Holding odom pose while nav_active is false; RGB-D translation and IMU yaw updates are ignored.")
+
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
         self._latest_imu_received_s = self.get_clock().now().nanoseconds / 1_000_000_000.0
@@ -723,10 +740,22 @@ class RgbdVisualOdometryNode(Node):
         return False
 
     def _orientation_freeze_active(self) -> bool:
-        return bool((self.config.freeze_odom_during_scan or self.config.freeze_orientation_during_scan) and self._scan_freeze_active())
+        return bool(
+            self._nav_inactive_freeze_active()
+            or (
+                (self.config.freeze_odom_during_scan or self.config.freeze_orientation_during_scan)
+                and self._scan_freeze_active()
+            )
+        )
 
     def _translation_freeze_active(self) -> bool:
-        return bool(self.config.freeze_odom_during_scan and self._scan_freeze_active())
+        return bool(
+            self._nav_inactive_freeze_active()
+            or (self.config.freeze_odom_during_scan and self._scan_freeze_active())
+        )
+
+    def _nav_inactive_freeze_active(self) -> bool:
+        return bool(getattr(self.config, "odom_requires_nav_active", False) and not getattr(self, "_nav_active", False))
 
     def _log_scan_orientation_freeze(self, *, now_s: float) -> None:
         if self._last_scan_freeze_log_s is not None and now_s - self._last_scan_freeze_log_s < 1.0:
@@ -735,6 +764,7 @@ class RgbdVisualOdometryNode(Node):
         self.get_logger().info(
             "RGB-D VO orientation freeze active: "
             f"scan_active={self._scan_orientation_frozen} "
+            f"nav_active={self._nav_active} "
             f"pose_x={self.pose.x:.3f} pose_y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
         )
 
@@ -783,7 +813,8 @@ class RgbdVisualOdometryNode(Node):
         translation_frozen = self._translation_freeze_active()
         if orientation_frozen:
             self._last_prediction_stamp_s = stamp_s
-            self._log_scan_orientation_freeze(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
+            if self._scan_orientation_frozen:
+                self._log_scan_orientation_freeze(now_s=self.get_clock().now().nanoseconds / 1_000_000_000.0)
             self._pending_predicted_yaw_rad = 0.0
         have_rgbd_frame = self.latest_rgb is not None and self.latest_depth is not None and self.intrinsics is not None
         predicted_yaw_rad = self._predict_yaw_from_imu(stamp_s=stamp_s)
@@ -938,6 +969,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bool topic that is true only while an intentional scan is active.",
     )
     parser.add_argument(
+        "--nav-active-topic",
+        default="/xlerobot/nav_active",
+        help="Bool topic that is true only while intentional Nav2 waypoint execution is active.",
+    )
+    parser.add_argument(
         "--scan-active-stale-timeout-s",
         type=float,
         default=10.0,
@@ -968,6 +1004,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Freeze both RGB-D translation and odom yaw while --scan-active-topic publishes true. "
             "The exploration runtime keeps scan_active true briefly after scans to provide a settle buffer."
+        ),
+    )
+    parser.add_argument(
+        "--odom-requires-nav-active",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Only accept RGB-D translation and IMU yaw odom updates while --nav-active-topic is true. "
+            "When false, odom publishes the held pose and refreshes the VO keyframe."
         ),
     )
     parser.add_argument(
@@ -1061,6 +1106,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_pitch_topic=args.camera_pitch_topic,
         camera_pan_topic=args.camera_pan_topic,
         scan_active_topic=args.scan_active_topic,
+        nav_active_topic=args.nav_active_topic,
         scan_active_stale_timeout_s=args.scan_active_stale_timeout_s,
         freeze_odom_during_scan=args.freeze_odom_during_scan,
         freeze_orientation_during_scan=(
@@ -1068,6 +1114,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
             if args.freeze_orientation_during_scan is None
             else bool(args.freeze_orientation_during_scan)
         ),
+        odom_requires_nav_active=args.odom_requires_nav_active,
         publish_rate_hz=args.publish_rate_hz,
         min_depth_m=args.min_depth_m,
         max_depth_m=args.max_depth_m,

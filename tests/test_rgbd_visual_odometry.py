@@ -61,17 +61,22 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
                 [
                     "--scan-active-topic",
                     "/scan/is_active",
+                    "--nav-active-topic",
+                    "/nav/is_active",
                     "--scan-active-stale-timeout-s",
                     "6.5",
                     "--no-freeze-orientation-during-scan",
+                    "--no-odom-requires-nav-active",
                 ]
             )
         )
 
         self.assertEqual(config.scan_active_topic, "/scan/is_active")
+        self.assertEqual(config.nav_active_topic, "/nav/is_active")
         self.assertEqual(config.scan_active_stale_timeout_s, 6.5)
         self.assertTrue(config.freeze_odom_during_scan)
         self.assertFalse(config.freeze_orientation_during_scan)
+        self.assertFalse(config.odom_requires_nav_active)
 
     def test_compat_freeze_flag_maps_to_scan_orientation_freeze(self) -> None:
         config = config_from_args(build_parser().parse_args(["--no-freeze-during-head-motion"]))
@@ -88,6 +93,30 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         node._scan_orientation_frozen = True
         self.assertTrue(node._translation_freeze_active())
+
+    def test_odom_freezes_when_nav_inactive_is_required(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type(
+            "Config",
+            (),
+            {
+                "freeze_odom_during_scan": False,
+                "freeze_orientation_during_scan": False,
+                "scan_active_stale_timeout_s": 0.0,
+                "odom_requires_nav_active": True,
+            },
+        )()
+        node._scan_orientation_frozen = False
+        node._scan_active_last_true_s = None
+        node._nav_active = False
+
+        self.assertTrue(node._translation_freeze_active())
+        self.assertTrue(node._orientation_freeze_active())
+
+        node._nav_active = True
+
+        self.assertFalse(node._translation_freeze_active())
+        self.assertFalse(node._orientation_freeze_active())
 
     def test_angle_wrap(self) -> None:
         self.assertAlmostEqual(angle_wrap(math.radians(181.0)), math.radians(-179.0))

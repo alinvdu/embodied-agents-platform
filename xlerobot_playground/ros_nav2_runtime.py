@@ -275,6 +275,7 @@ class RosRuntimeConfig:
     point_cloud_topic: str = "/camera/head/points"
     point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     scan_active_topic: str = "/xlerobot/scan_active"
+    nav_active_topic: str = "/xlerobot/nav_active"
     scan_active_release_delay_s: float = 3.0
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
@@ -488,9 +489,11 @@ class RosExplorationRuntime(Node):
             10,
         )
         self._scan_active_pub = self.create_publisher(Bool, config.scan_active_topic, scan_active_qos_profile())
+        self._nav_active_pub = self.create_publisher(Bool, config.nav_active_topic, scan_active_qos_profile())
         self._scan_active_heartbeat_enabled = False
         self._last_scan_active_heartbeat_s = 0.0
         self.set_scan_active(False)
+        self.set_nav_active(False)
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -844,6 +847,12 @@ class RosExplorationRuntime(Node):
         self._scan_active_pub.publish(message)
         self._spin_once(timeout_sec=0.0)
 
+    def set_nav_active(self, active: bool) -> None:
+        message = Bool()
+        message.data = bool(active)
+        self._nav_active_pub.publish(message)
+        self._spin_once(timeout_sec=0.0)
+
     def _set_scan_active_if_available(self, active: bool) -> None:
         self.set_scan_active(active)
 
@@ -954,21 +963,25 @@ class RosExplorationRuntime(Node):
         request.pose = self._build_pose(goal_pose)
         if behavior_tree:
             request.behavior_tree = behavior_tree
-        future = self._navigate_to_pose_client.send_goal_async(request, feedback_callback=_feedback)
-        self._spin_until_future_complete(future)
-        goal_handle = future.result()
-        if goal_handle is None or not goal_handle.accepted:
-            raise RuntimeError("Nav2 rejected the NavigateToPose goal.")
-        result_future = goal_handle.get_result_async()
-        cancel_requested = False
-        while not result_future.done():
-            self._spin_once(timeout_sec=0.1)
-            if should_cancel is not None and should_cancel() and not cancel_requested:
-                cancel_requested = True
-                cancel_future = goal_handle.cancel_goal_async()
-                self._spin_until_future_complete(cancel_future)
-        outcome = result_future.result()
-        return outcome, feedback_samples
+        self.set_nav_active(True)
+        try:
+            future = self._navigate_to_pose_client.send_goal_async(request, feedback_callback=_feedback)
+            self._spin_until_future_complete(future)
+            goal_handle = future.result()
+            if goal_handle is None or not goal_handle.accepted:
+                raise RuntimeError("Nav2 rejected the NavigateToPose goal.")
+            result_future = goal_handle.get_result_async()
+            cancel_requested = False
+            while not result_future.done():
+                self._spin_once(timeout_sec=0.1)
+                if should_cancel is not None and should_cancel() and not cancel_requested:
+                    cancel_requested = True
+                    cancel_future = goal_handle.cancel_goal_async()
+                    self._spin_until_future_complete(cancel_future)
+            outcome = result_future.result()
+            return outcome, feedback_samples
+        finally:
+            self.set_nav_active(False)
 
     def perform_turnaround_scan(
         self,
@@ -1327,6 +1340,7 @@ class RosExplorationRuntime(Node):
         try:
             self._scan_active_heartbeat_enabled = False
             self.set_scan_active(False)
+            self.set_nav_active(False)
         except Exception:
             pass
         self.destroy_node()

@@ -126,6 +126,7 @@ class SimExplorationConfig:
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
     ros_scan_active_topic: str = "/xlerobot/scan_active"
+    ros_nav_active_topic: str = "/xlerobot/nav_active"
     ros_scan_active_release_delay_s: float = 3.0
     ros_rgb_topic: str = "/camera/head/image_raw"
     ros_imu_topic: str = "/imu/filtered_yaw"
@@ -2976,6 +2977,7 @@ class RosExplorationSession:
                     scan_topic=config.ros_scan_topic,
                     point_cloud_topic=config.ros_point_cloud_topic,
                     scan_active_topic=config.ros_scan_active_topic,
+                    nav_active_topic=config.ros_nav_active_topic,
                     scan_active_release_delay_s=config.ros_scan_active_release_delay_s,
                     rgb_topic=config.ros_rgb_topic,
                     imu_topic=config.ros_imu_topic,
@@ -5041,6 +5043,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
+    parser.add_argument("--ros-nav-active-topic", default="/xlerobot/nav_active")
     parser.add_argument("--ros-scan-active-release-delay-s", type=float, default=3.0)
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
@@ -5173,6 +5176,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_scan_active_topic=args.ros_scan_active_topic,
+            ros_nav_active_topic=args.ros_nav_active_topic,
             ros_scan_active_release_delay_s=args.ros_scan_active_release_delay_s,
             ros_rgb_topic=args.ros_rgb_topic,
             ros_imu_topic=args.ros_imu_topic,

@@ -407,21 +407,23 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --odom-topic /odom \
   --camera-pan-topic /camera/head/pan_rad \
   --scan-active-topic /xlerobot/scan_active \
+  --nav-active-topic /xlerobot/nav_active \
   --scan-active-stale-timeout-s 10.0 \
   --freeze-orientation-during-scan \
   --freeze-odom-during-scan \
+  --odom-requires-nav-active \
   --imu-frame-convention base_link \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
   --publish-rate-hz 30 \
   --min-translation-update-m 0.001 \
   --jitter-threshold \
-  --min-yaw-update-deg 0.08
+  --min-yaw-update-deg 0.15
 ```
 
-This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. `--no-jitter-threshold` disables the tiny-motion rejection gate while debugging slow Nav2 movement. Remove it later to make `--min-translation-update-m 0.01` reject sub-centimeter noisy updates again.
+This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. With `--odom-requires-nav-active`, pose updates are accepted only while the exploration runtime publishes `/xlerobot/nav_active=true` around a Nav2 waypoint goal; when the robot is sitting, previewing, or scanning, odom keeps publishing the held pose and refreshes the VO keyframe without accumulating stationary drift. `--no-odom-requires-nav-active` is useful only for direct teleop/debug runs that do not publish `/xlerobot/nav_active`.
 
-Keep `--freeze-odom-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes odom yaw and RGB-D translation, while still refreshing the VO keyframe so scan-time camera motion is not accumulated into one post-scan jump. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias for yaw freezing, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts, refreshes it while scanning, and publishes `false` after the configured release delay. `--scan-active-stale-timeout-s 10.0` is a failsafe: if the odom node misses the final `false` and no scan-active refresh arrives for 10 seconds, it resumes odom instead of freezing forever.
+Keep `--freeze-odom-during-scan` enabled for stationary camera-pan mapping. `/xlerobot/scan_active=true` freezes odom yaw and RGB-D translation even if nav gating is disabled, while still refreshing the VO keyframe so scan-time camera motion is not accumulated into one post-scan jump. Head pan position alone no longer freezes odom. The older `--freeze-during-head-motion` option remains as a compatibility alias for yaw freezing, but the scan-active event is now the actual trigger. The exploration runtime publishes `/xlerobot/scan_active` before camera-pan or robot-spin scanning starts, refreshes it while scanning, and publishes `false` after the configured release delay. `--scan-active-stale-timeout-s 10.0` is a failsafe: if the odom node misses the final `false` and no scan-active refresh arrives for 10 seconds, it resumes scan freeze; `/xlerobot/nav_active` still controls whether normal motion updates are allowed.
 
 Quick checks:
 
@@ -519,6 +521,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-scan-active-topic /xlerobot/scan_active \
+  --ros-nav-active-topic /xlerobot/nav_active \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
@@ -579,6 +582,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-scan-active-topic /xlerobot/scan_active \
+  --ros-nav-active-topic /xlerobot/nav_active \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
