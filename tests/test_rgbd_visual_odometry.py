@@ -257,6 +257,23 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
         self.assertAlmostEqual(fourth, math.radians(2.25))
         self.assertAlmostEqual(node._pending_predicted_yaw_rad, 0.0)
 
+    def test_zero_yaw_threshold_accepts_tiny_predicted_updates(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type("Config", (), {"min_yaw_update_rad": 0.0})()
+        node._pending_predicted_yaw_rad = 0.0
+
+        tiny_delta_rad = math.radians(0.01)
+
+        self.assertAlmostEqual(
+            node._filter_imu_yaw_delta(tiny_delta_rad, absolute_imu_yaw_rad=None),
+            tiny_delta_rad,
+        )
+        self.assertAlmostEqual(
+            node._filter_imu_yaw_delta(-tiny_delta_rad, absolute_imu_yaw_rad=None),
+            -tiny_delta_rad,
+        )
+        self.assertAlmostEqual(node._pending_predicted_yaw_rad, 0.0)
+
     def test_orientation_freeze_depends_on_scan_event_not_pan(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
         node.config = type("Config", (), {"freeze_orientation_during_scan": True, "freeze_odom_during_scan": False, "scan_active_stale_timeout_s": 0.0})()

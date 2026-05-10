@@ -311,7 +311,51 @@ Pass criteria:
 - `tf.unwrapped_yaw_delta_deg` should be small, target below `3 deg`.
 - If yaw drifts more than this while stationary, fix IMU yaw before moving.
 
-## Test 1: 90 Degree Left Rotation
+## Test 1: 90 Degree Head Pan Command
+
+Purpose: validate the camera head pan motor command path used by camera-pan scans.
+
+This command does not rotate the robot base. It sends an absolute head pan command through the robot brain `/camera/head/pan` endpoint, records `/camera/head/pan_rad`, and records the robot brain reported head pose.
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.ros_rotation_diagnostic \
+  --head-pan-deg 90 \
+  --head-pan-settle-s 1.0 \
+  --duration-s 3 \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --camera-pan-topic /camera/head/pan_rad \
+  --csv-out artifacts/diagnostics/head_pan_90.csv \
+  --json-out artifacts/diagnostics/head_pan_90_summary.json
+
+python -m json.tool artifacts/diagnostics/head_pan_90_summary.json
+```
+
+Return the head to center:
+
+```bash
+python -m xlerobot_playground.ros_rotation_diagnostic \
+  --head-pan-deg 0 \
+  --head-pan-settle-s 1.0 \
+  --duration-s 3 \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --camera-pan-topic /camera/head/pan_rad \
+  --csv-out artifacts/diagnostics/head_pan_0.csv \
+  --json-out artifacts/diagnostics/head_pan_0_summary.json
+```
+
+Expected:
+
+- The head physically pans left/right according to the configured pan sign.
+- `topic.end_deg` and `robot_brain_pose.end_deg` are near the requested target.
+- `topic.target_error_deg` is near `0`.
+
+Important: this validates command path, units, sign, and published pan state. If the head motor does not expose real encoder feedback, the reported value is the commanded/reported state, not an independent physical angle measurement.
+
+## Test 2: 90 Degree Left Rotation
 
 Purpose: validate authoritative IMU yaw through `/odom` and `odom -> base_link`.
 
@@ -349,7 +393,7 @@ Pass criteria:
 - Yaw error from 90 degrees is below `5 deg`.
 - Robot does not translate significantly while rotating.
 
-## Test 2: 90 Degree Right Rotation
+## Test 3: 90 Degree Right Rotation
 
 Purpose: validate sign symmetry.
 
@@ -384,7 +428,7 @@ Pass criteria:
 - Absolute yaw error from 90 degrees is below `5 deg`.
 - Direction is correct. If it rotates left, yaw sign is wrong.
 
-## Test 3: Forward 0.25 m
+## Test 4: Forward 0.25 m
 
 Purpose: short, safer translation validation before 1 m.
 
@@ -422,7 +466,7 @@ Pass criteria:
 - Lateral drift is below `0.05 m`.
 - Yaw drift is below `5 deg`.
 
-## Test 4: Forward 1.0 m
+## Test 5: Forward 1.0 m
 
 Purpose: validate RGB-D translation over a useful distance.
 
@@ -464,7 +508,7 @@ Pass criteria:
 
 If the robot physically travels much less or much more than `/odom`, the odometry scale or RGB-D alignment is wrong.
 
-## Test 5: Square Path Consistency
+## Test 6: Square Path Consistency
 
 Purpose: detect accumulated rotation or translation bias.
 

@@ -7,6 +7,8 @@ import math
 import time
 from pathlib import Path
 from typing import Any
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     import rclpy
@@ -15,6 +17,7 @@ try:
     from rclpy.node import Node
     from rclpy.time import Time as RosTime
     from sensor_msgs.msg import Imu
+    from std_msgs.msg import Float32
     from tf2_ros import Buffer, ConnectivityException, ExtrapolationException, LookupException, TransformListener
 except Exception as exc:  # pragma: no cover - runtime guard for non-ROS test envs.
     IMPORT_ERROR: Exception | None = exc
@@ -26,6 +29,7 @@ except Exception as exc:  # pragma: no cover - runtime guard for non-ROS test en
     RosTime = None
     Buffer = None
     TransformListener = None
+    Float32 = None
     ConnectivityException = Exception
     ExtrapolationException = Exception
     LookupException = Exception
@@ -36,6 +40,27 @@ else:
 def require_ros() -> None:
     if IMPORT_ERROR is not None:
         raise RuntimeError("ROS rotation diagnostic requires ROS 2 Python packages.") from IMPORT_ERROR
+
+
+def http_json(method: str, url: str, payload: dict[str, Any] | None = None, *, timeout_s: float = 5.0) -> dict[str, Any]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = urllib_request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout_s) as response:
+            raw = response.read()
+    except urllib_error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {method} {url} failed with {exc.code}: {body}") from exc
+    except urllib_error.URLError as exc:
+        raise RuntimeError(f"HTTP {method} {url} failed: {exc}") from exc
+    if not raw:
+        return {}
+    return json.loads(raw.decode("utf-8"))
 
 
 def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
@@ -110,6 +135,7 @@ class RotationDiagnosticNode(Node):
         cmd_vel_topic: str,
         odom_topic: str,
         imu_topic: str,
+        camera_pan_topic: str,
         imu_axis: str,
         sample_hz: float,
         imu_bias_calibration_s: float,
@@ -127,11 +153,13 @@ class RotationDiagnosticNode(Node):
         self.cmd_vel_pub = self.create_publisher(Twist, cmd_vel_topic, 10)
         self.latest_odom_pose: dict[str, float] | None = None
         self.latest_imu_sample: dict[str, float] | None = None
+        self.latest_camera_pan_rad: float | None = None
         self.imu_bias_x_rad_s = 0.0
         self.imu_bias_y_rad_s = 0.0
         self.imu_bias_z_rad_s = 0.0
         self.create_subscription(Odometry, odom_topic, self._on_odom, 10)
         self.create_subscription(Imu, imu_topic, self._on_imu, 50)
+        self.create_subscription(Float32, camera_pan_topic, self._on_camera_pan, 10)
 
     def _on_odom(self, message: Any) -> None:
         position = message.pose.pose.position
@@ -168,6 +196,9 @@ class RotationDiagnosticNode(Node):
             "orientation_yaw_rad": orientation_yaw_rad,
         }
 
+    def _on_camera_pan(self, message: Any) -> None:
+        self.latest_camera_pan_rad = float(message.data)
+
     def lookup_pose(self) -> dict[str, float] | None:
         try:
             transform = self.tf_buffer.lookup_transform(self.odom_frame, self.base_frame, RosTime())
@@ -188,6 +219,123 @@ class RotationDiagnosticNode(Node):
 
     def stop(self) -> None:
         self.cmd_vel_pub.publish(Twist())
+
+    def command_head_pan(
+        self,
+        *,
+        robot_brain_url: str,
+        pan_deg: float,
+        settle_s: float,
+        action_key: str | None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "pan_deg": float(pan_deg),
+            "settle_s": float(settle_s),
+        }
+        if action_key:
+            payload["action_key"] = action_key
+        url = f"{robot_brain_url.rstrip('/')}/camera/head/pan"
+        return http_json("POST", url, payload, timeout_s=max(float(settle_s) + 5.0, 5.0))
+
+    def read_head_pose(self, *, robot_brain_url: str) -> dict[str, Any] | None:
+        try:
+            return http_json("GET", f"{robot_brain_url.rstrip('/')}/camera/head/pose", None, timeout_s=2.0)
+        except RuntimeError:
+            return None
+
+    def collect_head_pan(
+        self,
+        *,
+        robot_brain_url: str,
+        pan_deg: float,
+        settle_s: float,
+        action_key: str | None,
+        duration_s: float,
+    ) -> list[dict[str, Any]]:
+        samples: list[dict[str, Any]] = []
+        start = time.time()
+        command_response: dict[str, Any] | None = None
+        command_error: str | None = None
+        for _ in range(max(int(self.sample_dt_s * 20), 3)):
+            rclpy.spin_once(self, timeout_sec=0.02)
+        initial_head_pose = self.read_head_pose(robot_brain_url=robot_brain_url)
+        initial_sample: dict[str, Any] = {
+            "t_s": round(time.time() - start, 4),
+            "requested_head_pan_deg": float(pan_deg),
+            "command_succeeded": False,
+            "command_error": None,
+            "pre_command_sample": True,
+        }
+        if self.latest_camera_pan_rad is None:
+            initial_sample["head_pan_topic_available"] = False
+        else:
+            initial_sample.update(
+                {
+                    "head_pan_topic_available": True,
+                    "head_pan_topic_rad": self.latest_camera_pan_rad,
+                    "head_pan_topic_deg": math.degrees(self.latest_camera_pan_rad),
+                }
+            )
+        if isinstance(initial_head_pose, dict):
+            initial_sample.update(
+                {
+                    "head_pose_available": True,
+                    "head_pose_pan_rad": float(initial_head_pose.get("pan_rad", 0.0)),
+                    "head_pose_pan_deg": float(initial_head_pose.get("pan_deg", 0.0)),
+                    "head_pose_moving": bool(initial_head_pose.get("moving", False)),
+                }
+            )
+        else:
+            initial_sample["head_pose_available"] = False
+        samples.append(initial_sample)
+        try:
+            command_response = self.command_head_pan(
+                robot_brain_url=robot_brain_url,
+                pan_deg=pan_deg,
+                settle_s=settle_s,
+                action_key=action_key,
+            )
+        except RuntimeError as exc:
+            command_error = str(exc)
+        deadline = start + max(float(duration_s), float(settle_s) + 1.0)
+        while time.time() < deadline:
+            now = time.time()
+            rclpy.spin_once(self, timeout_sec=0.0)
+            head_pose = self.read_head_pose(robot_brain_url=robot_brain_url)
+            sample: dict[str, Any] = {
+                "t_s": round(now - start, 4),
+                "requested_head_pan_deg": float(pan_deg),
+                "command_succeeded": bool(command_response and command_response.get("succeeded")),
+                "command_error": command_error,
+            }
+            if self.latest_camera_pan_rad is None:
+                sample["head_pan_topic_available"] = False
+            else:
+                sample.update(
+                    {
+                        "head_pan_topic_available": True,
+                        "head_pan_topic_rad": self.latest_camera_pan_rad,
+                        "head_pan_topic_deg": math.degrees(self.latest_camera_pan_rad),
+                    }
+                )
+            if isinstance(head_pose, dict):
+                sample.update(
+                    {
+                        "head_pose_available": True,
+                        "head_pose_pan_rad": float(head_pose.get("pan_rad", 0.0)),
+                        "head_pose_pan_deg": float(head_pose.get("pan_deg", 0.0)),
+                        "head_pose_moving": bool(head_pose.get("moving", False)),
+                    }
+                )
+            else:
+                sample["head_pose_available"] = False
+            samples.append(sample)
+            time.sleep(self.sample_dt_s)
+        if samples:
+            samples[-1]["stop_reason"] = "head_pan_command_error" if command_error else "duration_timeout"
+            if command_response is not None:
+                samples[-1]["command_response"] = json.dumps(command_response, sort_keys=True)
+        return samples
 
     def calibrate_imu_bias(self) -> dict[str, float] | None:
         if self.imu_bias_calibration_s <= 1e-6:
@@ -424,6 +572,8 @@ def _summarize_source(samples: list[dict[str, Any]], *, prefix: str) -> dict[str
 
 
 def summarize(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    if samples and "requested_head_pan_deg" in samples[0]:
+        return summarize_head_pan(samples)
     summary = {
         "sample_count": len(samples),
         "stop_reason": samples[-1].get("stop_reason") if samples else "no_samples",
@@ -498,6 +648,58 @@ def _summarize_imu(samples: list[dict[str, Any]]) -> dict[str, Any]:
         summary["reported_turn_rad"] = round(orientation_delta_rad, 4)
     return summary
 
+
+def summarize_head_pan(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    topic_valid = [sample for sample in samples if sample.get("head_pan_topic_available")]
+    pose_valid = [sample for sample in samples if sample.get("head_pose_available")]
+    requested_deg = float(samples[0].get("requested_head_pan_deg", 0.0)) if samples else 0.0
+    summary: dict[str, Any] = {
+        "sample_count": len(samples),
+        "mode": "head_pan",
+        "stop_reason": samples[-1].get("stop_reason") if samples else "no_samples",
+        "requested_head_pan_deg": round(requested_deg, 2),
+    }
+    if topic_valid:
+        start = topic_valid[0]
+        end = topic_valid[-1]
+        start_deg = float(start["head_pan_topic_deg"])
+        end_deg = float(end["head_pan_topic_deg"])
+        summary["topic"] = {
+            "valid_sample_count": len(topic_valid),
+            "start_deg": round(start_deg, 2),
+            "end_deg": round(end_deg, 2),
+            "delta_deg": round(end_deg - start_deg, 2),
+            "target_error_deg": round(end_deg - requested_deg, 2),
+        }
+    else:
+        summary["topic"] = {
+            "valid_sample_count": 0,
+            "message": "No /camera/head/pan_rad samples were available.",
+        }
+    if pose_valid:
+        start_pose = pose_valid[0]
+        end_pose = pose_valid[-1]
+        start_pose_deg = float(start_pose["head_pose_pan_deg"])
+        end_pose_deg = float(end_pose["head_pose_pan_deg"])
+        summary["robot_brain_pose"] = {
+            "valid_sample_count": len(pose_valid),
+            "start_deg": round(start_pose_deg, 2),
+            "end_deg": round(end_pose_deg, 2),
+            "delta_deg": round(end_pose_deg - start_pose_deg, 2),
+            "target_error_deg": round(end_pose_deg - requested_deg, 2),
+            "moving": bool(end_pose.get("head_pose_moving", False)),
+        }
+    else:
+        summary["robot_brain_pose"] = {
+            "valid_sample_count": 0,
+            "message": "Robot brain /camera/head/pose was not available.",
+        }
+    command_error = next((sample.get("command_error") for sample in samples if sample.get("command_error")), None)
+    if command_error:
+        summary["command_error"] = command_error
+    return summary
+
+
 def write_csv(path: Path, samples: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns = sorted({key for sample in samples for key in sample})
@@ -518,6 +720,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--imu-topic", default="/imu")
+    parser.add_argument("--camera-pan-topic", default="/camera/head/pan_rad")
     parser.add_argument(
         "--imu-axis",
         choices=("x", "y", "z", "robot_yaw", "optical_yaw"),
@@ -542,6 +745,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Actually publish angular /cmd_vel. Without this flag the script only records TF.",
     )
+    parser.add_argument(
+        "--head-pan-deg",
+        type=float,
+        default=None,
+        help="Command the camera head pan motor to this absolute angle and record reported head pan. This does not move the base.",
+    )
+    parser.add_argument("--head-pan-settle-s", type=float, default=1.0)
+    parser.add_argument("--head-pan-action-key", default=None)
+    parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--csv-out", default="artifacts/diagnostics/rotation_diagnostic.csv")
     parser.add_argument("--json-out", default="artifacts/diagnostics/rotation_diagnostic_summary.json")
     return parser
@@ -557,19 +769,29 @@ def main(argv: list[str] | None = None) -> int:
         cmd_vel_topic=args.cmd_vel_topic,
         odom_topic=args.odom_topic,
         imu_topic=args.imu_topic,
+        camera_pan_topic=args.camera_pan_topic,
         imu_axis=args.imu_axis,
         sample_hz=args.sample_hz,
         imu_bias_calibration_s=args.imu_bias_calibration_s,
         imu_bias_min_samples=args.imu_bias_min_samples,
     )
     try:
-        samples = node.collect(
-            duration_s=args.duration_s,
-            angular_rad_s=args.angular_rad_s,
-            send_motion=args.send_motion,
-            target_yaw_rad=math.radians(args.target_yaw_deg) if args.target_yaw_deg is not None else None,
-            target_source=args.target_source,
-        )
+        if args.head_pan_deg is not None:
+            samples = node.collect_head_pan(
+                robot_brain_url=args.robot_brain_url,
+                pan_deg=args.head_pan_deg,
+                settle_s=args.head_pan_settle_s,
+                action_key=args.head_pan_action_key,
+                duration_s=args.duration_s,
+            )
+        else:
+            samples = node.collect(
+                duration_s=args.duration_s,
+                angular_rad_s=args.angular_rad_s,
+                send_motion=args.send_motion,
+                target_yaw_rad=math.radians(args.target_yaw_deg) if args.target_yaw_deg is not None else None,
+                target_source=args.target_source,
+            )
         summary = summarize(samples)
         write_csv(Path(args.csv_out).expanduser(), samples)
         json_path = Path(args.json_out).expanduser()
@@ -579,8 +801,15 @@ def main(argv: list[str] | None = None) -> int:
         imu_reported_turn_deg = summary.get("imu", {}).get("reported_turn_deg")
         if imu_reported_turn_deg is not None:
             print(f"Reported IMU turn: {imu_reported_turn_deg} deg")
+        head_pan_topic = summary.get("topic", {}).get("end_deg")
+        if head_pan_topic is not None:
+            print(f"Reported head pan topic: {head_pan_topic} deg")
         print(f"Wrote samples: {Path(args.csv_out).expanduser()}")
         print(f"Wrote summary: {json_path}")
+        if args.head_pan_deg is not None:
+            return 0 if summary.get("topic", {}).get("valid_sample_count", 0) or summary.get(
+                "robot_brain_pose", {}
+            ).get("valid_sample_count", 0) else 2
         return 0 if (
             summary.get("tf", {}).get("valid_pose_count", 0)
             or summary.get("odom_topic", {}).get("valid_pose_count", 0)
