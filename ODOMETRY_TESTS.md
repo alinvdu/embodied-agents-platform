@@ -218,8 +218,10 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m xlerobot_playground.imu_yaw_filter \
   --imu-topic /imu \
   --output-topic /imu/filtered_yaw \
+  --camera-pitch-topic /camera/head/pitch_rad \
   --input-frame-convention camera_optical \
   --yaw-source gyro_y \
+  --compensate-camera-pitch \
   --bias-calibration-s 0.5 \
   --yaw-rate-lowpass-alpha 0.2
 ```

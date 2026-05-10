@@ -10,20 +10,25 @@ try:
     import rclpy
     from rclpy.node import Node
     from sensor_msgs.msg import Imu
+    from std_msgs.msg import Float32
 except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
     rclpy = None
     Node = object
     Imu = None
+    Float32 = None
 
 
 @dataclass(frozen=True)
 class ImuYawFilterConfig:
     imu_topic: str = "/imu"
     output_topic: str = "/imu/filtered_yaw"
+    camera_pitch_topic: str = "/camera/head/pitch_rad"
     input_frame_convention: str = "camera_optical"
     output_frame: str = "base_link"
     yaw_source: str = "gyro_y"
+    compensate_camera_pitch: bool = True
+    min_pitch_compensation_cos: float = 0.25
     bias_calibration_s: float = 2.0
     bias_min_samples: int = 20
     yaw_rate_lowpass_alpha: float = 0.2
@@ -82,6 +87,24 @@ def yaw_rate_from_source(
     raise ValueError(f"Unsupported yaw source: {yaw_source}")
 
 
+def compensate_yaw_rate_for_pitch(
+    yaw_rate_rad_s: float,
+    *,
+    yaw_source: str,
+    pitch_rad: float,
+    enabled: bool,
+    min_cos: float,
+) -> float:
+    if not enabled:
+        return yaw_rate_rad_s
+    normalized = str(yaw_source).strip().lower()
+    if normalized not in {"gyro_y", "gyro_neg_y"}:
+        return yaw_rate_rad_s
+    cos_pitch = abs(math.cos(float(pitch_rad)))
+    clamped_cos = max(cos_pitch, max(float(min_cos), 1e-6))
+    return yaw_rate_rad_s / clamped_cos
+
+
 def angle_wrap(angle_rad: float) -> float:
     return (angle_rad + math.pi) % (2.0 * math.pi) - math.pi
 
@@ -93,6 +116,8 @@ class ImuYawFilterNode(Node):
         self.config = config
         self.publisher = self.create_publisher(Imu, config.output_topic, 50)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
+        self.create_subscription(Float32, config.camera_pitch_topic, self._on_camera_pitch, 10)
+        self._camera_pitch_rad = 0.0
         self._bias_started_s: float | None = None
         self._last_stamp_s: float | None = None
         self._sample_count = 0
@@ -107,8 +132,13 @@ class ImuYawFilterNode(Node):
         self._yaw_rad = 0.0
         self.get_logger().info(
             f"IMU yaw filter ready: input={config.imu_topic} output={config.output_topic} "
-            f"frame_convention={config.input_frame_convention} yaw_source={config.yaw_source}"
+            f"frame_convention={config.input_frame_convention} yaw_source={config.yaw_source} "
+            f"camera_pitch_topic={config.camera_pitch_topic} "
+            f"compensate_camera_pitch={config.compensate_camera_pitch}"
         )
+
+    def _on_camera_pitch(self, message: Any) -> None:
+        self._camera_pitch_rad = float(message.data)
 
     def _on_imu(self, message: Any) -> None:
         if message.header.stamp is None:
@@ -171,6 +201,13 @@ class ImuYawFilterNode(Node):
             base_y=base_gyro_y - self._bias_y,
             base_z=base_gyro_z - self._bias_z,
         )
+        yaw_rate_rad_s = compensate_yaw_rate_for_pitch(
+            yaw_rate_rad_s,
+            yaw_source=self.config.yaw_source,
+            pitch_rad=self._camera_pitch_rad,
+            enabled=self.config.compensate_camera_pitch,
+            min_cos=self.config.min_pitch_compensation_cos,
+        )
         alpha = max(0.0, min(self.config.yaw_rate_lowpass_alpha, 1.0))
         self._filtered_yaw_rate_rad_s = (
             alpha * yaw_rate_rad_s + (1.0 - alpha) * self._filtered_yaw_rate_rad_s
@@ -209,6 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--imu-topic", default="/imu")
     parser.add_argument("--output-topic", default="/imu/filtered_yaw")
+    parser.add_argument("--camera-pitch-topic", default="/camera/head/pitch_rad")
     parser.add_argument(
         "--input-frame-convention",
         choices=("camera_optical", "base_link"),
@@ -221,6 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Yaw-rate source. For Gemini 2 Viewer-style integration, use gyro_y.",
     )
     parser.add_argument("--output-frame", default="base_link")
+    parser.add_argument("--compensate-camera-pitch", dest="compensate_camera_pitch", action="store_true", default=True)
+    parser.add_argument("--no-compensate-camera-pitch", dest="compensate_camera_pitch", action="store_false")
+    parser.add_argument("--min-pitch-compensation-cos", type=float, default=0.25)
     parser.add_argument("--bias-calibration-s", type=float, default=2.0)
     parser.add_argument("--bias-min-samples", type=int, default=20)
     parser.add_argument("--yaw-rate-lowpass-alpha", type=float, default=0.2)
@@ -231,8 +272,11 @@ def config_from_args(args: argparse.Namespace) -> ImuYawFilterConfig:
     return ImuYawFilterConfig(
         imu_topic=args.imu_topic,
         output_topic=args.output_topic,
+        camera_pitch_topic=args.camera_pitch_topic,
         input_frame_convention=args.input_frame_convention,
         yaw_source=args.yaw_source,
+        compensate_camera_pitch=args.compensate_camera_pitch,
+        min_pitch_compensation_cos=args.min_pitch_compensation_cos,
         output_frame=args.output_frame,
         bias_calibration_s=args.bias_calibration_s,
         bias_min_samples=args.bias_min_samples,

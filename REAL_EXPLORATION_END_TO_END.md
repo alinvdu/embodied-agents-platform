@@ -377,13 +377,16 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m xlerobot_playground.imu_yaw_filter \
   --imu-topic /imu \
   --output-topic /imu/filtered_yaw \
+  --camera-pitch-topic /camera/head/pitch_rad \
   --input-frame-convention camera_optical \
   --yaw-source gyro_y \
+  --compensate-camera-pitch \
   --bias-calibration-s 0.5 \
   --yaw-rate-lowpass-alpha 0.2
 ```
 
 This matches the OrbbecViewer CSV path: integrate corrected `gyro_y`.
+Because the IMU is on the pitching camera head, `--compensate-camera-pitch` divides the selected yaw-rate axis by `cos(camera_pitch)` using `/camera/head/pitch_rad`; this removes the large yaw underreport when the camera is pitched down for mapping.
 Keep the robot still for the first 0.5 seconds after startup so the yaw filter calibrates gyro bias cleanly.
 
 Quick checks:
