@@ -324,14 +324,17 @@ cd "$ROBOT42"
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
+ros2 topic pub --once /xlerobot/nav_active std_msgs/msg/Bool "{data: true}"
+sleep 0.5
+
 python -m xlerobot_playground.ros_rotation_diagnostic \
-  --head-pan-deg 90 \
+  --head-pan-deg -90 \
   --head-pan-settle-s 1.0 \
   --duration-s 3 \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
-  --camera-pan-topic /camera/head/pan_rad \
-  --csv-out artifacts/diagnostics/head_pan_90.csv \
-  --json-out artifacts/diagnostics/head_pan_90_summary.json
+  --camera-pan-topic /camera/head/pan_rad
+
+ros2 topic pub --once /xlerobot/nav_active std_msgs/msg/Bool "{data: false}"
 
 python -m json.tool artifacts/diagnostics/head_pan_90_summary.json
 ```
