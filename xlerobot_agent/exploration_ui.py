@@ -657,6 +657,41 @@ HTML_PAGE = """<!doctype html>
       return worldFromSvgViewPoint(bounds, point.x, point.y);
     }
 
+    function pathLengthMeters(points) {
+      let length = 0;
+      let previous = null;
+      for (const point of points || []) {
+        const x = Number(point?.x);
+        const y = Number(point?.y);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        if (previous) {
+          length += Math.hypot(x - previous.x, y - previous.y);
+        }
+        previous = {x, y};
+      }
+      return length;
+    }
+
+    function previewPathLengthMeters(robotPose, previewPlan) {
+      const pathPoses = (previewPlan?.path_poses || []).filter((pose) => {
+        return Number.isFinite(Number(pose?.x)) && Number.isFinite(Number(pose?.y));
+      });
+      const measuredPoses = [];
+      if (robotPose && Number.isFinite(Number(robotPose.x)) && Number.isFinite(Number(robotPose.y))) {
+        measuredPoses.push(robotPose);
+      }
+      measuredPoses.push(...pathPoses);
+      const measuredLength = pathLengthMeters(measuredPoses);
+      if (measuredLength > 0) return measuredLength;
+      const plannedLength = Number(previewPlan?.path_length_m);
+      return Number.isFinite(plannedLength) && plannedLength > 0 ? plannedLength : null;
+    }
+
+    function formatCentimeters(meters) {
+      if (!Number.isFinite(Number(meters))) return '';
+      return `${Math.round(Number(meters) * 100)} cm`;
+    }
+
     function shouldPaintCell(cell) {
       if (!cell) return false;
       if (mapEditMode !== 'clear') return true;
@@ -890,19 +925,23 @@ HTML_PAGE = """<!doctype html>
       })() : '';
       const preview = ((map.artifacts || {}).nav2_preview || {});
       const previewPlan = preview.plan || null;
-      const previewPath = (previewPlan?.path_poses || []).map((pose) => {
+      const previewPathPoses = previewPlan?.path_poses || [];
+      const previewPath = previewPathPoses.map((pose) => {
         const p = project(pose);
         return `${p.x},${p.y}`;
       }).join(' ');
       const previewGoal = preview.requested_pose || null;
+      const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || null;
+      const previewDistanceM = previewPathLengthMeters(robotPose, previewPlan);
       const previewGoalMarkup = previewGoal ? (() => {
         const p = project(previewGoal);
+        const distanceLabel = previewDistanceM == null ? '' : `path ${formatCentimeters(previewDistanceM)}`;
         return `
           <circle cx="${p.x}" cy="${p.y}" r="8" fill="#f59e0b" opacity="0.92" />
           <text x="${p.x + 12}" y="${p.y - 8}" font-size="12" fill="#92400e" font-weight="700">preview</text>
+          ${distanceLabel ? `<text x="${p.x + 12}" y="${p.y + 8}" font-size="12" fill="#92400e" font-weight="700">${escapeHtml(distanceLabel)}</text>` : ''}
         `;
       })() : '';
-      const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || null;
       const robot = robotPose ? project(robotPose) : null;
       const headingLength = (map.occupancy?.resolution || 0.5) * 2.5;
       const robotHeading = robotPose ? project({
