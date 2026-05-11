@@ -78,14 +78,25 @@ class PointCloudPitchDiagnostic(Node):
             candidate_margin_m=self.candidate_margin_m,
             min_points=self.min_points,
         )
-        if fit is None:
+        raw_fit = fit_floor_pitch_error(
+            points,
+            min_range_m=self.min_range_m,
+            max_range_m=self.max_range_m,
+            low_percentile=self.low_percentile,
+            candidate_margin_m=self.candidate_margin_m,
+            min_points=self.min_points,
+        )
+        if fit is None or raw_fit is None:
             return
+        fit["raw_camera_pitch_deg"] = raw_fit["pitch_error_deg"]
+        fit["raw_camera_roll_deg"] = raw_fit["roll_error_deg"]
         self.samples.append(fit)
         self.get_logger().info(
             "sample "
             f"{len(self.samples)}/{self.max_samples}: "
             f"pitch_error_deg={fit['pitch_error_deg']:.3f} "
             f"roll_error_deg={fit['roll_error_deg']:.3f} "
+            f"raw_camera_pitch_deg={fit['raw_camera_pitch_deg']:.3f} "
             f"floor_points={fit['floor_points']:.0f}"
         )
 
@@ -160,7 +171,16 @@ def fit_floor_pitch_error(
 def summarize(samples: list[dict[str, float]]) -> dict[str, float]:
     if not samples:
         return {}
-    keys = ["pitch_error_deg", "roll_error_deg", "plane_a", "plane_b", "plane_c", "floor_points"]
+    keys = [
+        "pitch_error_deg",
+        "roll_error_deg",
+        "raw_camera_pitch_deg",
+        "raw_camera_roll_deg",
+        "plane_a",
+        "plane_b",
+        "plane_c",
+        "floor_points",
+    ]
     return {key: float(np.median([sample[key] for sample in samples])) for key in keys}
 
 
@@ -206,13 +226,18 @@ def main(argv: list[str] | None = None) -> int:
             print("No usable floor plane samples collected.")
             return 2
         pitch_error = summary["pitch_error_deg"]
+        raw_pitch = summary["raw_camera_pitch_deg"]
         print(f"median_pitch_error_deg={pitch_error:.3f}")
         print(f"median_roll_error_deg={summary['roll_error_deg']:.3f}")
+        print(f"median_raw_camera_pitch_deg={raw_pitch:.3f}")
+        print(f"median_raw_camera_roll_deg={summary['raw_camera_roll_deg']:.3f}")
         print(f"median_floor_points={summary['floor_points']:.0f}")
         if args.old_offset_deg is not None:
             print(f"try_offset_plus_error_deg={args.old_offset_deg + pitch_error:.3f}")
             print(f"try_offset_minus_error_deg={args.old_offset_deg - pitch_error:.3f}")
-            print("Use the candidate that makes the next run's median_pitch_error_deg closest to 0.")
+            print(f"try_offset_plus_raw_camera_pitch_deg={args.old_offset_deg + raw_pitch:.3f}")
+            print(f"try_offset_minus_raw_camera_pitch_deg={args.old_offset_deg - raw_pitch:.3f}")
+            print("Use a small test step first; the candidate that reduces raw_camera_pitch_deg toward 0 has the right sign.")
         return 0
     finally:
         node.destroy_node()
