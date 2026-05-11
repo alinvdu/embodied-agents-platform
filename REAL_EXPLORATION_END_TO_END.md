@@ -95,7 +95,7 @@ python -m xlerobot_playground.robot_brain_agent \
   --camera-pitch-action-key head_motor_2.pos \
   --camera-pitch-action-units deg \
   --camera-pitch-action-sign 1 \
-  --camera-pitch-action-offset-deg -25 \
+  --camera-pitch-action-offset-deg -28 \
   --camera-pitch-settle-s 0.5 \
   --initial-camera-pitch-deg 0
 ```
