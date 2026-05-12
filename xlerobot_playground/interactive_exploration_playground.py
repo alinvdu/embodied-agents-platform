@@ -37,7 +37,6 @@ from xlerobot_playground.map_editing import (
 )
 from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
 from xlerobot_playground.scan_fusion import integrate_planar_scan
-from xlerobot_playground.interactive_react_ui import INTERACTIVE_REACT_HTML
 from xlerobot_playground.ros_nav2_router import RemoteNav2RouterClient
 from xlerobot_playground.sim_exploration_backend import (
     ExplorationDecision,
@@ -4584,7 +4583,7 @@ class InteractiveExplorationServer:
 
     def serve_forever(self) -> None:
         session = self.session
-        html = INTERACTIVE_REACT_HTML.replace("__UI_FLAVOR__", self.ui_flavor)
+        html = INTERACTIVE_HTML
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:

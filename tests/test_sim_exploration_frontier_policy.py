@@ -37,7 +37,6 @@ from xlerobot_playground.interactive_exploration_playground import (
     _zero_mobile_base_qvel,
     build_parser as build_interactive_playground_parser,
 )
-from xlerobot_playground.interactive_react_ui import INTERACTIVE_REACT_HTML
 from xlerobot_playground.map_editing import (
     ACTIVE_RGBD_SCAN_FUSION_CONFIG,
     DEFAULT_OCCUPANCY_FUSION_CONFIG,
@@ -1755,13 +1754,6 @@ class SimExplorationBackendTests(unittest.TestCase):
         self.assertEqual(args.visited_frontier_filter_radius_m, 0.8)
         self.assertEqual(args.sim_motion_speed, "fastest")
         self.assertTrue(args.automatic_semantic_waypoints)
-
-    def test_interactive_playground_ui_is_react_app(self) -> None:
-        self.assertIn("ReactDOM.createRoot", INTERACTIVE_REACT_HTML)
-        self.assertIn("React.createElement", INTERACTIVE_REACT_HTML)
-        self.assertIn("window.INTERACTIVE_UI_FLAVOR", INTERACTIVE_REACT_HTML)
-        self.assertIn("/api/region/create", INTERACTIVE_REACT_HTML)
-        self.assertIn("requestJson(path, payload || {})", INTERACTIVE_REACT_HTML)
 
     def test_resolve_manishkill_start_pose_rotates_default_spawn_in_place(self) -> None:
         pose = _resolve_manishkill_start_pose(

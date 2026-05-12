@@ -451,12 +451,6 @@ HTML_PAGE = """<!doctype html>
         </section>
 
         <section class="panel">
-          <div class="eyebrow">Exploration</div>
-          <div id="decision-summary" class="muted">No exploration decision yet.</div>
-          <div id="frontier-list" class="list" style="margin-top:12px; max-height:220px;"></div>
-        </section>
-
-        <section class="panel">
           <div class="eyebrow">Map Editing</div>
           <div class="button-row" style="margin-top:10px;">
             <button class="secondary" id="edit-block">Draw Wall</button>
@@ -782,26 +776,9 @@ HTML_PAGE = """<!doctype html>
 
     function renderExploration(state) {
       const map = state.current_map || {};
-      const frontiers = map.frontiers || [];
-      const lastDecision = ((map.artifacts || {}).decision_log || []).slice(-1)[0];
-      const frontierMemory = ((map.artifacts || {}).frontier_memory || {});
-      const summary = document.getElementById('decision-summary');
-      if (!lastDecision) {
-        summary.textContent = 'No exploration decision yet.';
-      } else {
-        const decision = lastDecision.decision || {};
-        summary.textContent = `${decision.decision_type || 'unknown'} · ${decision.selected_frontier_id || 'no frontier'} · coverage ${lastDecision.coverage ?? 'n/a'}`;
-      }
-      document.getElementById('frontier-list').innerHTML = frontiers.map((frontier) => `
-        <div class="list-card ${frontier.status === 'active' ? 'active' : ''}">
-          <strong>${escapeHtml(frontier.frontier_id || 'frontier')}</strong><br/>
-          <span class="muted">${escapeHtml(frontier.status || 'unknown')} · gain ${escapeHtml(String(frontier.unknown_gain ?? 'n/a'))} · path ${escapeHtml(String(frontier.path_cost_m ?? 'n/a'))}</span>
-        </div>
-      `).join('') || '<div class="muted">No frontiers available.</div>';
       const edits = ((map.artifacts || {}).manual_occupancy_edits || {});
       const blocked = (edits.blocked_cells || []).length;
       const cleared = (edits.cleared_cells || []).length;
-      const activeFrontierId = frontierMemory.active_frontier_id || 'none';
       const verb = mapEditMode === 'block'
         ? 'draw occupied wall cells'
         : mapEditMode === 'clear'
@@ -811,7 +788,7 @@ HTML_PAGE = """<!doctype html>
             : mapEditMode === 'preview'
               ? 'click once to preview Nav2 path without moving'
               : 'click once to send a Nav2 waypoint';
-      document.getElementById('edit-mode-summary').textContent = `Map mode: ${mapEditMode} (${verb}). Active frontier: ${activeFrontierId}. Manual walls ${blocked}, manual clears ${cleared}.`;
+      document.getElementById('edit-mode-summary').textContent = `Map mode: ${mapEditMode} (${verb}). Manual walls ${blocked}, manual clears ${cleared}.`;
       const guardrails = ((map.artifacts || {}).guardrail_events || []).slice(-12).reverse();
       const guardrailElement = document.getElementById('guardrail-list');
       if (guardrailElement) {
@@ -898,23 +875,6 @@ HTML_PAGE = """<!doctype html>
           <text x="${anchor.x + 10}" y="${anchor.y + 4}" font-size="12" fill="#4c1d95" font-weight="700">${escapeHtml(place.label || '')}</text>
         `;
       }).join('');
-      const frontiers = (map.frontiers || []).map((frontier) => {
-        const p = project(frontier.approach_pose || frontier.nav_pose || {x: 0, y: 0});
-        const boundary = project(frontier.frontier_boundary_pose || frontier.centroid_pose || frontier.nav_pose || {x: 0, y: 0});
-        const fill = frontier.status === 'completed'
-          ? '#94a3b8'
-          : frontier.status === 'active'
-            ? '#b91c1c'
-            : frontier.currently_visible === false
-              ? 'rgba(82,96,109,0.42)'
-              : '#0f766e';
-        return `
-          <circle cx="${boundary.x}" cy="${boundary.y}" r="4" fill="none" stroke="${fill}" stroke-width="1.8" opacity="0.7" />
-          <line x1="${boundary.x}" y1="${boundary.y}" x2="${p.x}" y2="${p.y}" stroke="${fill}" stroke-width="1.4" stroke-dasharray="4 4" opacity="0.5" />
-          <circle cx="${p.x}" cy="${p.y}" r="7" fill="${fill}" />
-          <text x="${p.x + 10}" y="${p.y - 10}" font-size="12" fill="#172033">${escapeHtml(frontier.frontier_id || '')}</text>
-        `;
-      }).join('');
       const manualWaypoint = lastManualWaypoint ? (() => {
         const p = project(lastManualWaypoint);
         return `
@@ -956,7 +916,6 @@ HTML_PAGE = """<!doctype html>
         ${namedPlaces}
         ${semanticEvidence}
         ${semanticPlaces}
-        ${frontiers}
         ${previewPath ? `<polyline points="${previewPath}" fill="none" stroke="#f59e0b" stroke-width="5" stroke-linecap="round" stroke-linejoin="round" stroke-dasharray="10 7" opacity="0.95" />` : ''}
         ${previewGoalMarkup}
         ${manualWaypoint}
