@@ -460,7 +460,7 @@ python -m xlerobot_playground.real_nav2_config \
   --follow-path-xy-goal-tolerance-m 0.08 \
   --local-costmap-width 2 \
   --local-costmap-height 2 \
-  --inflation-radius-m 0.16 \
+  --inflation-radius-m 0.01 \
   --inflation-cost-scaling-factor 4.0 \
   --transform-tolerance-s 0.5 \
   --progress-required-movement-radius 0.04 \
