@@ -1,5 +1,7 @@
 .venv/
 .venv-maniskill/
 __pycache__/
+.DS_Store
 artifacts/*
 build/*
+.env

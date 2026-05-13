@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig
+from xlerobot_agent.home_memory import summarize_home_memory
 from xlerobot_playground.map_editing import ManualOccupancyEdits, overlay_occupancy_payload
 
 
@@ -210,6 +211,253 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
                 if cell.get("manual_override") == "blocked"
             ]
             self.assertEqual(manual_cells, [{"x": -2.0, "y": 0.0, "state": "occupied", "manual_override": "blocked"}])
+
+    def test_approve_current_map_exports_home_memory_sidecar(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "real_xlerobot_exploration_map.json"
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=str(persist_path),
+                    occupancy_resolution=0.25,
+                )
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="house_v1",
+                source="operator",
+            )
+            map_payload = {
+                "map_id": "house_v1",
+                "frame": "map",
+                "resolution": 0.25,
+                "coverage": 0.5,
+                "summary": "approved home map",
+                "approved": False,
+                "created_at": 1.0,
+                "source": "operator",
+                "mode": "sim",
+                "robot_pose": {"x": 0.25, "y": 0.5, "yaw": 0.0},
+                "trajectory": [{"x": 0.0, "y": 0.0, "yaw": 0.0}],
+                "keyframes": [{"frame_id": "frame_1", "description": "debug-only frame"}],
+                "regions": [
+                    {
+                        "region_id": "region_kitchen",
+                        "label": "kitchen",
+                        "confidence": 0.9,
+                        "polygon_2d": [[0.0, 0.0], [2.0, 0.0], [2.0, 2.0], [0.0, 2.0]],
+                        "centroid": {"x": 1.0, "y": 1.0},
+                        "adjacency": ["region_hallway"],
+                        "representative_keyframes": ["frame_1"],
+                        "evidence": ["fridge visible"],
+                        "default_waypoints": [{"name": "kitchen_center", "x": 1.0, "y": 1.0, "yaw": 1.57}],
+                    }
+                ],
+                "named_places": [
+                    {
+                        "name": "dock",
+                        "pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+                        "region_id": "region_hallway",
+                        "source": "manual",
+                    },
+                    {
+                        "name": "fridge",
+                        "pose": {"x": 1.8, "y": 1.0, "yaw": 3.14},
+                        "region_id": "region_kitchen",
+                        "source": "manual",
+                    },
+                ],
+                "occupancy": {
+                    "resolution": 0.25,
+                    "bounds": {"min_x": 0.0, "max_x": 2.0, "min_y": 0.0, "max_y": 2.0},
+                    "cells": [{"x": 0.0, "y": 0.0, "state": "free"}],
+                },
+                "frontiers": [{"frontier_id": "debug_frontier"}],
+                "artifacts": {"decision_log": [{"decision": "debug-only"}]},
+            }
+            backend.complete_external_task(task["task_id"], map_payload=map_payload)
+            backend.update_occupancy_edits(
+                task_id=task["task_id"],
+                mode="block",
+                cells=[{"cell_x": 2, "cell_y": 2}],
+            )
+
+            approved = backend.approve_current_map()
+
+            assert approved is not None
+            home_memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            self.assertTrue(persist_path.exists())
+            self.assertTrue(home_memory_path.exists())
+            memory = json.loads(home_memory_path.read_text())
+            self.assertEqual(memory["schema_version"], "home_memory.v1")
+            self.assertEqual(memory["memory_id"], "house_v1")
+            self.assertTrue(memory["approved"])
+            self.assertEqual(memory["start_pose"]["name"], "dock")
+            self.assertEqual(memory["regions"][0]["label"], "kitchen")
+            self.assertEqual(memory["manual_occupancy_edits"]["blocked_cells"][0]["cell_x"], 2)
+            self.assertIn("fridge", {item["label"] for item in memory["objects"]})
+            self.assertIn("open_fridge", {item["skill_id"] for item in memory["skills"]})
+            self.assertIn("keyframes", memory["export_notes"]["preserved_in_map_only"])
+            self.assertIn("kitchen", summarize_home_memory(memory))
+            persisted = json.loads(persist_path.read_text())
+            self.assertEqual(persisted["current_map"]["frontiers"], [{"frontier_id": "debug_frontier"}])
+            self.assertEqual(persisted["current_map"]["keyframes"], [{"frame_id": "frame_1", "description": "debug-only frame"}])
+            self.assertIn("home_memory", persisted["current_map"]["artifacts"])
+
+    def test_set_dock_pose_sets_start_pose_and_memory_start(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "map.json"
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(mode="sim", persist_path=str(persist_path))
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="house_v1",
+            )
+            backend.complete_external_task(
+                task["task_id"],
+                map_payload={
+                    "map_id": "house_v1",
+                    "frame": "map",
+                    "resolution": 0.25,
+                    "coverage": 1.0,
+                    "summary": "dock pose map",
+                    "approved": False,
+                    "created_at": 1.0,
+                    "source": "operator",
+                    "mode": "sim",
+                    "robot_pose": {"x": 0.5, "y": 0.75, "yaw": 1.57},
+                    "trajectory": [],
+                    "keyframes": [],
+                    "regions": [
+                        {
+                            "region_id": "region_hallway",
+                            "label": "hallway",
+                            "polygon_2d": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                            "centroid": {"x": 0.5, "y": 0.5},
+                            "default_waypoints": [],
+                        }
+                    ],
+                    "named_places": [],
+                    "occupancy": {
+                        "resolution": 0.25,
+                        "bounds": {"min_x": 0.0, "max_x": 1.0, "min_y": 0.0, "max_y": 1.0},
+                        "cells": [{"x": 0.0, "y": 0.0, "state": "free"}],
+                    },
+                },
+            )
+
+            dock = backend.set_dock_pose()
+            approved = backend.approve_current_map()
+
+            assert dock is not None
+            assert approved is not None
+            self.assertEqual(dock["name"], "dock")
+            self.assertEqual(dock["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
+            self.assertEqual(approved["start_pose"]["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
+            memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            memory = json.loads(memory_path.read_text())
+            self.assertEqual(memory["start_pose"]["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
+            self.assertEqual(memory["start_pose"]["source"], "operator_dock_pose")
+
+    def test_home_memory_does_not_infer_start_pose_without_dock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "map.json"
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(mode="sim", persist_path=str(persist_path))
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="house_v1",
+            )
+            backend.complete_external_task(
+                task["task_id"],
+                map_payload={
+                    "map_id": "house_v1",
+                    "frame": "map",
+                    "resolution": 0.25,
+                    "coverage": 1.0,
+                    "summary": "map without dock",
+                    "approved": False,
+                    "created_at": 1.0,
+                    "source": "operator",
+                    "mode": "sim",
+                    "robot_pose": {"x": 0.5, "y": 0.75, "yaw": 1.57},
+                    "trajectory": [{"x": 0.0, "y": 0.0, "yaw": 0.0}],
+                    "keyframes": [],
+                    "regions": [],
+                    "named_places": [],
+                    "occupancy": {
+                        "resolution": 0.25,
+                        "bounds": {"min_x": 0.0, "max_x": 1.0, "min_y": 0.0, "max_y": 1.0},
+                        "cells": [{"x": 0.0, "y": 0.0, "state": "free"}],
+                    },
+                },
+            )
+
+            approved = backend.approve_current_map()
+
+            assert approved is not None
+            memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            memory = json.loads(memory_path.read_text())
+            self.assertIsNone(memory["start_pose"])
+
+    def test_create_region_adds_manual_polygon_and_derived_waypoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=f"{tmpdir}/map.json",
+                    occupancy_resolution=0.25,
+                )
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="manual_regions",
+                source="operator",
+            )
+            backend.complete_external_task(
+                task["task_id"],
+                map_payload={
+                    "map_id": "manual_regions",
+                    "frame": "map",
+                    "resolution": 0.25,
+                    "coverage": 0.5,
+                    "summary": "manual region map",
+                    "approved": False,
+                    "created_at": 1.0,
+                    "source": "operator",
+                    "mode": "sim",
+                    "trajectory": [],
+                    "keyframes": [],
+                    "regions": [],
+                    "named_places": [],
+                    "occupancy": {
+                        "resolution": 0.25,
+                        "bounds": {"min_x": 0.0, "max_x": 4.0, "min_y": 0.0, "max_y": 4.0},
+                        "cells": [{"x": 0.0, "y": 0.0, "state": "free"}],
+                    },
+                },
+            )
+
+            region = backend.create_region(
+                label="Kitchen Zone",
+                polygon_2d=[[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]],
+                purpose="food prep",
+            )
+
+            assert region is not None
+            self.assertTrue(region["region_id"].startswith("region_kitchen_zone_"))
+            self.assertEqual(region["label"], "Kitchen Zone")
+            self.assertEqual(region["centroid"], {"x": 1.0, "y": 0.5})
+            self.assertEqual(region["default_waypoints"][0]["name"], "kitchen_zone_center")
+            snapshot = backend.snapshot()
+            self.assertEqual(snapshot["current_map"]["regions"][0]["purpose"], "food prep")
+            self.assertIn("Kitchen_Zone_entry", {place["name"] for place in snapshot["current_map"]["named_places"]})
 
 
 if __name__ == "__main__":

@@ -1,0 +1,873 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import json
+import os
+from pathlib import Path
+import threading
+import time
+from typing import Any, Callable
+import uuid
+
+from .home_memory import (
+    HomeMemoryStore,
+    home_memory_agent_context,
+    known_home_memory_labels,
+    resolve_home_memory_target,
+    summarize_home_memory,
+)
+from .llm import AgentLLMRouter, AgentModelSuite, ModelConfig
+from .perception_service import execute_perception_tool
+
+
+EventSink = Callable[[str, str, str, dict[str, Any] | None], None]
+
+
+@dataclass(frozen=True)
+class HomeAgentModelConfig:
+    provider: str = "mock"
+    model: str = "mock"
+    base_url: str | None = None
+    api_key: str | None = None
+    temperature: float = 0.2
+    max_tokens: int = 1200
+
+
+@dataclass(frozen=True)
+class HomeAgentConfig:
+    home_memory_path: str | None = None
+    home_memory_search_roots: tuple[str, ...] = field(default_factory=tuple)
+    model: HomeAgentModelConfig = field(default_factory=HomeAgentModelConfig)
+    specialist_model: HomeAgentModelConfig | None = None
+    dry_run: bool = True
+    auto_execute_navigation: bool = False
+    require_skill_approval: bool = True
+    host: str = "127.0.0.1"
+    port: int = 8765
+    max_turns: int = 8
+
+
+@dataclass
+class HomeAgentRunRecord:
+    run_id: str
+    command: str
+    status: str = "running"
+    summary: str = ""
+    actions: list[dict[str, Any]] = field(default_factory=list)
+    memory_summary: str = ""
+    started_at: float = field(default_factory=time.time)
+    completed_at: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "command": self.command,
+            "status": self.status,
+            "summary": self.summary,
+            "actions": list(self.actions),
+            "memory_summary": self.memory_summary,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+        }
+
+
+class HomeAgentToolRuntime:
+    def __init__(
+        self,
+        *,
+        memory: dict[str, Any] | None,
+        config: HomeAgentConfig,
+        emit: EventSink,
+    ) -> None:
+        self.memory = memory or {}
+        self.config = config
+        self.emit = emit
+        self.current_pose = self._initial_pose()
+        self.stopped = False
+
+    def preview_path_to_pose(
+        self,
+        *,
+        target_label: str,
+        pose: dict[str, Any],
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        result = {
+            "tool": "preview_path_to_pose",
+            "status": "succeeded",
+            "target_label": target_label,
+            "goal_pose": _json_pose(pose),
+            "path": self._straight_line_path(pose),
+            "constraints": constraints or {},
+            "planner": "nav2_preview_placeholder",
+            "dry_run": True,
+        }
+        self.emit(
+            "tool_executed",
+            "Path Preview",
+            f"Prepared a navigation preview toward `{target_label}`.",
+            result,
+        )
+        return result
+
+    def navigate_to_pose(
+        self,
+        *,
+        target_label: str,
+        pose: dict[str, Any],
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        dry_run = bool(self.config.dry_run)
+        result = {
+            "tool": "navigate_to_pose",
+            "status": "dry_run" if dry_run else "accepted",
+            "target_label": target_label,
+            "goal_pose": _json_pose(pose),
+            "constraints": constraints or {},
+            "nav_backend": "nav2_placeholder",
+            "dry_run": dry_run,
+        }
+        if not dry_run:
+            self.current_pose = dict(result["goal_pose"])
+        self.emit(
+            "tool_executed",
+            "Navigation Goal",
+            (
+                f"Prepared a dry-run Nav2 goal for `{target_label}`."
+                if dry_run
+                else f"Accepted a Nav2 goal for `{target_label}`."
+            ),
+            result,
+        )
+        return result
+
+    def perceive_scene(self, *, target_label: str = "") -> dict[str, Any]:
+        world_state = {
+            "current_task": "home_agent_perception",
+            "current_pose": self.current_pose,
+            "metadata": {"home_memory": home_memory_agent_context(self.memory) if self.memory else {}},
+        }
+        payload = execute_perception_tool(
+            "perceive_scene",
+            context={
+                "world_state": world_state,
+                "payload": {"target": target_label},
+                "subgoal": {"text": f"perceive {target_label}".strip(), "kind": "search", "target": target_label},
+            },
+            brain=None,
+        )
+        self.emit(
+            "tool_executed",
+            "Perception",
+            f"Refreshed scene perception{f' for `{target_label}`' if target_label else ''}.",
+            payload,
+        )
+        return payload
+
+    def analyze_embodied_scene(self, *, target_label: str = "", question: str = "") -> dict[str, Any]:
+        model = self.config.specialist_model
+        if model is None:
+            result = {
+                "tool": "analyze_embodied_scene",
+                "status": "unavailable",
+                "target_label": target_label,
+                "question": question,
+                "reason": "no specialist embodied-reasoning model configured",
+            }
+            self.emit(
+                "specialist_unavailable",
+                "Specialist Unavailable",
+                "No embodied-reasoning specialist model is configured.",
+                result,
+            )
+            return result
+        if model.provider == "mock":
+            result = {
+                "tool": "analyze_embodied_scene",
+                "status": "succeeded",
+                "target_label": target_label,
+                "question": question,
+                "analysis": "Mock specialist: use long-term approach pose, refresh RGB-D locally, then verify reachability before skill execution.",
+                "confidence": 0.5,
+            }
+            self.emit("specialist_result", "Embodied Reasoning", result["analysis"], result)
+            return result
+
+        router_config = _llm_model_config(model)
+        router = AgentLLMRouter(
+            AgentModelSuite(planner=router_config, critic=router_config, coder=router_config)
+        )
+        prompt = json.dumps(
+            {
+                "target_label": target_label,
+                "question": question,
+                "current_pose": self.current_pose,
+                "home_memory_context": home_memory_agent_context(self.memory) if self.memory else {},
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        parsed, trace = router.complete_json_prompt(
+            config=router_config,
+            system_prompt=(
+                "You are a robotics embodied-reasoning specialist. "
+                "Analyze physical/spatial feasibility for a household robot. "
+                "Return JSON only with keys: analysis, confidence, suggested_next_tool, risks."
+            ),
+            user_prompt=prompt,
+        )
+        if parsed is None:
+            result = {
+                "tool": "analyze_embodied_scene",
+                "status": "failed",
+                "target_label": target_label,
+                "question": question,
+                "error": trace.error,
+            }
+            self.emit("specialist_failed", "Specialist Failed", trace.error or "Specialist call failed.", result)
+            return result
+        result = {
+            "tool": "analyze_embodied_scene",
+            "status": "succeeded",
+            "target_label": target_label,
+            "question": question,
+            "analysis": str(parsed.get("analysis", "")),
+            "confidence": parsed.get("confidence"),
+            "suggested_next_tool": parsed.get("suggested_next_tool"),
+            "risks": parsed.get("risks", []),
+        }
+        self.emit("specialist_result", "Embodied Reasoning", result["analysis"], result)
+        return result
+
+    def run_skill(
+        self,
+        *,
+        skill_id: str,
+        target_label: str = "",
+        constraints: dict[str, Any] | None = None,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        skill = self._skill(skill_id)
+        if skill is None:
+            result = {
+                "tool": "run_skill",
+                "status": "blocked",
+                "skill_id": skill_id,
+                "target_label": target_label,
+                "reason": "skill_not_registered_in_home_memory",
+            }
+            self.emit("tool_blocked", "Skill Blocked", f"`{skill_id}` is not registered yet.", result)
+            return result
+        requires_approval = bool((skill.get("safety") or {}).get("requires_human_approval", False))
+        if self.config.require_skill_approval and requires_approval and not approved:
+            result = {
+                "tool": "run_skill",
+                "status": "approval_required",
+                "skill_id": skill_id,
+                "target_label": target_label,
+                "constraints": constraints or {},
+                "reason": "first manipulation/specialized skill attempts require operator approval",
+            }
+            self.emit(
+                "approval_required",
+                "Approval Required",
+                f"`{skill_id}` is ready to be invoked, but needs operator approval first.",
+                result,
+            )
+            return result
+        result = {
+            "tool": "run_skill",
+            "status": "dry_run" if self.config.dry_run else "accepted",
+            "skill_id": skill_id,
+            "target_label": target_label,
+            "constraints": constraints or {},
+            "executor": skill.get("executor_binding", "vla_skill_runner"),
+            "dry_run": bool(self.config.dry_run),
+        }
+        self.emit("tool_executed", "Skill", f"Prepared `{skill_id}` for `{target_label}`.", result)
+        return result
+
+    def ask_human_approval(self, *, reason: str, action: dict[str, Any] | None = None) -> dict[str, Any]:
+        result = {
+            "tool": "ask_human_approval",
+            "status": "pending",
+            "reason": reason,
+            "action": action or {},
+        }
+        self.emit("approval_required", "Approval Requested", reason, result)
+        return result
+
+    def stop_robot(self, *, reason: str = "") -> dict[str, Any]:
+        self.stopped = True
+        result = {
+            "tool": "stop_robot",
+            "status": "accepted",
+            "reason": reason or "operator_or_agent_requested_stop",
+        }
+        self.emit("tool_executed", "Stop", "Stop request accepted by the home agent runtime.", result)
+        return result
+
+    def _initial_pose(self) -> dict[str, Any]:
+        start = self.memory.get("start_pose") if isinstance(self.memory, dict) else None
+        if isinstance(start, dict) and isinstance(start.get("pose"), dict):
+            return _json_pose(start["pose"])
+        return {"x": 0.0, "y": 0.0, "yaw": 0.0}
+
+    def _straight_line_path(self, pose: dict[str, Any]) -> list[dict[str, float]]:
+        return [dict(self.current_pose), _json_pose(pose)]
+
+    def _skill(self, skill_id: str) -> dict[str, Any] | None:
+        for skill in self.memory.get("skills", []):
+            if isinstance(skill, dict) and skill.get("skill_id") == skill_id:
+                return skill
+        return None
+
+
+class HomeTaskAgent:
+    def __init__(self, config: HomeAgentConfig, emit: EventSink | None = None) -> None:
+        self.config = config
+        self.emit = emit or (lambda kind, title, summary, details=None: None)
+
+    def run(self, command: str) -> HomeAgentRunRecord:
+        memory = self._load_memory()
+        record = HomeAgentRunRecord(
+            run_id=f"home_agent_{uuid.uuid4().hex[:10]}",
+            command=command,
+            memory_summary=summarize_home_memory(memory) if memory else "No home memory loaded.",
+        )
+        self.emit("session_started", "Run Started", f"Started HomeTaskAgent for `{command}`.", record.to_dict())
+        runtime = HomeAgentToolRuntime(memory=memory, config=self.config, emit=self._recording_emit(record))
+        try:
+            if self.config.model.provider == "mock":
+                self._run_deterministic(command, memory, runtime, record)
+            else:
+                self._run_agents_sdk(command, memory, runtime, record)
+            if record.status == "running":
+                record.status = "completed"
+        except Exception as exc:
+            record.status = "failed"
+            record.summary = f"HomeTaskAgent failed: {exc}"
+            self.emit("session_failed", "Run Failed", record.summary, {"error": str(exc)})
+        record.completed_at = time.time()
+        self.emit("session_finished", "Run Finished", record.summary or record.status, record.to_dict())
+        return record
+
+    def _load_memory(self) -> dict[str, Any] | None:
+        path = resolve_home_memory_path(self.config)
+        if path is None:
+            return None
+        return HomeMemoryStore(path).load()
+
+    def _recording_emit(self, record: HomeAgentRunRecord) -> EventSink:
+        def emit(kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
+            if details and details.get("tool"):
+                record.actions.append(dict(details))
+            self.emit(kind, title, summary, details)
+
+        return emit
+
+    def _run_deterministic(
+        self,
+        command: str,
+        memory: dict[str, Any] | None,
+        runtime: HomeAgentToolRuntime,
+        record: HomeAgentRunRecord,
+    ) -> None:
+        if not memory:
+            record.status = "blocked"
+            record.summary = "No home memory path is configured, so the agent cannot resolve places yet."
+            self.emit("agent_blocked", "Missing Memory", record.summary, {})
+            return
+        if "stop" in command.lower():
+            runtime.stop_robot(reason=command)
+            record.summary = "Stop request handled."
+            return
+
+        target = self._target_from_command(command, memory)
+        skill_id = self._skill_from_command(command, memory)
+        if target is None:
+            labels = ", ".join(known_home_memory_labels(memory)) or "none"
+            record.status = "blocked"
+            record.summary = f"I could not match the command to a known home-memory target. Known labels: {labels}."
+            self.emit("agent_blocked", "Target Not Found", record.summary, {"known_labels": known_home_memory_labels(memory)})
+            return
+
+        self.emit("memory_resolved", "Memory Target", f"Resolved `{target['label']}` from home memory.", target)
+        if skill_id:
+            nav = self._navigation_call(runtime, target)
+            scene = runtime.perceive_scene(target_label=str(target["label"]))
+            skill = runtime.run_skill(skill_id=skill_id, target_label=str(target["label"]))
+            record.summary = (
+                f"Resolved `{target['label']}`, prepared navigation, refreshed perception, "
+                f"and staged `{skill_id}` with status `{skill.get('status')}`."
+            )
+            return
+
+        result = self._navigation_call(runtime, target)
+        record.summary = f"Resolved `{target['label']}` and prepared `{result['tool']}`."
+
+    def _run_agents_sdk(
+        self,
+        command: str,
+        memory: dict[str, Any] | None,
+        runtime: HomeAgentToolRuntime,
+        record: HomeAgentRunRecord,
+    ) -> None:
+        try:
+            from agents import Agent, ModelSettings, Runner, function_tool
+        except ImportError as exc:
+            raise RuntimeError("OpenAI Agents SDK is not installed") from exc
+
+        @function_tool
+        def preview_path_to_pose(target_label: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
+            """Preview a Nav2 path to a concrete map pose."""
+            return json.dumps(
+                runtime.preview_path_to_pose(
+                    target_label=target_label,
+                    pose={"x": x, "y": y, "yaw": yaw},
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def navigate_to_pose(target_label: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
+            """Send a concrete map pose to Nav2, or dry-run it when the backend is in dry-run mode."""
+            return json.dumps(
+                runtime.navigate_to_pose(
+                    target_label=target_label,
+                    pose={"x": x, "y": y, "yaw": yaw},
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def perceive_scene(target_label: str = "") -> str:
+            """Refresh short-term RGB-D scene understanding for the current robot pose."""
+            return json.dumps(runtime.perceive_scene(target_label=target_label))
+
+        @function_tool
+        def analyze_embodied_scene(target_label: str = "", question: str = "") -> str:
+            """Ask the optional embodied-reasoning specialist about physical scene feasibility."""
+            return json.dumps(runtime.analyze_embodied_scene(target_label=target_label, question=question))
+
+        @function_tool
+        def run_skill(skill_id: str, target_label: str = "", constraints_json: str = "{}", approved: bool = False) -> str:
+            """Invoke a registered scripted/VLA skill, subject to safety approval."""
+            return json.dumps(
+                runtime.run_skill(
+                    skill_id=skill_id,
+                    target_label=target_label,
+                    constraints=_loads_object(constraints_json),
+                    approved=approved,
+                )
+            )
+
+        @function_tool
+        def ask_human_approval(reason: str, action_json: str = "{}") -> str:
+            """Request operator approval before uncertain navigation or manipulation."""
+            return json.dumps(runtime.ask_human_approval(reason=reason, action=_loads_object(action_json)))
+
+        @function_tool
+        def stop_robot(reason: str = "") -> str:
+            """Stop robot motion or decline unsafe work."""
+            return json.dumps(runtime.stop_robot(reason=reason))
+
+        agent = Agent(
+            name="HomeTaskAgent",
+            instructions=self._agent_instructions(memory),
+            model=self._sdk_model(),
+            model_settings=ModelSettings(
+                temperature=self.config.model.temperature,
+                max_tokens=self.config.model.max_tokens,
+            ),
+            tools=[
+                preview_path_to_pose,
+                navigate_to_pose,
+                perceive_scene,
+                analyze_embodied_scene,
+                run_skill,
+                ask_human_approval,
+                stop_robot,
+            ],
+        )
+        result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
+        record.summary = str(getattr(result, "final_output", "") or "Agent run completed.").strip()
+
+    def _agent_instructions(self, memory: dict[str, Any] | None) -> str:
+        context = home_memory_agent_context(memory) if memory else {}
+        specialist = None
+        if self.config.specialist_model is not None:
+            specialist = {
+                "provider": self.config.specialist_model.provider,
+                "model": self.config.specialist_model.model,
+                "role": "specialist embodied visual/spatial reasoning, not the main planner",
+            }
+        return "\n".join(
+            [
+                "You are Robot42's HomeTaskAgent.",
+                "You receive the full long-term home memory in context. Do not call memory lookup tools.",
+                "Only call tools when you need robot action, Nav2 path/goal handling, perception, skill execution, approval, or stop.",
+                "For place navigation, choose a concrete pose from a region default waypoint, named place, or object approach pose.",
+                "If navigation is not explicitly allowed by the backend, navigate_to_pose returns a dry-run goal; that is acceptable for early tests.",
+                "For manipulation or VLA/scripted skills, perceive first and ask for approval when uncertain or when the tool reports approval_required.",
+                "Use analyze_embodied_scene only for physical/spatial uncertainty where a robotics specialist model is configured.",
+                "Return a concise final summary of what was prepared or executed.",
+                "",
+                "Backend settings:",
+                json.dumps(
+                    {
+                        "dry_run": self.config.dry_run,
+                        "auto_execute_navigation": self.config.auto_execute_navigation,
+                        "require_skill_approval": self.config.require_skill_approval,
+                        "specialist_model": specialist,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                ),
+                "",
+                "Long-term home memory context:",
+                json.dumps(context, indent=2, sort_keys=True),
+            ]
+        )
+
+    def _sdk_model(self) -> Any:
+        provider = self.config.model.provider
+        if provider == "litellm":
+            from agents.extensions.models.litellm_model import LitellmModel
+
+            return LitellmModel(
+                model=self.config.model.model,
+                base_url=self.config.model.base_url,
+                api_key=self.config.model.api_key,
+            )
+        if provider == "openai-compatible":
+            from agents import OpenAIChatCompletionsModel
+            from openai import AsyncOpenAI
+
+            if not self.config.model.base_url:
+                raise ValueError("openai-compatible model provider requires base_url")
+            client = AsyncOpenAI(
+                base_url=self.config.model.base_url,
+                api_key=self.config.model.api_key or "not-needed",
+            )
+            return OpenAIChatCompletionsModel(model=self.config.model.model, openai_client=client)
+        return self.config.model.model
+
+    def _target_from_command(self, command: str, memory: dict[str, Any]) -> dict[str, Any] | None:
+        labels = sorted(known_home_memory_labels(memory), key=len, reverse=True)
+        command_key = command.lower().replace("_", " ")
+        for label in labels:
+            if label.lower().replace("_", " ") in command_key:
+                return resolve_home_memory_target(memory, label)
+        return resolve_home_memory_target(memory, command)
+
+    def _skill_from_command(self, command: str, memory: dict[str, Any]) -> str | None:
+        normalized = command.lower().replace("_", " ")
+        skills = [skill for skill in memory.get("skills", []) if isinstance(skill, dict)]
+        for skill in skills:
+            skill_id = str(skill.get("skill_id") or "")
+            if skill_id and skill_id.replace("_", " ") in normalized:
+                return skill_id
+        if "open" in normalized and "fridge" in normalized:
+            return "open_fridge"
+        if ("inspect" in normalized or "what" in normalized) and "fridge" in normalized:
+            return "inspect_fridge_contents"
+        if "pick" in normalized and ("can" in normalized or "coke" in normalized):
+            return "pick_can"
+        if "place" in normalized:
+            return "place_item"
+        return None
+
+    def _navigation_call(self, runtime: HomeAgentToolRuntime, target: dict[str, Any]) -> dict[str, Any]:
+        pose = target.get("pose") or {}
+        label = str(target.get("label") or "target")
+        if self.config.auto_execute_navigation:
+            return runtime.navigate_to_pose(target_label=label, pose=pose)
+        return runtime.preview_path_to_pose(target_label=label, pose=pose)
+
+
+class HomeAgentController:
+    def __init__(self, agent: HomeTaskAgent, config: HomeAgentConfig) -> None:
+        self.agent = agent
+        self.config = config
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        self._status = "idle"
+        self._events: list[dict[str, Any]] = []
+        self._record: HomeAgentRunRecord | None = None
+        self._paused = False
+
+    @classmethod
+    def from_config(cls, config: HomeAgentConfig) -> "HomeAgentController":
+        controller: HomeAgentController | None = None
+
+        def emit(kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
+            if controller is not None:
+                controller.emit(kind, title, summary, details)
+
+        agent = HomeTaskAgent(config, emit=emit)
+        controller = cls(agent, config)
+        return controller
+
+    def start(self, command: str) -> bool:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return False
+            self._events = []
+            self._record = None
+            self._status = "running"
+            self._thread = threading.Thread(target=self._run, args=(command,), daemon=True)
+            self._thread.start()
+            return True
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+            self.emit("paused", "Paused", "Pause requested. Long-running robot calls should honor this.", {})
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = False
+            self.emit("resumed", "Resumed", "Resume requested.", {})
+
+    def stop(self) -> None:
+        with self._lock:
+            self._status = "stopped"
+            self.emit("stop_requested", "Stop Requested", "Operator requested stop.", {})
+
+    def emit(self, kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
+        event = {
+            "kind": kind,
+            "title": title,
+            "summary": summary,
+            "details": details or {},
+            "timestamp": _timestamp(),
+        }
+        with self._lock:
+            self._events.append(event)
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            memory = self._safe_memory()
+            memory_path = resolve_home_memory_path(self.config)
+            record = self._record.to_dict() if self._record is not None else None
+            return {
+                "status": self._status,
+                "backend": "home_agent",
+                "paused": self._paused,
+                "models": {
+                    "main": self.config.model.__dict__,
+                    "specialist": self.config.specialist_model.__dict__ if self.config.specialist_model else None,
+                },
+                "home_memory": {
+                    "path": str(memory_path) if memory_path is not None else self.config.home_memory_path,
+                    "summary": summarize_home_memory(memory) if memory else "No home memory loaded.",
+                    "context": home_memory_agent_context(memory) if memory else {},
+                },
+                "record": record,
+                "plan": record or {},
+                "report": {"events": list(self._events)},
+                "events": list(self._events),
+            }
+
+    def _run(self, command: str) -> None:
+        record = self.agent.run(command)
+        with self._lock:
+            self._record = record
+            if self._status != "stopped":
+                self._status = record.status
+
+    def _safe_memory(self) -> dict[str, Any] | None:
+        path = resolve_home_memory_path(self.config)
+        if path is None:
+            return None
+        try:
+            return HomeMemoryStore(path).load()
+        except Exception:
+            return None
+
+
+class HomeAgentServer:
+    def __init__(self, controller: HomeAgentController, *, host: str = "127.0.0.1", port: int = 8765) -> None:
+        self.controller = controller
+        self.host = host
+        self.port = port
+        self._server: ThreadingHTTPServer | None = None
+
+    def serve_forever(self) -> None:
+        controller = self.controller
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/api/state":
+                    self._send_json(controller.snapshot())
+                    return
+                if self.path == "/" or self.path == "/index.html":
+                    self._send_json({"service": "Robot42 HomeAgent", "state": "/api/state"})
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+            def do_POST(self) -> None:
+                payload = self._read_json_body()
+                if self.path == "/api/start":
+                    command = str(payload.get("command") or "").strip()
+                    if not command:
+                        self.send_error(HTTPStatus.BAD_REQUEST, "command is required")
+                        return
+                    accepted = controller.start(command)
+                    if not accepted:
+                        self.send_error(HTTPStatus.CONFLICT, "an agent run is already active")
+                        return
+                    self._send_json({"status": "started"})
+                    return
+                if self.path == "/api/pause":
+                    controller.pause()
+                    self._send_json({"status": "paused"})
+                    return
+                if self.path == "/api/resume":
+                    controller.resume()
+                    self._send_json({"status": "running"})
+                    return
+                if self.path == "/api/stop":
+                    controller.stop()
+                    self._send_json({"status": "stopping"})
+                    return
+                self.send_error(HTTPStatus.NOT_FOUND, "not found")
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+            def _read_json_body(self) -> dict[str, Any]:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length == 0:
+                    return {}
+                return json.loads(self.rfile.read(length).decode("utf-8"))
+
+            def _send_json(self, payload: dict[str, Any]) -> None:
+                encoded = json.dumps(payload, indent=2, sort_keys=True).encode("utf-8")
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        self._server = ThreadingHTTPServer((self.host, self.port), Handler)
+        self._server.serve_forever()
+
+    def shutdown(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+
+
+def config_from_env() -> HomeAgentConfig:
+    provider = os.getenv("ROBOT42_AGENT_PROVIDER", "mock")
+    model = os.getenv("ROBOT42_AGENT_MODEL", "mock" if provider == "mock" else "gpt-5.5")
+    specialist_provider = os.getenv("ROBOT42_SPECIALIST_PROVIDER")
+    specialist_model = os.getenv("ROBOT42_SPECIALIST_MODEL")
+    specialist = None
+    if specialist_provider and specialist_model:
+        specialist = HomeAgentModelConfig(
+            provider=specialist_provider,
+            model=specialist_model,
+            base_url=os.getenv("ROBOT42_SPECIALIST_BASE_URL"),
+            api_key=os.getenv("ROBOT42_SPECIALIST_API_KEY"),
+        )
+    return HomeAgentConfig(
+        home_memory_path=os.getenv("ROBOT42_HOME_MEMORY_PATH"),
+        home_memory_search_roots=_search_roots_from_env(),
+        model=HomeAgentModelConfig(
+            provider=provider,
+            model=model,
+            base_url=os.getenv("ROBOT42_AGENT_BASE_URL"),
+            api_key=os.getenv("ROBOT42_AGENT_API_KEY") or os.getenv("OPENAI_API_KEY"),
+            temperature=float(os.getenv("ROBOT42_AGENT_TEMPERATURE", "0.2")),
+            max_tokens=int(os.getenv("ROBOT42_AGENT_MAX_TOKENS", "1200")),
+        ),
+        specialist_model=specialist,
+        dry_run=_env_bool("ROBOT42_AGENT_DRY_RUN", True),
+        auto_execute_navigation=_env_bool("ROBOT42_AGENT_AUTO_NAV", False),
+        require_skill_approval=_env_bool("ROBOT42_AGENT_REQUIRE_SKILL_APPROVAL", True),
+        host=os.getenv("ROBOT42_AGENT_HOST", "127.0.0.1"),
+        port=int(os.getenv("ROBOT42_AGENT_PORT", "8765")),
+    )
+
+
+def resolve_home_memory_path(config: HomeAgentConfig) -> Path | None:
+    if config.home_memory_path:
+        path = Path(config.home_memory_path)
+        if path.exists():
+            return path
+    return discover_latest_home_memory_path(config.home_memory_search_roots)
+
+
+def discover_latest_home_memory_path(search_roots: tuple[str, ...] = tuple()) -> Path | None:
+    roots = [Path(item).expanduser() for item in search_roots if item]
+    if not roots:
+        roots = [Path.cwd()]
+    candidates: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        if root.is_file() and root.name.endswith(".home_memory.json"):
+            candidates.append(root)
+            continue
+        direct_home_memory = root / "home_memory"
+        if direct_home_memory.exists():
+            candidates.extend(direct_home_memory.glob("*.home_memory.json"))
+        candidates.extend(path for path in root.rglob("*.home_memory.json") if "home_memory" in path.parts)
+    existing = [path for path in set(candidates) if path.exists()]
+    if not existing:
+        return None
+    return max(existing, key=lambda path: path.stat().st_mtime)
+
+
+def _search_roots_from_env() -> tuple[str, ...]:
+    value = os.getenv("ROBOT42_HOME_MEMORY_SEARCH_ROOTS", "")
+    if not value.strip():
+        return tuple()
+    return tuple(item.strip() for item in value.split(":") if item.strip())
+
+
+def _json_pose(pose: dict[str, Any]) -> dict[str, float]:
+    return {
+        "x": round(float(pose.get("x", 0.0) or 0.0), 3),
+        "y": round(float(pose.get("y", 0.0) or 0.0), 3),
+        "yaw": round(float(pose.get("yaw", 0.0) or 0.0), 3),
+    }
+
+
+def _loads_object(payload: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(payload or "{}")
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _llm_model_config(config: HomeAgentModelConfig) -> ModelConfig:
+    provider = config.provider
+    base_url = config.base_url
+    if provider == "openai":
+        provider = "openai-compatible"
+        base_url = base_url or "https://api.openai.com/v1/chat/completions"
+    return ModelConfig(
+        provider=provider,
+        model=config.model,
+        base_url=base_url,
+        api_key=config.api_key,
+        temperature=config.temperature,
+        max_tokens=config.max_tokens,
+    )
+
+
+def _timestamp() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}

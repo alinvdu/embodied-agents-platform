@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import argparse
+from dataclasses import replace
+from pathlib import Path
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from xlerobot_agent.home_agent import (
+    HomeAgentConfig,
+    HomeAgentController,
+    HomeAgentModelConfig,
+    HomeAgentServer,
+    config_from_env,
+    resolve_home_memory_path,
+)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the Robot42 HomeTaskAgent backend for the React UI.")
+    parser.add_argument("--home-memory-path", default=None)
+    parser.add_argument("--host", default=None)
+    parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--provider", choices=("mock", "openai", "openai-compatible", "litellm"), default=None)
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--base-url", default=None)
+    parser.add_argument("--api-key", default=None)
+    parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
+    parser.add_argument("--specialist-model", default=None)
+    parser.add_argument("--specialist-base-url", default=None)
+    parser.add_argument("--specialist-api-key", default=None)
+    parser.add_argument("--execute-navigation", action="store_true")
+    parser.add_argument("--live-tools", action="store_true", help="Disable dry-run mode for navigation/skill tool calls.")
+    parser.add_argument("--allow-skills-without-approval", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    config = _merge_args(config_from_env(), args)
+    controller = HomeAgentController.from_config(config)
+    server = HomeAgentServer(controller, host=config.host, port=config.port)
+    print(f"Robot42 HomeTaskAgent backend: http://{config.host}:{config.port}")
+    resolved_memory = resolve_home_memory_path(config)
+    if resolved_memory is not None:
+        print(f"Home memory: {resolved_memory}")
+    elif config.home_memory_path:
+        print(f"Home memory: {config.home_memory_path} (not found yet)")
+    else:
+        print("Home memory: auto-discovery enabled, none found yet")
+    print(f"Main model: {config.model.provider}/{config.model.model}")
+    if config.specialist_model:
+        print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
+    print(f"Dry run: {config.dry_run}")
+    server.serve_forever()
+    return 0
+
+
+def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentConfig:
+    model = config.model
+    if args.provider or args.model or args.base_url or args.api_key:
+        model = replace(
+            model,
+            provider=args.provider or model.provider,
+            model=args.model or model.model,
+            base_url=args.base_url if args.base_url is not None else model.base_url,
+            api_key=args.api_key if args.api_key is not None else model.api_key,
+        )
+    specialist = config.specialist_model
+    if args.specialist_provider and args.specialist_model:
+        specialist = HomeAgentModelConfig(
+            provider=args.specialist_provider,
+            model=args.specialist_model,
+            base_url=args.specialist_base_url,
+            api_key=args.specialist_api_key,
+        )
+    return replace(
+        config,
+        home_memory_path=args.home_memory_path or config.home_memory_path,
+        home_memory_search_roots=config.home_memory_search_roots,
+        host=args.host or config.host,
+        port=args.port or config.port,
+        model=model,
+        specialist_model=specialist,
+        dry_run=False if args.live_tools else config.dry_run,
+        auto_execute_navigation=True if args.execute_navigation else config.auto_execute_navigation,
+        require_skill_approval=False if args.allow_skills_without_approval else config.require_skill_approval,
+    )
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -39,6 +39,17 @@ class ExplorationUIController(Protocol):
     ) -> dict[str, Any] | None:
         ...
 
+    def create_region(
+        self,
+        *,
+        label: str,
+        polygon_2d: list[list[float]],
+        default_waypoints: list[dict[str, Any]] | None = None,
+        region_id: str | None = None,
+        purpose: str | None = None,
+    ) -> dict[str, Any] | None:
+        ...
+
     def merge_regions(self, region_ids: list[str], *, new_label: str | None = None) -> dict[str, Any] | None:
         ...
 
@@ -46,6 +57,9 @@ class ExplorationUIController(Protocol):
         ...
 
     def set_named_place(self, *, name: str, pose: dict[str, Any], region_id: str | None = None) -> dict[str, Any] | None:
+        ...
+
+    def set_dock_pose(self, *, pose: dict[str, Any] | None = None) -> dict[str, Any] | None:
         ...
 
     def approve_map(self) -> dict[str, Any] | None:
@@ -117,6 +131,23 @@ class LocalExplorationUIController:
             default_waypoints=default_waypoints,
         )
 
+    def create_region(
+        self,
+        *,
+        label: str,
+        polygon_2d: list[list[float]],
+        default_waypoints: list[dict[str, Any]] | None = None,
+        region_id: str | None = None,
+        purpose: str | None = None,
+    ) -> dict[str, Any] | None:
+        return self.backend.create_region(
+            label=label,
+            polygon_2d=polygon_2d,
+            default_waypoints=default_waypoints,
+            region_id=region_id,
+            purpose=purpose,
+        )
+
     def merge_regions(self, region_ids: list[str], *, new_label: str | None = None) -> dict[str, Any] | None:
         return self.backend.merge_regions(region_ids, new_label=new_label)
 
@@ -125,6 +156,9 @@ class LocalExplorationUIController:
 
     def set_named_place(self, *, name: str, pose: dict[str, Any], region_id: str | None = None) -> dict[str, Any] | None:
         return self.backend.set_named_place(name, pose, region_id=region_id)
+
+    def set_dock_pose(self, *, pose: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        return self.backend.set_dock_pose(pose)
 
     def approve_map(self) -> dict[str, Any] | None:
         return self.backend.approve_current_map()
@@ -192,6 +226,17 @@ class RemoteExplorationUIController:
             default_waypoints=default_waypoints,
         )
 
+    def create_region(
+        self,
+        *,
+        label: str,
+        polygon_2d: list[list[float]],
+        default_waypoints: list[dict[str, Any]] | None = None,
+        region_id: str | None = None,
+        purpose: str | None = None,
+    ) -> dict[str, Any] | None:
+        return {"status": "unavailable", "reason": "Remote region creation is not implemented yet."}
+
     def merge_regions(self, region_ids: list[str], *, new_label: str | None = None) -> dict[str, Any] | None:
         return self.client.merge_mapping_regions(region_ids, new_label=new_label)
 
@@ -200,6 +245,9 @@ class RemoteExplorationUIController:
 
     def set_named_place(self, *, name: str, pose: dict[str, Any], region_id: str | None = None) -> dict[str, Any] | None:
         return self.client.set_named_place(name=name, pose=pose, region_id=region_id)
+
+    def set_dock_pose(self, *, pose: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        return {"status": "unavailable", "reason": "Remote dock pose editing is not implemented yet."}
 
     def approve_map(self) -> dict[str, Any] | None:
         return self.client.approve_mapping_map()
@@ -1269,6 +1317,16 @@ class ExplorationReviewServer:
                     )
                     self._send_json(response or {"status": "missing"})
                     return
+                if self.path == "/api/region/create":
+                    response = controller.create_region(
+                        label=str(payload.get("label", "region")),
+                        polygon_2d=list(payload.get("polygon_2d", [])),
+                        default_waypoints=payload.get("default_waypoints"),
+                        region_id=payload.get("region_id"),
+                        purpose=payload.get("purpose"),
+                    )
+                    self._send_json(response or {"status": "missing"})
+                    return
                 if self.path == "/api/region/split":
                     response = controller.split_region(
                         str(payload.get("region_id")),
@@ -1288,6 +1346,13 @@ class ExplorationReviewServer:
                         name=str(payload.get("name")),
                         pose=dict(payload.get("pose", {})),
                         region_id=payload.get("region_id"),
+                    )
+                    self._send_json(response or {"status": "missing"})
+                    return
+                if self.path == "/api/dock_pose":
+                    pose = payload.get("pose")
+                    response = controller.set_dock_pose(
+                        pose=dict(pose) if isinstance(pose, dict) else None,
                     )
                     self._send_json(response or {"status": "missing"})
                     return

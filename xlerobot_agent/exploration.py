@@ -12,6 +12,7 @@ from typing import Any, Protocol
 import uuid
 
 from .models import ExecutionStatus
+from .home_memory import HomeMemoryStore, default_home_memory_path_for_map_path
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ class MapStore(Protocol):
 class ExplorationBackendConfig:
     mode: str = "sim"
     persist_path: str | None = None
+    home_memory_path: str | None = None
+    export_home_memory_on_approve: bool = True
     restore_persisted_state: bool = True
     step_interval_s: float = 0.05
     occupancy_resolution: float = 0.5
@@ -271,6 +274,9 @@ class ExplorationBackend:
         self._manual_occupancy_edits: dict[str, dict[str, Any]] = {}
         self._map_store: FileMapStore | None = (
             FileMapStore(self.config.persist_path) if self.config.persist_path is not None else None
+        )
+        self._home_memory_store: HomeMemoryStore | None = (
+            HomeMemoryStore(Path(self.config.home_memory_path)) if self.config.home_memory_path else None
         )
         if self.config.restore_persisted_state:
             self._restore()
@@ -466,8 +472,25 @@ class ExplorationBackend:
             self._current_map["approved"] = True
             self._current_map["approved_at"] = time.time()
             self._maps[self._current_map["map_id"]] = json.loads(json.dumps(self._current_map))
+            self._export_home_memory_on_approve()
             self._persist()
             return json.loads(json.dumps(self._current_map))
+
+    def set_dock_pose(self, pose: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            if self._current_map is None:
+                return None
+            resolved_pose = _json_pose(pose or self._current_robot_pose())
+            start_pose = {
+                "name": "dock",
+                "pose": resolved_pose,
+                "fixed": True,
+                "source": "operator_dock_pose",
+            }
+            self._current_map["start_pose"] = start_pose
+            self.set_named_place("dock", resolved_pose, region_id=_region_id_for_pose(self._current_map, resolved_pose))
+            self._persist()
+            return json.loads(json.dumps(start_pose))
 
     def update_region(
         self,
@@ -491,6 +514,48 @@ class ExplorationBackend:
             self._rebuild_named_places()
             self._persist()
             return json.loads(json.dumps(region))
+
+    def create_region(
+        self,
+        *,
+        label: str,
+        polygon_2d: list[list[float]],
+        default_waypoints: list[dict[str, Any]] | None = None,
+        region_id: str | None = None,
+        purpose: str | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            if self._current_map is None:
+                return None
+            cleaned_polygon = [[float(x), float(y)] for x, y in polygon_2d]
+            if len(cleaned_polygon) < 3:
+                return None
+            normalized_label = str(label or "region").strip() or "region"
+            centroid = _polygon_centroid(cleaned_polygon)
+            created = {
+                "region_id": region_id or f"region_{_slug(normalized_label)}_{uuid.uuid4().hex[:6]}",
+                "label": normalized_label,
+                "confidence": 1.0,
+                "polygon_2d": cleaned_polygon,
+                "centroid": centroid,
+                "adjacency": [],
+                "representative_keyframes": [],
+                "evidence": ["manual region annotation"],
+                "default_waypoints": [_json_pose(item) for item in default_waypoints]
+                if default_waypoints is not None
+                else [
+                    {
+                        "name": f"{_slug(normalized_label)}_center",
+                        **_json_pose({"x": centroid["x"], "y": centroid["y"], "yaw": 0.0}),
+                    }
+                ],
+            }
+            if purpose:
+                created["purpose"] = str(purpose)
+            self._current_map.setdefault("regions", []).append(created)
+            self._rebuild_named_places()
+            self._persist()
+            return json.loads(json.dumps(created))
 
     def merge_regions(self, region_ids: list[str], *, new_label: str | None = None) -> dict[str, Any] | None:
         with self._lock:
@@ -579,6 +644,19 @@ class ExplorationBackend:
             self._current_map["named_places"] = named_places
             self._persist()
             return json.loads(json.dumps(named_place))
+
+    def _current_robot_pose(self) -> dict[str, Any]:
+        if self._current_map is None:
+            return {"x": 0.0, "y": 0.0, "yaw": 0.0}
+        robot_pose = self._current_map.get("robot_pose")
+        if isinstance(robot_pose, dict):
+            return dict(robot_pose)
+        trajectory = self._current_map.get("trajectory")
+        if isinstance(trajectory, list) and trajectory:
+            last_pose = trajectory[-1]
+            if isinstance(last_pose, dict):
+                return dict(last_pose)
+        return {"x": 0.0, "y": 0.0, "yaw": 0.0}
 
     def occupancy_edit_snapshot(self, task_id: str | None = None) -> dict[str, Any]:
         with self._lock:
@@ -772,8 +850,7 @@ class ExplorationBackend:
                 "coverage": map_payload["coverage"],
                 "region_count": len(map_payload["regions"]),
             }
-            self._current_map = json.loads(json.dumps(map_payload))
-            self._maps[map_payload["map_id"]] = json.loads(json.dumps(map_payload))
+            self._set_current_map(map_payload)
             self._persist()
 
     def _build_map_payload(
@@ -835,6 +912,7 @@ class ExplorationBackend:
             "created_at": time.time(),
             "source": task.source,
             "mode": self.config.mode,
+            "robot_pose": scenario.start_pose.to_dict(),
             "trajectory": trajectory,
             "keyframes": keyframes,
             "regions": regions,
@@ -851,7 +929,7 @@ class ExplorationBackend:
         named_places: list[dict[str, Any]] = [
             item
             for item in self._current_map.get("named_places", [])
-            if item.get("source") == "manual"
+            if item.get("source") in {"manual", "operator_dock_pose"}
         ]
         for region in self._current_map.get("regions", []):
             label = str(region["label"]).replace(" ", "_")
@@ -930,6 +1008,33 @@ class ExplorationBackend:
             return
         payload = self.snapshot()
         self._map_store.save_snapshot(payload)
+
+    def _export_home_memory_on_approve(self) -> None:
+        if not self.config.export_home_memory_on_approve:
+            return
+        if self._current_map is None:
+            return
+        store = self._home_memory_store or self._default_home_memory_store_for_current_map()
+        if store is None:
+            return
+        memory = store.export_from_map_snapshot(self._current_map)
+        artifacts = self._current_map.setdefault("artifacts", {})
+        artifacts["home_memory"] = {
+            "path": str(store.path),
+            "schema_version": memory.get("schema_version"),
+            "memory_id": memory.get("memory_id"),
+            "updated_at": memory.get("updated_at"),
+        }
+
+    def _default_home_memory_store_for_current_map(self) -> HomeMemoryStore | None:
+        if self.config.persist_path is None or self._current_map is None:
+            return None
+        map_id = str(self._current_map.get("map_id") or "").strip()
+        if not map_id:
+            path = default_home_memory_path_for_map_path(self.config.persist_path)
+        else:
+            path = Path(self.config.persist_path).parent / "home_memory" / f"{map_id}.home_memory.json"
+        return HomeMemoryStore(path)
 
     def _restore(self) -> None:
         if self._map_store is None:
@@ -1090,6 +1195,41 @@ def _json_pose(pose: dict[str, Any]) -> dict[str, Any]:
         "y": round(float(pose.get("y", 0.0)), 3),
         "yaw": round(float(pose.get("yaw", 0.0)), 3),
     }
+
+
+def _slug(value: str) -> str:
+    cleaned = "".join(ch.lower() if ch.isalnum() else "_" for ch in str(value).strip())
+    return "_".join(part for part in cleaned.split("_") if part) or "region"
+
+
+def _region_id_for_pose(map_payload: dict[str, Any], pose: dict[str, Any]) -> str | None:
+    x = float(pose.get("x", 0.0) or 0.0)
+    y = float(pose.get("y", 0.0) or 0.0)
+    for region in map_payload.get("regions", []):
+        if not isinstance(region, dict):
+            continue
+        polygon = region.get("polygon_2d")
+        if isinstance(polygon, list) and _point_in_polygon(x, y, polygon):
+            return region.get("region_id")
+    return None
+
+
+def _point_in_polygon(x: float, y: float, polygon: list[Any]) -> bool:
+    if len(polygon) < 3:
+        return False
+    inside = False
+    previous = len(polygon) - 1
+    for current in range(len(polygon)):
+        try:
+            xi, yi = float(polygon[current][0]), float(polygon[current][1])
+            xj, yj = float(polygon[previous][0]), float(polygon[previous][1])
+        except Exception:
+            previous = current
+            continue
+        if ((yi > y) != (yj > y)) and (x < (xj - xi) * (y - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        previous = current
+    return inside
 
 
 def _polygon_centroid(polygon: Any) -> dict[str, float]:

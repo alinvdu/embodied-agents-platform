@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 from dataclasses import dataclass, field
 import io
+import struct
 from typing import Any
 from collections.abc import Mapping
+import zlib
 
 try:
     import numpy as np
@@ -300,13 +302,11 @@ def _image_data_url_from_payload(payload: Any) -> str | None:
         except Exception:
             return None
         return _numpy_image_to_data_url(array)
-    return None
+    return _list_image_to_png_data_url(payload)
 
 
 def _array_payload_to_png_data_url(payload: Mapping[str, Any]) -> str | None:
-    if np is None:
-        return None
-    if "data_base64" in payload and "shape" in payload and "dtype" in payload:
+    if np is not None and "data_base64" in payload and "shape" in payload and "dtype" in payload:
         try:
             raw = base64.b64decode(str(payload["data_base64"]))
             array = np.frombuffer(raw, dtype=np.dtype(str(payload["dtype"])))
@@ -316,10 +316,12 @@ def _array_payload_to_png_data_url(payload: Mapping[str, Any]) -> str | None:
         except Exception:
             return None
     if "data" in payload:
+        if np is None:
+            return _list_image_to_png_data_url(payload["data"])
         try:
             array = np.asarray(payload["data"])
         except Exception:
-            return None
+            return _list_image_to_png_data_url(payload["data"])
         return _numpy_image_to_data_url(array)
     return None
 
@@ -346,6 +348,55 @@ def _numpy_image_to_data_url(array: Any) -> str | None:
     pil_image.save(buffer, format="PNG")
     encoded = base64.b64encode(buffer.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{encoded}"
+
+
+def _list_image_to_png_data_url(payload: Any) -> str | None:
+    if not isinstance(payload, list) or not payload:
+        return None
+    rows: list[bytes] = []
+    width: int | None = None
+    for row in payload:
+        if not isinstance(row, list) or not row:
+            return None
+        pixels: list[int] = []
+        if row and isinstance(row[0], list):
+            for pixel in row:
+                if not isinstance(pixel, list) or len(pixel) < 3:
+                    return None
+                pixels.extend(_clamp_channel(channel) for channel in pixel[:3])
+            row_width = len(row)
+        else:
+            for value in row:
+                channel = _clamp_channel(value)
+                pixels.extend((channel, channel, channel))
+            row_width = len(row)
+        if width is None:
+            width = row_width
+        elif width != row_width:
+            return None
+        rows.append(b"\x00" + bytes(pixels))
+    if width is None:
+        return None
+    png = _png_bytes(width, len(rows), b"".join(rows))
+    encoded = base64.b64encode(png).decode("utf-8")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _png_bytes(width: int, height: int, filtered_rows: bytes) -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        checksum = zlib.crc32(kind + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", checksum)
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", zlib.compress(filtered_rows)) + chunk(b"IEND", b"")
+
+
+def _clamp_channel(value: Any) -> int:
+    try:
+        number = int(value)
+    except Exception:
+        return 0
+    return max(0, min(255, number))
 
 
 def _mock_initial_observation(
