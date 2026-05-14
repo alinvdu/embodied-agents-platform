@@ -26,6 +26,7 @@ body {
 
 button,
 input,
+select,
 textarea {
   font: inherit;
 }
@@ -68,6 +69,7 @@ button.icon {
 }
 
 input,
+select,
 textarea {
   width: 100%;
   border: 1px solid var(--line);
@@ -250,6 +252,29 @@ label {
 
 .compact-button {
   padding: 8px 10px;
+}
+
+.memory-picker,
+.memory-list {
+  display: grid;
+  gap: 8px;
+}
+
+.memory-picker {
+  min-width: 220px;
+}
+
+.new-memory-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.memory-mini-list {
+  display: grid;
+  gap: 7px;
+  max-height: 170px;
+  overflow: auto;
 }
 
 .chat-panel.minimal {
@@ -447,7 +472,8 @@ label {
 }
 
 .event,
-.list-row {
+.list-row,
+.memory-row {
   display: grid;
   gap: 4px;
   text-align: left;
@@ -458,11 +484,13 @@ label {
 }
 
 .event span,
-.list-row small {
+.list-row small,
+.memory-row small {
   color: var(--muted);
 }
 
-.list-row.active {
+.list-row.active,
+.memory-row.active {
   border-color: rgba(29, 78, 216, 0.4);
   background: rgba(29, 78, 216, 0.06);
 }
@@ -689,6 +717,10 @@ label {
   .exploration-grid {
     grid-template-columns: 1fr;
     height: auto;
+  }
+
+  .environment-card {
+    grid-template-columns: auto minmax(0, 1fr);
   }
 
   .map-canvas,

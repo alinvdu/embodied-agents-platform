@@ -22,6 +22,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--ros-navigation-map-source") + 1], "fused_scan")
         self.assertEqual(translated[translated.index("--ros-imu-topic") + 1], "/imu/filtered_yaw")
         self.assertEqual(translated[translated.index("--source") + 1], "real_xlerobot")
+        self.assertIn("--memory-root", translated)
+        self.assertEqual(translated[translated.index("--memory-root") + 1], "./artifacts/memories")
         self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
@@ -41,6 +43,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
                 "--llm-api-key",
                 "secret",
                 "--no-serve-review-ui",
+                "--memory-root",
+                "/tmp/robot42-memories",
                 "--review-host",
                 "127.0.0.1",
                 "--review-port",
@@ -53,6 +57,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--llm-provider") + 1], "openai")
         self.assertEqual(translated[translated.index("--llm-model") + 1], "gpt-test")
         self.assertEqual(translated[translated.index("--llm-api-key") + 1], "secret")
+        self.assertEqual(translated[translated.index("--memory-root") + 1], "/tmp/robot42-memories")
         self.assertIn("--no-serve-review-ui", translated)
         self.assertEqual(translated[translated.index("--review-host") + 1], "127.0.0.1")
         self.assertEqual(translated[translated.index("--review-port") + 1], "8899")

@@ -286,9 +286,12 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             approved = backend.approve_current_map()
 
             assert approved is not None
-            home_memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            memory_dir = persist_path.parent / "memories" / "house_v1"
+            home_memory_path = memory_dir / "home_memory.json"
+            environment_map_path = memory_dir / "environment_map.json"
             self.assertTrue(persist_path.exists())
             self.assertTrue(home_memory_path.exists())
+            self.assertTrue(environment_map_path.exists())
             memory = json.loads(home_memory_path.read_text())
             self.assertEqual(memory["schema_version"], "home_memory.v1")
             self.assertEqual(memory["memory_id"], "house_v1")
@@ -304,6 +307,18 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(persisted["current_map"]["frontiers"], [{"frontier_id": "debug_frontier"}])
             self.assertEqual(persisted["current_map"]["keyframes"], [{"frame_id": "frame_1", "description": "debug-only frame"}])
             self.assertIn("home_memory", persisted["current_map"]["artifacts"])
+            self.assertEqual(persisted["current_map"]["artifacts"]["home_memory"]["directory"], str(memory_dir))
+
+            restored = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=str(persist_path.parent / "fresh_backend.json"),
+                    memory_root_path=str(persist_path.parent / "memories"),
+                )
+            )
+            loaded = restored.load_environment_memory("house_v1")
+            assert loaded is not None
+            self.assertEqual(loaded["current_map"]["regions"][0]["label"], "kitchen")
 
     def test_set_dock_pose_sets_start_pose_and_memory_start(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -357,7 +372,7 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(dock["name"], "dock")
             self.assertEqual(dock["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
             self.assertEqual(approved["start_pose"]["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
-            memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            memory_path = persist_path.parent / "memories" / "house_v1" / "home_memory.json"
             memory = json.loads(memory_path.read_text())
             self.assertEqual(memory["start_pose"]["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
             self.assertEqual(memory["start_pose"]["source"], "operator_dock_pose")
@@ -401,7 +416,7 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             approved = backend.approve_current_map()
 
             assert approved is not None
-            memory_path = persist_path.parent / "home_memory" / "house_v1.home_memory.json"
+            memory_path = persist_path.parent / "memories" / "house_v1" / "home_memory.json"
             memory = json.loads(memory_path.read_text())
             self.assertIsNone(memory["start_pose"])
 

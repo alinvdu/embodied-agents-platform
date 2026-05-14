@@ -15,6 +15,7 @@ The project already has most of the raw pieces for this direction.
 - `xlerobot_playground/semantic_memory.py`, `semantic_evidence.py`, `semantic_anchors.py`, and `semantic_projection.py` are a parked semantic memory path. Useful, but not yet the primary long-term home-memory representation.
 - `xlerobot_agent/tools.py`, `xlerobot_agent/playground.py`, `xlerobot_agent/runtime.py`, and tests already contain a mock/local agent loop with tools like `create_map`, `get_map`, `go_to_pose`, `perceive_scene`, `ground_object_3d`, and `set_waypoint_from_object`.
 - `xlerobot_agent/home_memory.py` now exports approved annotated maps into `home_memory.v1`, including occupancy, manual wall edits, regions, named places, fixture/object affordances, skills, and a compact `home_memory_agent_context(...)` shape for prompts.
+- `xlerobot_agent/memory_discovery.py` now organizes saved environments as folders under `memories/<memory_id>/`, with `manifest.json`, `environment_map.json`, and `home_memory.json`.
 - `xlerobot_agent/home_agent.py` now provides the first Robot42 `HomeTaskAgent` backend: it loads home memory into context, exposes only action/safety tools, runs through the OpenAI Agents SDK when configured, and has a deterministic/mock fallback for dry-run development.
 - `examples/robot42_agent_backend.py` runs the new backend on the React chat port.
 - `xlerobot_playground/robot_brain_agent.py` is a hardware endpoint for motion, stop, RGB-D, IMU, and camera pan/pitch state. It is not an LLM agent; it is the robot IO surface.
@@ -36,10 +37,13 @@ The right next move is to formalize a `HomeMemory` artifact and make the agent c
 Create a new explicit artifact, probably:
 
 ```text
-artifacts/home_memory/house_v1.home_memory.json
+artifacts/memories/house_v1/
+  manifest.json
+  environment_map.json
+  home_memory.json
 ```
 
-It should be generated from an approved exploration/map-review snapshot, not hand-maintained forever. The source of truth during authoring remains the exploration UI map plus your annotations.
+It should be generated from an approved exploration/map-review snapshot, not hand-maintained forever. The source of truth during authoring remains the exploration UI map plus your annotations, and the memory folder keeps the editable map snapshot side by side with the distilled agent memory.
 
 Recommended top-level shape:
 
@@ -164,7 +168,7 @@ This should be the primary mapping workflow for now.
 6. Operator adds named places for important fixtures: fridge, sink, counter, couch, table, dock.
 7. Operator explicitly clicks "Set Dock Pose" while the robot is at its fixed start/dock position.
 8. Approve map.
-9. Export approved annotated map into `house_v1.home_memory.json`.
+9. Export approved annotated map into `memories/house_v1/home_memory.json` and keep the editable snapshot as `memories/house_v1/environment_map.json`.
 10. Agent uses `HomeMemoryStore` as its default map context.
 
 This avoids spending weeks on perfect frontier behavior before the robot can do useful tasks.
@@ -269,7 +273,7 @@ Tasks:
 
 Acceptance:
 
-- A command like "go to the kitchen" resolves through `house_v1.home_memory.json`, not through a freshly generated sim map.
+- A command like "go to the kitchen" resolves through `memories/house_v1/home_memory.json`, not through a freshly generated sim map.
 - A command like "look in the fridge" resolves `fridge -> approach_pose -> Nav2 goal -> RGB-D perception`.
 
 Current status:

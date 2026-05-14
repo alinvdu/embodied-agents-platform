@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--persist-path", default=None)
+    parser.add_argument("--memory-root", default=None)
     parser.add_argument("--offload-server-url", default=None)
     parser.add_argument("--brain-name", default="xlerobot-review-brain")
     parser.add_argument("--brain-id", default=None)
@@ -51,6 +52,7 @@ def main(argv: list[str] | None = None) -> int:
             ExplorationBackendConfig(
                 mode="sim",
                 persist_path=args.persist_path,
+                memory_root_path=args.memory_root,
             )
         )
         controller = LocalExplorationUIController(backend)

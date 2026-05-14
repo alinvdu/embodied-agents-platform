@@ -20,6 +20,21 @@ class ExplorationUIController(Protocol):
     def start_create_map(self, *, area: str, session: str, source: str = "operator") -> dict[str, Any]:
         ...
 
+    def list_environment_memories(self) -> list[dict[str, Any]]:
+        ...
+
+    def create_environment_memory(self, memory_id: str, *, label: str | None = None) -> dict[str, Any]:
+        ...
+
+    def load_environment_memory(self, memory_id: str) -> dict[str, Any] | None:
+        ...
+
+    def start_navigation_session(self) -> dict[str, Any]:
+        ...
+
+    def stop_navigation_session(self) -> dict[str, Any]:
+        ...
+
     def pause_task(self, task_id: str) -> dict[str, Any] | None:
         ...
 
@@ -92,11 +107,15 @@ class LocalExplorationUIController:
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
+        navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
+        navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         self.backend = backend
         self.waypoint_navigator = waypoint_navigator
         self.waypoint_previewer = waypoint_previewer
         self.scan_performer = scan_performer
+        self.navigation_session_starter = navigation_session_starter
+        self.navigation_session_stopper = navigation_session_stopper
 
     def snapshot(self) -> dict[str, Any]:
         return self.backend.snapshot()
@@ -106,6 +125,25 @@ class LocalExplorationUIController:
 
     def start_create_map(self, *, area: str, session: str, source: str = "operator") -> dict[str, Any]:
         return self.backend.start_create_map(area=area, session=session, source=source)
+
+    def list_environment_memories(self) -> list[dict[str, Any]]:
+        return self.backend.list_environment_memories()
+
+    def create_environment_memory(self, memory_id: str, *, label: str | None = None) -> dict[str, Any]:
+        return self.backend.create_environment_memory(memory_id, label=label)
+
+    def load_environment_memory(self, memory_id: str) -> dict[str, Any] | None:
+        return self.backend.load_environment_memory(memory_id)
+
+    def start_navigation_session(self) -> dict[str, Any]:
+        if self.navigation_session_starter is None:
+            return {"status": "unavailable", "reason": "Navigation-only sessions are not available for this backend."}
+        return self.navigation_session_starter()
+
+    def stop_navigation_session(self) -> dict[str, Any]:
+        if self.navigation_session_stopper is None:
+            return {"status": "unavailable", "reason": "Navigation-only sessions are not available for this backend."}
+        return self.navigation_session_stopper()
 
     def pause_task(self, task_id: str) -> dict[str, Any] | None:
         return self.backend.pause_task(task_id)
@@ -201,6 +239,21 @@ class RemoteExplorationUIController:
 
     def start_create_map(self, *, area: str, session: str, source: str = "operator") -> dict[str, Any]:
         return self.client.start_create_map(area=area, session=session, source=source)
+
+    def list_environment_memories(self) -> list[dict[str, Any]]:
+        return []
+
+    def create_environment_memory(self, memory_id: str, *, label: str | None = None) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote memory creation is not implemented yet."}
+
+    def load_environment_memory(self, memory_id: str) -> dict[str, Any] | None:
+        return {"status": "unavailable", "reason": "Remote memory loading is not implemented yet."}
+
+    def start_navigation_session(self) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote navigation-only sessions are not implemented yet."}
+
+    def stop_navigation_session(self) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote navigation-only sessions are not implemented yet."}
 
     def pause_task(self, task_id: str) -> dict[str, Any] | None:
         return self.client.pause_mapping_task(task_id)
@@ -1273,6 +1326,9 @@ class ExplorationReviewServer:
                 if self.path == "/api/state":
                     self._send_json(controller.snapshot())
                     return
+                if self.path == "/api/memories":
+                    self._send_json({"memories": controller.list_environment_memories()})
+                    return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
             def do_POST(self) -> None:
@@ -1295,6 +1351,25 @@ class ExplorationReviewServer:
                             source="operator",
                         )
                     )
+                    return
+                if self.path == "/api/memory/create":
+                    memory_id = str(payload.get("memory_id") or payload.get("label") or f"home_{int(time.time())}")
+                    self._send_json(
+                        controller.create_environment_memory(
+                            memory_id,
+                            label=payload.get("label"),
+                        )
+                    )
+                    return
+                if self.path == "/api/memory/load":
+                    response = controller.load_environment_memory(str(payload.get("memory_id") or ""))
+                    self._send_json(response or {"status": "missing"})
+                    return
+                if self.path == "/api/nav/session/start":
+                    self._send_json(controller.start_navigation_session())
+                    return
+                if self.path == "/api/nav/session/stop":
+                    self._send_json(controller.stop_navigation_session())
                     return
                 if self.path == "/api/task/pause":
                     response = controller.pause_task(str(payload.get("task_id")))

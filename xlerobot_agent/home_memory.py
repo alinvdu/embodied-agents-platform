@@ -6,6 +6,8 @@ from pathlib import Path
 import time
 from typing import Any
 
+from .memory_discovery import HOME_MEMORY_FILENAME, default_environment_memory_dir_for_map_path
+
 
 HOME_MEMORY_SCHEMA_VERSION = "home_memory.v1"
 
@@ -37,13 +39,7 @@ class HomeMemoryExportResult:
 
 
 def default_home_memory_path_for_map_path(path: str | Path) -> Path:
-    map_path = Path(path)
-    memory_id = map_path.stem
-    for suffix in ("_map", "_exploration", "_snapshot"):
-        if memory_id.endswith(suffix):
-            memory_id = memory_id[: -len(suffix)] or map_path.stem
-            break
-    return map_path.parent / "home_memory" / f"{memory_id}.home_memory.json"
+    return default_environment_memory_dir_for_map_path(path) / HOME_MEMORY_FILENAME
 
 
 def home_memory_from_map_snapshot(

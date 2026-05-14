@@ -116,6 +116,28 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(record.status, "completed")
         self.assertIn("house_v1", record.memory_summary)
 
+    def test_controller_lists_and_selects_memory_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_dir = Path(tmpdir) / "memories" / "house_v1"
+            memory_dir.mkdir(parents=True)
+            memory_path = memory_dir / "home_memory.json"
+            memory_path.write_text(json.dumps(sample_memory()))
+            controller = HomeAgentController.from_config(
+                HomeAgentConfig(
+                    home_memory_search_roots=(tmpdir,),
+                    model=HomeAgentModelConfig(provider="mock", model="mock"),
+                )
+            )
+
+            listed = controller.list_environment_memories()
+            selected = controller.select_environment_memory("house_v1")
+            snapshot = controller.snapshot()
+
+        self.assertEqual(listed[0]["memory_id"], "house_v1")
+        assert selected is not None
+        self.assertEqual(selected["home_memory_path"], str(memory_path))
+        self.assertEqual(snapshot["home_memory"]["context"]["memory_id"], "house_v1")
+
     def test_mock_agent_stages_skill_with_approval_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = Path(tmpdir) / "house.home_memory.json"

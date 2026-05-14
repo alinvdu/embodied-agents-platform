@@ -12,7 +12,8 @@ from typing import Any, Protocol
 import uuid
 
 from .models import ExecutionStatus
-from .home_memory import HomeMemoryStore, default_home_memory_path_for_map_path
+from .home_memory import HomeMemoryStore, home_memory_from_map_snapshot
+from .memory_discovery import EnvironmentMemoryDiscovery, default_memory_root_for_map_path
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ class ExplorationBackendConfig:
     mode: str = "sim"
     persist_path: str | None = None
     home_memory_path: str | None = None
+    memory_root_path: str | None = None
     export_home_memory_on_approve: bool = True
     restore_persisted_state: bool = True
     step_interval_s: float = 0.05
@@ -278,6 +280,7 @@ class ExplorationBackend:
         self._home_memory_store: HomeMemoryStore | None = (
             HomeMemoryStore(Path(self.config.home_memory_path)) if self.config.home_memory_path else None
         )
+        self._memory_discovery = EnvironmentMemoryDiscovery(self._default_memory_root())
         if self.config.restore_persisted_state:
             self._restore()
         self._persist()
@@ -464,6 +467,27 @@ class ExplorationBackend:
     def list_maps(self) -> list[dict[str, Any]]:
         with self._lock:
             return [json.loads(json.dumps(item)) for item in self._maps.values()]
+
+    def list_environment_memories(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [record.to_dict() for record in self._memory_discovery.list()]
+
+    def create_environment_memory(self, memory_id: str, *, label: str | None = None) -> dict[str, Any]:
+        with self._lock:
+            return self._memory_discovery.create(memory_id, label=label).to_dict()
+
+    def load_environment_memory(self, memory_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            payload = self._memory_discovery.load_environment_snapshot(memory_id)
+            if not isinstance(payload, dict):
+                return None
+            self._current_map = None
+            self._maps.clear()
+            self._tasks.clear()
+            self._manual_occupancy_edits.clear()
+            self._restore_from_payload(payload)
+            self._persist()
+            return self.snapshot()
 
     def approve_current_map(self) -> dict[str, Any] | None:
         with self._lock:
@@ -666,6 +690,21 @@ class ExplorationBackend:
             payload = self._manual_occupancy_edits.get(task.task_id)
             if not isinstance(payload, dict):
                 return {"blocked_cells": [], "cleared_cells": []}
+            return json.loads(json.dumps(payload))
+
+    def set_occupancy_edits(self, task_id: str, edits: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return {"blocked_cells": [], "cleared_cells": []}
+            payload = {
+                "blocked_cells": list(edits.get("blocked_cells", [])) if isinstance(edits.get("blocked_cells"), list) else [],
+                "cleared_cells": list(edits.get("cleared_cells", [])) if isinstance(edits.get("cleared_cells"), list) else [],
+            }
+            self._manual_occupancy_edits[task.task_id] = json.loads(json.dumps(payload))
+            if self._current_map is not None:
+                self._attach_manual_edits(self._current_map, task.task_id)
+            self._persist()
             return json.loads(json.dumps(payload))
 
     def update_occupancy_edits(
@@ -1014,32 +1053,41 @@ class ExplorationBackend:
             return
         if self._current_map is None:
             return
-        store = self._home_memory_store or self._default_home_memory_store_for_current_map()
-        if store is None:
-            return
-        memory = store.export_from_map_snapshot(self._current_map)
+        if self._home_memory_store is not None:
+            memory = self._home_memory_store.export_from_map_snapshot(self._current_map)
+            record = None
+            home_memory_path = self._home_memory_store.path
+            environment_map_path = None
+            memory_directory = home_memory_path.parent
+        else:
+            memory = home_memory_from_map_snapshot(self._current_map)
+            record = self._memory_discovery.save_environment(
+                memory=memory,
+                environment_snapshot=self.snapshot(),
+                label=str(self._current_map.get("summary") or memory.get("memory_id") or "home"),
+            )
+            home_memory_path = record.home_memory_path
+            environment_map_path = record.environment_map_path
+            memory_directory = record.directory
         artifacts = self._current_map.setdefault("artifacts", {})
         artifacts["home_memory"] = {
-            "path": str(store.path),
+            "path": str(home_memory_path) if home_memory_path is not None else None,
+            "directory": str(memory_directory),
+            "environment_map_path": str(environment_map_path) if environment_map_path is not None else None,
             "schema_version": memory.get("schema_version"),
             "memory_id": memory.get("memory_id"),
             "updated_at": memory.get("updated_at"),
         }
-
-    def _default_home_memory_store_for_current_map(self) -> HomeMemoryStore | None:
-        if self.config.persist_path is None or self._current_map is None:
-            return None
-        map_id = str(self._current_map.get("map_id") or "").strip()
-        if not map_id:
-            path = default_home_memory_path_for_map_path(self.config.persist_path)
-        else:
-            path = Path(self.config.persist_path).parent / "home_memory" / f"{map_id}.home_memory.json"
-        return HomeMemoryStore(path)
+        if record is not None and record.environment_map_path is not None:
+            record.environment_map_path.write_text(json.dumps(self.snapshot(), indent=2, sort_keys=True))
 
     def _restore(self) -> None:
         if self._map_store is None:
             return
         payload = self._map_store.load_snapshot()
+        self._restore_from_payload(payload)
+
+    def _restore_from_payload(self, payload: dict[str, Any] | None) -> None:
         if not isinstance(payload, dict):
             return
         current_map = payload.get("current_map")
@@ -1081,6 +1129,13 @@ class ExplorationBackend:
                 latest_task_id = next(reversed(self._tasks))
                 self._manual_occupancy_edits[latest_task_id] = json.loads(json.dumps(edits))
                 self._attach_manual_edits(self._current_map, latest_task_id)
+
+    def _default_memory_root(self) -> Path:
+        if self.config.memory_root_path:
+            return Path(self.config.memory_root_path)
+        if self.config.persist_path:
+            return default_memory_root_for_map_path(self.config.persist_path)
+        return Path.cwd() / "artifacts" / "memories"
 
 
 def _build_scenario(*, session: str, area: str, current_pose: str) -> ExplorationScenario:

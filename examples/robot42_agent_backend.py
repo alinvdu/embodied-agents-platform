@@ -22,6 +22,7 @@ from xlerobot_agent.home_agent import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the Robot42 HomeTaskAgent backend for the React UI.")
     parser.add_argument("--home-memory-path", default=None)
+    parser.add_argument("--memory-root", default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--provider", choices=("mock", "openai", "openai-compatible", "litellm"), default=None)
@@ -80,7 +81,7 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
     return replace(
         config,
         home_memory_path=args.home_memory_path or config.home_memory_path,
-        home_memory_search_roots=config.home_memory_search_roots,
+        home_memory_search_roots=(args.memory_root,) if args.memory_root else config.home_memory_search_roots,
         host=args.host or config.host,
         port=args.port or config.port,
         model=model,

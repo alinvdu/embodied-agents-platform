@@ -38,6 +38,12 @@ from .home_memory import (
     resolve_home_memory_target,
     summarize_home_memory,
 )
+from .memory_discovery import (
+    EnvironmentMemoryDiscovery,
+    EnvironmentMemoryRecord,
+    default_environment_memory_dir_for_map_path,
+    default_memory_root_for_map_path,
+)
 from .llm import (
     ActionDecision,
     AgentLLMRouter,
@@ -138,6 +144,8 @@ __all__ = [
     "ExecutionStatus",
     "ExecutorConfig",
     "ExecutorRegistry",
+    "EnvironmentMemoryDiscovery",
+    "EnvironmentMemoryRecord",
     "GoalContext",
     "HomeAgentConfig",
     "HomeAgentController",
@@ -201,6 +209,8 @@ __all__ = [
     "build_playground_skill_registry",
     "config_from_env",
     "create_executor_config",
+    "default_environment_memory_dir_for_map_path",
+    "default_memory_root_for_map_path",
     "discover_latest_home_memory_path",
     "execute_perception_tool",
     "extract_scene_from_tool_result",

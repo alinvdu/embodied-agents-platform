@@ -355,6 +355,49 @@ What it offers:
 - Drives the XLeRobot base toward frontiers until exploration stalls
 - Captures RGB keyframes and writes a reviewable map snapshot for later correction
 
+## Robot42 Real Exploration End To End
+
+This is the normal Robot42 environment-configuration flow for the real robot. Use it when you need to create, scan, load, edit, or approve an environment map. It starts the real agentic exploration backend, serves the environment/configuration backend on port `8770`, and saves approved long-term memories under `artifacts/memories`.
+
+```bash
+python -m xlerobot_playground.real_agentic_exploration \
+  --memory-root ./artifacts/memories
+```
+
+See the full agent flow in [Robot42 Agentic End To End](./robot42_agentic_end_to_end.md).
+
+Then run the React UI:
+
+```bash
+cd frontend/robot42
+npm install
+npm run dev
+```
+
+And run the Robot42 agent backend:
+
+```bash
+python examples/robot42_agent_backend.py \
+  --memory-root ./artifacts/memories
+```
+
+What gets saved after `Approve + Save Memory`:
+
+```text
+artifacts/memories/<memory_id>/
+  manifest.json
+  environment_map.json
+  home_memory.json
+```
+
+Notes:
+- `python -m xlerobot_playground.real_agentic_exploration` is the normal real robot mapping/configuration entrypoint.
+- You do not need this command for agent-only runs when a memory already exists.
+- To reopen an existing saved environment, start this backend, open `Configure Environment`, choose a memory, and click `Load`.
+- The editable snapshot path is internal/default during normal runs; only override it when debugging storage.
+- `--memory-root` is the folder of saved long-term environments.
+- `examples/xlerobot_exploration_review.py` is only a review-only helper for already-saved maps; it is not the normal robot exploration entrypoint.
+
 ## Exploration Review
 
 Run the review UI on a saved local map snapshot:

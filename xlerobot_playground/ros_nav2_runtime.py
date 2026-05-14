@@ -28,7 +28,7 @@ try:
     import rclpy
     from action_msgs.msg import GoalStatus
     from builtin_interfaces.msg import Duration as DurationMsg
-    from geometry_msgs.msg import PoseStamped, Quaternion, TransformStamped, Twist
+    from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, TransformStamped, Twist
     from nav_msgs.msg import OccupancyGrid
     from nav2_msgs.action import ComputePathToPose, NavigateToPose, Spin
     from rclpy.action import ActionClient
@@ -51,6 +51,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     GoalStatus = None
     DurationMsg = None
     PoseStamped = None
+    PoseWithCovarianceStamped = None
     Quaternion = None
     TransformStamped = None
     Twist = None
@@ -112,6 +113,26 @@ def yaw_from_quaternion_xyzw(x: float, y: float, z: float, w: float) -> float:
     siny_cosp = 2.0 * (w * z + x * y)
     cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
     return math.atan2(siny_cosp, cosy_cosp)
+
+
+def compose_pose_2d(first: Pose2D, second: Pose2D) -> Pose2D:
+    cos_yaw = math.cos(first.yaw)
+    sin_yaw = math.sin(first.yaw)
+    return Pose2D(
+        first.x + cos_yaw * second.x - sin_yaw * second.y,
+        first.y + sin_yaw * second.x + cos_yaw * second.y,
+        first.yaw + second.yaw,
+    )
+
+
+def inverse_pose_2d(pose: Pose2D) -> Pose2D:
+    cos_yaw = math.cos(pose.yaw)
+    sin_yaw = math.sin(pose.yaw)
+    return Pose2D(
+        -cos_yaw * pose.x - sin_yaw * pose.y,
+        sin_yaw * pose.x - cos_yaw * pose.y,
+        -pose.yaw,
+    )
 
 
 def _quaternion_rotation_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
@@ -280,6 +301,7 @@ class RosRuntimeConfig:
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
+    initial_pose_topic: str = "/initialpose"
     map_frame: str = "map"
     odom_frame: str = "odom"
     base_frame: str = "base_link"
@@ -483,6 +505,7 @@ class RosExplorationRuntime(Node):
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
+        self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, config.initial_pose_topic, 10)
         self._point_cloud_update_map_enabled_pub = self.create_publisher(
             Bool,
             config.point_cloud_update_map_enabled_topic,
@@ -518,6 +541,7 @@ class RosExplorationRuntime(Node):
         self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
         self._published_navigation_map: RosOccupancyMap | None = None
         self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self._force_publish_navigation_state = False
         self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
 
     def _spin_once(self, *, timeout_sec: float) -> None:
@@ -714,6 +738,16 @@ class RosExplorationRuntime(Node):
                 else f"Timed out waiting for `{self.config.map_topic}` and `{self.config.map_frame}->{self.config.base_frame}` pose."
             )
         )
+
+    def spin_until_odom_pose(self, *, timeout_s: float | None = None) -> Pose2D:
+        deadline = time.time() + (timeout_s if timeout_s is not None else self.config.ready_timeout_s)
+        while time.time() < deadline:
+            self._spin_once(timeout_sec=0.1)
+            pose = self.current_pose_in_frame(self.config.odom_frame)
+            if pose is not None:
+                return pose
+            time.sleep(0.05)
+        raise RuntimeError(f"Timed out waiting for `{self.config.odom_frame}->{self.config.base_frame}` pose.")
 
     def current_pose(self) -> Pose2D | None:
         return self.lookup_pose(self.config.map_frame, self.config.base_frame)
@@ -1328,13 +1362,49 @@ class RosExplorationRuntime(Node):
         occupancy_map: RosOccupancyMap,
         *,
         map_to_odom: Pose2D | None = None,
+        force_publish: bool = False,
     ) -> None:
         self._published_navigation_map = occupancy_map
         if map_to_odom is not None:
             self._map_to_odom = map_to_odom
+        if force_publish:
+            self._force_publish_navigation_state = True
         self.latest_map = occupancy_map
         self.latest_map_stamp_s = time.time()
         self._publish_internal_navigation_state()
+
+    def set_initial_pose(
+        self,
+        pose: Pose2D,
+        *,
+        publish_count: int = 3,
+        covariance_xy_m2: float = 0.25,
+        covariance_yaw_rad2: float = 0.06853892326654787,
+    ) -> dict[str, Any]:
+        odom_pose = self.spin_until_odom_pose(timeout_s=self.config.ready_timeout_s)
+        map_to_odom = compose_pose_2d(pose, inverse_pose_2d(odom_pose))
+        self._map_to_odom = map_to_odom
+        for _ in range(max(int(publish_count), 1)):
+            message = PoseWithCovarianceStamped()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.header.frame_id = self.config.map_frame
+            message.pose.pose.position.x = float(pose.x)
+            message.pose.pose.position.y = float(pose.y)
+            message.pose.pose.position.z = 0.0
+            message.pose.pose.orientation = quaternion_from_yaw(float(pose.yaw))
+            message.pose.covariance[0] = float(covariance_xy_m2)
+            message.pose.covariance[7] = float(covariance_xy_m2)
+            message.pose.covariance[35] = float(covariance_yaw_rad2)
+            self._initial_pose_pub.publish(message)
+            self._publish_map_to_odom_transform()
+            self._spin_once(timeout_sec=0.05)
+        return {
+            "status": "ok",
+            "initial_pose": pose.to_dict(),
+            "odom_pose": odom_pose.to_dict(),
+            "map_to_odom": map_to_odom.to_dict(),
+            "initial_pose_topic": self.config.initial_pose_topic,
+        }
 
     def close(self) -> None:
         try:
@@ -1346,7 +1416,7 @@ class RosExplorationRuntime(Node):
         self.destroy_node()
 
     def _publish_internal_navigation_state(self) -> None:
-        if not self.config.publish_internal_navigation_map:
+        if not self.config.publish_internal_navigation_map and not self._force_publish_navigation_state:
             return
         self._publish_map_to_odom_transform()
         if self._published_navigation_map is None:

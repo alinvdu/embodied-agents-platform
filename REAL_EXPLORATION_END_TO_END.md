@@ -62,7 +62,9 @@ robot spin scan: fallback only, selected with --ros-turn-scan-mode robot_spin
 
 The default initial and arrival scans now rotate `head_motor_1` instead of rotating the robot base. This keeps `/odom` stable during scanning and lets the two outward pan sweeps form one 360 degree scan.
 
-`real_agentic_exploration` now starts from a clean in-memory map by default even when `--persist-path` points to an existing JSON. Pass `--restore-persisted-state` only when you explicitly want to resume the backend/UI snapshot from that file.
+`real_agentic_exploration` now saves approved Robot42 environments under the memory directory passed with `--memory-root`. You normally only provide that memory directory. The editable map snapshot path is an internal/default exploration detail unless you are debugging storage.
+
+To reopen a saved environment without running frontier exploration, start `real_agentic_exploration` with the same `--memory-root`, open `Configure Environment`, select the saved environment, and click `Load`. For live manual waypoint testing, click `Start Nav Session`; this attaches real ROS/Nav2 to the loaded `environment_map.json`, applies the saved dock/start pose as the initial robot pose, and enables the existing `Preview` / `Go` controls.
 
 ## Robot Brain
 
@@ -511,7 +513,7 @@ source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_agentic_exploration \
-  --persist-path /home/alin/Robot42/artifacts/real_xlerobot_exploration_map.json \
+  --memory-root /home/alin/Robot42/artifacts/memories \
   --session real_house_v1 \
   --explorer-policy heuristic \
   --serve-review-ui \
@@ -569,7 +571,7 @@ Once heuristic exploration is sane, switch to LLM policy:
 
 ```bash
 python -m xlerobot_playground.real_agentic_exploration \
-  --persist-path /home/alin/Robot42/artifacts/real_xlerobot_exploration_map.json \
+  --memory-root /home/alin/Robot42/artifacts/memories \
   --session real_house_v1 \
   --explorer-policy llm \
   --llm-provider openai \
@@ -685,10 +687,13 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects a
   - frontier candidates
   - recent RGB keyframes
   - selected frontier and Nav2 path/result
-- Final map saved to:
+- After you approve the environment with `Approve + Save Memory`, the environment is saved to:
 
 ```text
-/home/alin/Robot42/artifacts/real_xlerobot_exploration_map.json
+/home/alin/Robot42/artifacts/memories/<memory_id>/
+  manifest.json
+  environment_map.json
+  home_memory.json
 ```
 
 ## Current Limitations
@@ -697,4 +702,4 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects a
 - The default initial and arrival 360 scans use camera pan through robot brain `head_motor_1.pos`; robot base rotation is fallback only with `--ros-turn-scan-mode robot_spin`.
 - Frontier navigation uses Nav2 `navigate_to_pose`; this is the existing ROS exploration execution path.
 - Exact region naming and semantic waypoint quality depend on good RGB keyframes and LLM/VLM configuration.
-- Saving the final map JSON works through `--persist-path`; saving directly into persistent robot memory is still a separate integration step.
+- Approved environments are saved under `--memory-root` as memory folders containing the editable environment map and the distilled agent memory side by side.

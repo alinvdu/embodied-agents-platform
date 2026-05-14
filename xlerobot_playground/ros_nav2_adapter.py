@@ -217,14 +217,19 @@ class RemoteRosExplorationRuntime:
         occupancy_map: RosOccupancyMap,
         *,
         map_to_odom: Pose2D | None = None,
+        force_publish: bool = False,
     ) -> None:
         self._request_json(
             "/api/runtime/publish_navigation_map",
             {
                 "occupancy_map": serialize_map(occupancy_map),
                 "map_to_odom": serialize_pose(map_to_odom),
+                "force_publish": force_publish,
             },
         )
+
+    def set_initial_pose(self, pose: Pose2D) -> dict[str, Any]:
+        return self._request_json("/api/runtime/set_initial_pose", {"pose": pose.to_dict()})
 
     def snapshot(self) -> dict[str, Any]:
         return self._request_json("/api/state", {}, method="GET")
@@ -413,8 +418,20 @@ class RosNav2AdapterServer:
                         outer.runtime.publish_navigation_map(
                             occupancy_map,
                             map_to_odom=pose_from_payload(payload.get("map_to_odom")),
+                            force_publish=bool(payload.get("force_publish", False)),
                         )
                         self._send_json({"status": "ok", "runtime_state": outer._runtime_state_payload()})
+                        return
+                    if path == "/api/runtime/set_initial_pose":
+                        pose = pose_from_payload(payload.get("pose"))
+                        if pose is None:
+                            raise ValueError("pose is required")
+                        self._send_json(
+                            {
+                                **outer.runtime.set_initial_pose(pose),
+                                "runtime_state": outer._runtime_state_payload(),
+                            }
+                        )
                         return
                 self.send_error(HTTPStatus.NOT_FOUND)
 

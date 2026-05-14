@@ -47,6 +47,8 @@ function AgentChat({ onConfigure }) {
   const [state, setState] = useState(null);
   const [explorationState, setExplorationState] = useState(null);
   const [command, setCommand] = useState("");
+  const [selectedMemoryId, setSelectedMemoryId] = useState("");
+  const [newMemoryId, setNewMemoryId] = useState("house_v1");
   const [agentConnected, setAgentConnected] = useState(false);
   const [debugOpen, setDebugOpen] = useState(false);
   const [messages, setMessages] = useState([
@@ -101,7 +103,28 @@ function AgentChat({ onConfigure }) {
   const memoryContext = state?.home_memory?.context || {};
   const regions = memoryContext.regions || [];
   const objects = memoryContext.objects || [];
+  const agentMemories = state?.environment_memories || [];
   const environment = environmentStatus(state, explorationState);
+
+  const selectAgentMemory = async (memoryId) => {
+    if (!memoryId) return;
+    setSelectedMemoryId(memoryId);
+    if (!agentConnected) return;
+    await apiPost(AGENT_BASE, "/api/memory/select", { memory_id: memoryId });
+    await refresh();
+  };
+
+  const createAgentMemory = async () => {
+    const memoryId = newMemoryId.trim();
+    if (!memoryId || !agentConnected) {
+      onConfigure();
+      return;
+    }
+    await apiPost(AGENT_BASE, "/api/memory/create", { memory_id: memoryId, label: memoryId });
+    setSelectedMemoryId(memoryId);
+    await refresh();
+    onConfigure();
+  };
 
   return (
     <section className="agent-home">
@@ -117,7 +140,16 @@ function AgentChat({ onConfigure }) {
       </header>
 
       <div className="agent-main">
-        <EnvironmentCard environment={environment} onConfigure={onConfigure} />
+        <EnvironmentCard
+          environment={environment}
+          memories={agentMemories}
+          selectedMemoryId={selectedMemoryId || memoryContext.memory_id || ""}
+          onSelectMemory={selectAgentMemory}
+          newMemoryId={newMemoryId}
+          setNewMemoryId={setNewMemoryId}
+          onCreateMemory={createAgentMemory}
+          onConfigure={onConfigure}
+        />
         <div className="chat-panel minimal">
           <div className="section-head">
             <span><Bot size={17} /> Agent</span>
@@ -171,7 +203,16 @@ function AgentChat({ onConfigure }) {
   );
 }
 
-function EnvironmentCard({ environment, onConfigure }) {
+function EnvironmentCard({
+  environment,
+  memories = [],
+  selectedMemoryId = "",
+  onSelectMemory,
+  newMemoryId,
+  setNewMemoryId,
+  onCreateMemory,
+  onConfigure,
+}) {
   return (
     <div className={`environment-card ${environment.configured ? "configured" : ""}`}>
       <div className="environment-icon"><Home size={22} /></div>
@@ -183,6 +224,20 @@ function EnvironmentCard({ environment, onConfigure }) {
         <span><Map size={15} /> {environment.regionCount} regions</span>
         <span><Home size={15} /> {environment.objectCount} objects</span>
       </div>
+      <div className="memory-picker">
+        <select value={selectedMemoryId} onChange={(event) => onSelectMemory?.(event.target.value)}>
+          <option value="">Select memory</option>
+          {memories.map((memory) => (
+            <option value={memory.memory_id} key={`${memory.memory_id}-${memory.home_memory_path || memory.directory}`}>
+              {memory.label || memory.memory_id}
+            </option>
+          ))}
+        </select>
+        <div className="new-memory-row">
+          <input value={newMemoryId || ""} onChange={(event) => setNewMemoryId?.(event.target.value)} placeholder="new environment" />
+          <button className="compact-button" onClick={onCreateMemory}><Map size={15} /> New</button>
+        </div>
+      </div>
       <button className="compact-button" onClick={onConfigure}><Settings size={15} /> Configure</button>
     </div>
   );
@@ -190,6 +245,9 @@ function EnvironmentCard({ environment, onConfigure }) {
 
 function ExplorationConsole({ onExit }) {
   const [state, setState] = useState(null);
+  const [memories, setMemories] = useState([]);
+  const [selectedMemoryId, setSelectedMemoryId] = useState("");
+  const [newEnvironmentId, setNewEnvironmentId] = useState("house_v1");
   const [error, setError] = useState("");
   const [mode, setMode] = useState("block");
   const [selectedRegionId, setSelectedRegionId] = useState("");
@@ -208,6 +266,8 @@ function ExplorationConsole({ onExit }) {
     try {
       const next = await apiGet(EXPLORATION_BASE, "/api/state");
       setState(next);
+      const memoryList = await apiGet(EXPLORATION_BASE, "/api/memories");
+      setMemories(memoryList.memories || []);
       setError("");
     } catch (err) {
       setState(null);
@@ -249,6 +309,25 @@ function ExplorationConsole({ onExit }) {
     const response = await apiPost(EXPLORATION_BASE, path, payload);
     await refresh();
     return response;
+  };
+
+  const activeEnvironmentId = () => selectedMemoryId || newEnvironmentId.trim() || "house_v1";
+
+  const createEnvironment = async () => {
+    const memoryId = activeEnvironmentId();
+    const created = await post("/api/memory/create", { memory_id: memoryId, label: memoryId });
+    setSelectedMemoryId(created?.memory_id || memoryId);
+    setSaveMessage(`Environment workspace ready: ${created?.memory_id || memoryId}.`);
+  };
+
+  const loadEnvironment = async () => {
+    if (!selectedMemoryId) return;
+    const loaded = await post("/api/memory/load", { memory_id: selectedMemoryId });
+    setSaveMessage(
+      loaded?.current_map
+        ? `Loaded environment: ${selectedMemoryId}.`
+        : `Could not load environment: ${selectedMemoryId}.`
+    );
   };
 
   const saveRegion = async () => {
@@ -295,6 +374,24 @@ function ExplorationConsole({ onExit }) {
     }
   };
 
+  const startNavigationSession = async () => {
+    const result = await post("/api/nav/session/start", {});
+    setSaveMessage(
+      result?.status === "active"
+        ? "Navigation session active. Preview and Go now use the loaded environment."
+        : `Navigation session did not start: ${result?.reason || result?.status || "unknown"}`
+    );
+  };
+
+  const stopNavigationSession = async () => {
+    const result = await post("/api/nav/session/stop", {});
+    setSaveMessage(
+      result?.status === "stopped"
+        ? "Navigation session stopped."
+        : `Navigation session status: ${result?.reason || result?.status || "unknown"}`
+    );
+  };
+
   return (
     <section className="environment-shell">
       <header className="environment-topbar">
@@ -308,18 +405,49 @@ function ExplorationConsole({ onExit }) {
       <div className="exploration-left">
         <Panel title="Control">
           <div className="toolbar">
-            <button className="primary" disabled={!backendOnline} onClick={() => post("/api/explore/start", { area: "downstairs", session: "house_v1" })}><Play size={16} /> Start</button>
-            <button disabled={!backendOnline} onClick={() => post("/api/create_map/start", { area: "downstairs", session: "house_v1" })}><Map size={16} /> Create Map</button>
+            <button className="primary" disabled={!backendOnline} onClick={() => post("/api/explore/start", { area: "downstairs", session: activeEnvironmentId() })}><Play size={16} /> Start</button>
+            <button disabled={!backendOnline} onClick={() => post("/api/create_map/start", { area: "downstairs", session: activeEnvironmentId() })}><Map size={16} /> Create Map</button>
             <button disabled={!backendOnline} onClick={() => post("/api/scan/perform", {})}><Eye size={16} /> Scan</button>
             <button disabled={!backendOnline} onClick={() => post("/api/task/pause", { task_id: activeTask?.task_id })}><Pause size={16} /> Pause</button>
             <button disabled={!backendOnline} onClick={() => post("/api/task/resume", { task_id: activeTask?.task_id })}><Play size={16} /> Resume</button>
             <button disabled={!backendOnline} className="danger" onClick={() => post("/api/task/cancel", { task_id: activeTask?.task_id })}><Square size={16} /> Cancel</button>
+            <button disabled={!backendOnline || !map} onClick={startNavigationSession}><Navigation size={16} /> Start Nav Session</button>
+            <button disabled={!backendOnline} onClick={stopNavigationSession}><Square size={16} /> Stop Nav Session</button>
             <button disabled={!backendOnline || !map} onClick={setDockPose}><Home size={16} /> Set Dock Pose</button>
             <button disabled={!backendOnline || !map} className="primary" onClick={approveAndSaveMemory}><Check size={16} /> Approve + Save Memory</button>
             {!backendOnline ? <button onClick={refresh}><RotateCcw size={16} /> Retry Connection</button> : null}
           </div>
           {!backendOnline ? <p className="offline-note">Start the exploration backend to load, edit, and save the environment.</p> : null}
           {saveMessage ? <p className="success-line">{saveMessage}</p> : null}
+        </Panel>
+        <Panel title="Environments">
+          <div className="memory-list">
+            <select value={selectedMemoryId} onChange={(event) => setSelectedMemoryId(event.target.value)}>
+              <option value="">Select saved environment</option>
+              {memories.map((memory) => (
+                <option value={memory.memory_id} key={`${memory.memory_id}-${memory.directory}`}>
+                  {memory.label || memory.memory_id}
+                </option>
+              ))}
+            </select>
+            <div className="toolbar">
+              <button disabled={!backendOnline || !selectedMemoryId} onClick={loadEnvironment}><Eye size={16} /> Load</button>
+              <button disabled={!backendOnline} onClick={createEnvironment}><Map size={16} /> New</button>
+            </div>
+            <input value={newEnvironmentId} onChange={(event) => setNewEnvironmentId(event.target.value)} placeholder="environment id" />
+            <div className="memory-mini-list">
+              {memories.slice(0, 4).map((memory) => (
+                <button
+                  key={`${memory.memory_id}-${memory.updated_at}`}
+                  className={memory.memory_id === selectedMemoryId ? "memory-row active" : "memory-row"}
+                  onClick={() => setSelectedMemoryId(memory.memory_id)}
+                >
+                  <span>{memory.label || memory.memory_id}</span>
+                  <small>{memory.region_count || 0} regions</small>
+                </button>
+              ))}
+            </div>
+          </div>
         </Panel>
         <Panel title="Map Tools">
           <div className="segmented">

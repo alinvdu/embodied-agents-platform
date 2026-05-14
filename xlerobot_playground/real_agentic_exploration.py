@@ -13,6 +13,7 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
     parser.add_argument("--persist-path", default="./artifacts/real_xlerobot_exploration_map.json")
+    parser.add_argument("--memory-root", default=None)
     parser.add_argument("--restore-persisted-state", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--session", default="real_house_v1")
     parser.add_argument("--area", default="real_space")
@@ -115,6 +116,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
     items = [
         "--persist-path",
         args.persist_path,
+        "--memory-root",
+        args.memory_root or "./artifacts/memories",
         "--restore-persisted-state" if args.restore_persisted_state else "--no-restore-persisted-state",
         "--area",
         args.area,

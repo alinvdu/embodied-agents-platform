@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
@@ -18,6 +18,7 @@ from .home_memory import (
     resolve_home_memory_target,
     summarize_home_memory,
 )
+from .memory_discovery import EnvironmentMemoryDiscovery
 from .llm import AgentLLMRouter, AgentModelSuite, ModelConfig
 from .perception_service import execute_perception_tool
 
@@ -666,11 +667,41 @@ class HomeAgentController:
                     "summary": summarize_home_memory(memory) if memory else "No home memory loaded.",
                     "context": home_memory_agent_context(memory) if memory else {},
                 },
+                "environment_memories": self.list_environment_memories(),
                 "record": record,
                 "plan": record or {},
                 "report": {"events": list(self._events)},
                 "events": list(self._events),
             }
+
+    def list_environment_memories(self) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for discovery in _memory_discoveries(self.config):
+            for record in discovery.list():
+                key = str(record.home_memory_path or record.directory)
+                if key in seen:
+                    continue
+                seen.add(key)
+                records.append(record.to_dict())
+        return sorted(records, key=lambda item: (float(item.get("updated_at") or 0.0), item.get("memory_id") or ""), reverse=True)
+
+    def select_environment_memory(self, memory_id: str) -> dict[str, Any] | None:
+        for discovery in _memory_discoveries(self.config):
+            record = discovery.get(memory_id)
+            if record is None or record.home_memory_path is None:
+                continue
+            self.config = replace(self.config, home_memory_path=str(record.home_memory_path))
+            self.agent.config = self.config
+            self.emit("memory_selected", "Memory Selected", f"Selected `{record.memory_id}`.", record.to_dict())
+            return record.to_dict()
+        return None
+
+    def create_environment_memory(self, memory_id: str, *, label: str | None = None) -> dict[str, Any]:
+        discovery = _memory_discoveries(self.config)[0]
+        record = discovery.create(memory_id, label=label)
+        self.emit("memory_created", "Memory Created", f"Created draft memory `{record.memory_id}`.", record.to_dict())
+        return record.to_dict()
 
     def _run(self, command: str) -> None:
         record = self.agent.run(command)
@@ -704,6 +735,9 @@ class HomeAgentServer:
                 if self.path == "/api/state":
                     self._send_json(controller.snapshot())
                     return
+                if self.path == "/api/memories":
+                    self._send_json({"memories": controller.list_environment_memories()})
+                    return
                 if self.path == "/" or self.path == "/index.html":
                     self._send_json({"service": "Robot42 HomeAgent", "state": "/api/state"})
                     return
@@ -733,6 +767,19 @@ class HomeAgentServer:
                 if self.path == "/api/stop":
                     controller.stop()
                     self._send_json({"status": "stopping"})
+                    return
+                if self.path == "/api/memory/select":
+                    response = controller.select_environment_memory(str(payload.get("memory_id") or ""))
+                    self._send_json(response or {"status": "missing"})
+                    return
+                if self.path == "/api/memory/create":
+                    memory_id = str(payload.get("memory_id") or payload.get("label") or f"home_{int(time.time())}")
+                    self._send_json(
+                        controller.create_environment_memory(
+                            memory_id,
+                            label=payload.get("label"),
+                        )
+                    )
                     return
                 self.send_error(HTTPStatus.NOT_FOUND, "not found")
 
@@ -803,24 +850,44 @@ def resolve_home_memory_path(config: HomeAgentConfig) -> Path | None:
 
 
 def discover_latest_home_memory_path(search_roots: tuple[str, ...] = tuple()) -> Path | None:
-    roots = [Path(item).expanduser() for item in search_roots if item]
-    if not roots:
-        roots = [Path.cwd()]
     candidates: list[Path] = []
-    for root in roots:
-        if not root.exists():
-            continue
+    for discovery in _memory_discoveries(HomeAgentConfig(home_memory_search_roots=search_roots)):
+        for record in discovery.list():
+            if record.home_memory_path is not None:
+                candidates.append(record.home_memory_path)
+    for root in _raw_search_roots(search_roots):
         if root.is_file() and root.name.endswith(".home_memory.json"):
             candidates.append(root)
-            continue
-        direct_home_memory = root / "home_memory"
-        if direct_home_memory.exists():
-            candidates.extend(direct_home_memory.glob("*.home_memory.json"))
-        candidates.extend(path for path in root.rglob("*.home_memory.json") if "home_memory" in path.parts)
+        elif root.exists():
+            candidates.extend(path for path in root.rglob("*.home_memory.json") if "home_memory" in path.parts)
     existing = [path for path in set(candidates) if path.exists()]
     if not existing:
         return None
     return max(existing, key=lambda path: path.stat().st_mtime)
+
+
+def _memory_discoveries(config: HomeAgentConfig) -> list[EnvironmentMemoryDiscovery]:
+    roots = _raw_search_roots(config.home_memory_search_roots)
+    memory_roots: list[Path] = []
+    for root in roots:
+        if root.name == "memories":
+            memory_roots.append(root)
+        else:
+            memory_roots.append(root / "memories")
+            memory_roots.append(root / "artifacts" / "memories")
+    if not memory_roots:
+        memory_roots = [Path.cwd() / "artifacts" / "memories"]
+    deduped: list[Path] = []
+    for root in memory_roots:
+        expanded = root.expanduser()
+        if expanded not in deduped:
+            deduped.append(expanded)
+    return [EnvironmentMemoryDiscovery(root) for root in deduped]
+
+
+def _raw_search_roots(search_roots: tuple[str, ...]) -> list[Path]:
+    roots = [Path(item).expanduser() for item in search_roots if item]
+    return roots or [Path.cwd()]
 
 
 def _search_roots_from_env() -> tuple[str, ...]:

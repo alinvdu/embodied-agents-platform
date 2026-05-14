@@ -961,6 +961,93 @@ def _occupancy_map_like_to_ros_map(
         data=tuple(data),
     )
 
+
+def _pose_from_map_payload(payload: Any) -> Pose2D | None:
+    if not isinstance(payload, dict) or "x" not in payload or "y" not in payload:
+        return None
+    try:
+        return Pose2D(float(payload["x"]), float(payload["y"]), float(payload.get("yaw", 0.0) or 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def _start_pose_from_environment_payload(map_payload: dict[str, Any]) -> Pose2D | None:
+    start_pose = map_payload.get("start_pose")
+    if isinstance(start_pose, dict):
+        pose = _pose_from_map_payload(start_pose.get("pose"))
+        if pose is not None:
+            return pose
+    for place in map_payload.get("named_places", []):
+        if not isinstance(place, dict):
+            continue
+        if str(place.get("name", "")).lower() not in {"dock", "start", "home"}:
+            continue
+        pose = _pose_from_map_payload(place.get("pose"))
+        if pose is not None:
+            return pose
+    return None
+
+
+def _ros_map_from_environment_payload(map_payload: dict[str, Any]) -> RosOccupancyMap | None:
+    occupancy = map_payload.get("occupancy")
+    if not isinstance(occupancy, dict):
+        return None
+    cells = [item for item in occupancy.get("cells", []) if isinstance(item, dict)]
+    if not cells:
+        return None
+    resolution = float(occupancy.get("resolution") or map_payload.get("resolution") or 0.25)
+    resolution = max(resolution, 1e-6)
+    bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+    try:
+        min_x = float(bounds.get("min_x"))
+        min_y = float(bounds.get("min_y"))
+        max_x = float(bounds.get("max_x"))
+        max_y = float(bounds.get("max_y"))
+    except (TypeError, ValueError):
+        xs = [float(item.get("x", 0.0)) for item in cells]
+        ys = [float(item.get("y", 0.0)) for item in cells]
+        min_x = min(xs)
+        min_y = min(ys)
+        max_x = max(xs) + resolution
+        max_y = max(ys) + resolution
+    width = max(int(round((max_x - min_x) / resolution)), 1)
+    height = max(int(round((max_y - min_y) / resolution)), 1)
+    data = [-1] * (width * height)
+    occupancy_map = RosOccupancyMap(
+        resolution=resolution,
+        width=width,
+        height=height,
+        origin_x=min_x,
+        origin_y=min_y,
+        data=tuple(data),
+    )
+    for item in cells:
+        try:
+            x = float(item.get("x", 0.0)) + resolution / 2.0
+            y = float(item.get("y", 0.0)) + resolution / 2.0
+        except (TypeError, ValueError):
+            continue
+        cell_x, cell_y = occupancy_map.world_to_cell(x, y)
+        if not occupancy_map.in_bounds(cell_x, cell_y):
+            continue
+        state = str(item.get("manual_override") or item.get("state") or "").lower()
+        if state == "blocked" or state == "occupied":
+            value = 100
+        elif state == "cleared" or state == "free":
+            value = 0
+        else:
+            continue
+        data[cell_y * width + cell_x] = value
+    return RosOccupancyMap(
+        resolution=resolution,
+        width=width,
+        height=height,
+        origin_x=min_x,
+        origin_y=min_y,
+        data=tuple(data),
+    )
+
+
 class FrontierMemory:
     def __init__(self, resolution: float) -> None:
         self.resolution = resolution
@@ -2943,6 +3030,7 @@ class RosExplorationSession:
         self.last_alert: str | None = None
         self.last_alert_id = 0
         self.last_nav2_preview: dict[str, Any] | None = None
+        self._navigation_only_map: RosOccupancyMap | None = None
         self._lock = threading.RLock()
         self._last_pose: Pose2D | None = None
         self._manual_scan_in_progress = False
@@ -3200,6 +3288,7 @@ class RosExplorationSession:
             self.frontier_memory = FrontierMemory(self.config.occupancy_resolution)
             self.semantic_observer = SemanticWaypointObserver(self.config, scenario=None)
             self.manual_occupancy_edits = edits_from_payload({}, cell_type=GridCell)
+            self._navigation_only_map = None
             self.keyframes = []
             self.trajectory = []
             self.decision_log = []
@@ -3238,6 +3327,55 @@ class RosExplorationSession:
             self._initialize_scan_state()
             self._prepare_decision_locked()
             return self.snapshot()
+
+    def start_navigation_only(self, map_payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            saved_map = _ros_map_from_environment_payload(map_payload)
+            if saved_map is None:
+                self.status = "navigation_only_failed"
+                self.last_error = "Loaded environment does not contain an occupancy map."
+                return {"status": "failed", "reason": self.last_error}
+            self._navigation_only_map = saved_map
+            self.scan_map_resolution = float(saved_map.resolution)
+            edits = map_payload.get("artifacts", {}).get("manual_occupancy_edits")
+            self.manual_occupancy_edits = edits_from_payload(
+                edits if isinstance(edits, dict) else {},
+                cell_type=GridCell,
+            )
+            start_pose = _start_pose_from_environment_payload(map_payload)
+            initial_pose_result = None
+            if start_pose is not None:
+                self.status = "navigation_only_setting_initial_pose"
+                initial_pose_result = self.runtime.set_initial_pose(start_pose)
+            effective_map = EditableOccupancyMap(saved_map, self.manual_occupancy_edits)
+            self.runtime.publish_navigation_map(
+                _occupancy_map_like_to_ros_map(effective_map),
+                map_to_odom=_pose_from_map_payload(initial_pose_result.get("map_to_odom"))
+                if isinstance(initial_pose_result, dict)
+                else None,
+                force_publish=True,
+            )
+            self.runtime.spin_for(0.3)
+            live_pose = self.runtime.current_pose()
+            if live_pose is not None:
+                self._update_pose_history(live_pose)
+            self.status = "navigation_only_active"
+            self.backend.update_external_task(
+                self.task_id,
+                message=(
+                    "Navigation-only session active on the loaded environment. "
+                    "Use Preview or Go to test manual Nav2 waypoints."
+                ),
+            )
+            return {
+                "status": "active",
+                "mode": "navigation_only",
+                "initial_pose": None if start_pose is None else start_pose.to_dict(),
+                "initial_pose_result": initial_pose_result,
+                "robot_pose": None if live_pose is None else live_pose.to_dict(),
+                "map": map_payload,
+            }
 
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
@@ -3466,6 +3604,7 @@ class RosExplorationSession:
 
     def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            self._sync_manual_occupancy_edits()
             try:
                 current_pose = self.runtime.current_pose()
                 target_pose = Pose2D(
@@ -3533,6 +3672,7 @@ class RosExplorationSession:
 
     def preview_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
+            self._sync_manual_occupancy_edits()
             try:
                 current_pose = self.runtime.current_pose()
                 target_pose = Pose2D(
@@ -3644,6 +3784,8 @@ class RosExplorationSession:
         }
 
     def _current_ros_map(self) -> RosOccupancyMap | None:
+        if self._navigation_only_map is not None:
+            return self._navigation_only_map
         if (
             self.config.ros_navigation_map_source == "external"
             and self.config.ros_fuse_external_projected_map_snapshots
@@ -4830,12 +4972,16 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
+        navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
+        navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
         super().__init__(
             backend,
             waypoint_navigator=waypoint_navigator,
             waypoint_previewer=waypoint_previewer,
             scan_performer=scan_performer,
+            navigation_session_starter=navigation_session_starter,
+            navigation_session_stopper=navigation_session_stopper,
         )
         self.start_gate = start_gate
 
@@ -4843,7 +4989,7 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         return self.start_gate.request_start(area=area, session=session, source=source)
 
 
-class ManiSkillExplorationRunner:
+class ExplorationRunner:
     def __init__(
         self,
         config: SimExplorationConfig,
@@ -4855,7 +5001,90 @@ class ManiSkillExplorationRunner:
         self.backend = backend
         self.start_gate = start_gate
         self._active_session: _ApartmentExplorationSession | RosExplorationSession | None = None
+        self._active_session_kind: str | None = None
         self._active_session_lock = threading.RLock()
+
+    def start_navigation_session(self) -> dict[str, Any]:
+        if self.config.nav2_mode != "ros":
+            return {"status": "unavailable", "reason": "Navigation-only sessions require real ROS/Nav2 mode."}
+        with self._active_session_lock:
+            if self._active_session is not None:
+                return {
+                    "status": "active",
+                    "mode": self._active_session_kind or "unknown",
+                    "reason": "A live ROS/Nav2 session is already active.",
+                }
+        map_payload = self.backend.get_map()
+        if not isinstance(map_payload, dict):
+            return {"status": "unavailable", "reason": "Load a saved environment before starting a nav session."}
+        task = self.backend.begin_external_task(
+            tool_id="navigation_session",
+            area=self.config.area,
+            session=self.config.session,
+            source="operator",
+            message="Starting navigation-only ROS/Nav2 session from loaded environment.",
+        )
+        edits = map_payload.get("artifacts", {}).get("manual_occupancy_edits")
+        if isinstance(edits, dict):
+            self.backend.set_occupancy_edits(str(task["task_id"]), edits)
+            map_payload = self.backend.get_map() or map_payload
+        session = RosExplorationSession(self.config, self.backend, str(task["task_id"]))
+        with self._active_session_lock:
+            self._active_session = session
+            self._active_session_kind = "navigation_only"
+        try:
+            result = session.start_navigation_only(map_payload)
+        except Exception as exc:
+            with self._active_session_lock:
+                if self._active_session is session:
+                    self._active_session = None
+                    self._active_session_kind = None
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
+            self.backend.fail_external_task(
+                str(task["task_id"]),
+                message=f"Navigation-only session failed: {exc}",
+                result={"error": str(exc)},
+            )
+            return {"status": "failed", "reason": str(exc)}
+        if result.get("status") != "active":
+            with self._active_session_lock:
+                if self._active_session is session:
+                    self._active_session = None
+                    self._active_session_kind = None
+            close = getattr(session, "close", None)
+            if callable(close):
+                close()
+            self.backend.fail_external_task(
+                str(task["task_id"]),
+                message=str(result.get("reason") or "Navigation-only session failed."),
+                result=result,
+            )
+        return result
+
+    def stop_navigation_session(self) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+            kind = self._active_session_kind
+            if session is None:
+                return {"status": "inactive", "reason": "No live ROS/Nav2 session is active."}
+            if kind != "navigation_only":
+                return {"status": "unavailable", "reason": f"The active session is `{kind}`, not navigation-only."}
+            self._active_session = None
+            self._active_session_kind = None
+        task_id = str(getattr(session, "task_id", ""))
+        close = getattr(session, "close", None)
+        if callable(close):
+            close()
+        if task_id:
+            self.backend.complete_external_task(
+                task_id,
+                map_payload=self.backend.get_map() or {},
+                message="Stopped navigation-only ROS/Nav2 session.",
+                result={"mode": "navigation_only"},
+            )
+        return {"status": "stopped", "mode": "navigation_only"}
 
     def navigate_to_waypoint(self, pose: dict[str, Any]) -> dict[str, Any]:
         with self._active_session_lock:
@@ -4864,8 +5093,8 @@ class ManiSkillExplorationRunner:
             return {
                 "status": "unavailable",
                 "reason": (
-                    "No live exploration session is running. For click waypoint tests, keep the session alive "
-                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                    "No live navigation session is running. Load an environment and click Start Nav Session, "
+                    "or keep an exploration session alive with --pause-for-operator-approval."
                 ),
             }
         navigate = getattr(session, "navigate_to_manual_waypoint", None)
@@ -4880,8 +5109,8 @@ class ManiSkillExplorationRunner:
             return {
                 "status": "unavailable",
                 "reason": (
-                    "No live exploration session is running. For path previews, keep the session alive "
-                    "with --pause-for-operator-approval instead of --stop-after-initial-scan."
+                    "No live navigation session is running. Load an environment and click Start Nav Session, "
+                    "or keep an exploration session alive with --pause-for-operator-approval."
                 ),
             }
         preview = getattr(session, "preview_manual_waypoint", None)
@@ -4919,6 +5148,7 @@ class ManiSkillExplorationRunner:
             session = _ApartmentExplorationSession(self.config, self.backend, str(task["task_id"]))
         with self._active_session_lock:
             self._active_session = session
+            self._active_session_kind = "exploration"
         try:
             map_payload = session.run()
         except Exception as exc:
@@ -4932,6 +5162,7 @@ class ManiSkillExplorationRunner:
             with self._active_session_lock:
                 if self._active_session is session:
                     self._active_session = None
+                    self._active_session_kind = None
             close = getattr(session, "close", None)
             if callable(close):
                 close()
@@ -4953,6 +5184,9 @@ class ManiSkillExplorationRunner:
         return self.backend.snapshot()
 
 
+ManiSkillExplorationRunner = ExplorationRunner
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -4962,6 +5196,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo-root", default=str(resolve_xlerobot_repo_root()))
     parser.add_argument("--persist-path", default="./artifacts/xlerobot_exploration_map.json")
+    parser.add_argument("--memory-root", default=None)
     parser.add_argument("--restore-persisted-state", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--area", default="apartment")
     parser.add_argument("--session", default="house_v1")
@@ -5118,11 +5353,12 @@ def main(argv: list[str] | None = None) -> int:
         ExplorationBackendConfig(
             mode="ros" if args.nav2_mode == "ros" else "sim",
             persist_path=args.persist_path,
+            memory_root_path=args.memory_root,
             restore_persisted_state=args.restore_persisted_state,
             occupancy_resolution=args.occupancy_resolution,
         )
     )
-    runner = ManiSkillExplorationRunner(
+    runner = ExplorationRunner(
         SimExplorationConfig(
             repo_root=args.repo_root,
             persist_path=args.persist_path,
@@ -5233,6 +5469,8 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
+                navigation_session_starter=runner.start_navigation_session,
+                navigation_session_stopper=runner.stop_navigation_session,
             )
         else:
             controller = LocalExplorationUIController(
@@ -5240,6 +5478,8 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
+                navigation_session_starter=runner.start_navigation_session,
+                navigation_session_stopper=runner.stop_navigation_session,
             )
         server = ExplorationReviewServer(
             controller,
