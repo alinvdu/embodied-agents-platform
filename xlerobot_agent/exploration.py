@@ -486,6 +486,8 @@ class ExplorationBackend:
             self._tasks.clear()
             self._manual_occupancy_edits.clear()
             self._restore_from_payload(payload)
+            self._ensure_start_pose()
+            self._prepare_loaded_environment_view()
             self._persist()
             return self.snapshot()
 
@@ -493,6 +495,7 @@ class ExplorationBackend:
         with self._lock:
             if self._current_map is None:
                 return None
+            self._ensure_start_pose()
             self._current_map["approved"] = True
             self._current_map["approved_at"] = time.time()
             self._maps[self._current_map["map_id"]] = json.loads(json.dumps(self._current_map))
@@ -515,6 +518,29 @@ class ExplorationBackend:
             self.set_named_place("dock", resolved_pose, region_id=_region_id_for_pose(self._current_map, resolved_pose))
             self._persist()
             return json.loads(json.dumps(start_pose))
+
+    def _ensure_start_pose(self) -> None:
+        if self._current_map is None:
+            return
+        if isinstance(self._current_map.get("start_pose"), dict):
+            return
+        self._current_map["start_pose"] = {
+            "name": "start",
+            "pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+            "fixed": True,
+            "source": "default_map_origin",
+        }
+
+    def _prepare_loaded_environment_view(self) -> None:
+        if self._current_map is None:
+            return
+        start_pose = self._current_map.get("start_pose")
+        pose = start_pose.get("pose") if isinstance(start_pose, dict) else None
+        if isinstance(pose, dict):
+            self._current_map["robot_pose"] = _json_pose(pose)
+        artifacts = self._current_map.setdefault("artifacts", {})
+        if isinstance(artifacts, dict):
+            artifacts["hide_exploration_trajectory"] = True
 
     def update_region(
         self,

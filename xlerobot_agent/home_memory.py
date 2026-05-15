@@ -267,7 +267,12 @@ def _start_pose_from_map(map_payload: dict[str, Any]) -> dict[str, Any] | None:
                 "fixed": True,
                 "source": "named_place",
             }
-    return None
+    return {
+        "name": "start",
+        "pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+        "fixed": True,
+        "source": "default_map_origin",
+    }
 
 
 def _memory_region(region: dict[str, Any]) -> dict[str, Any]:

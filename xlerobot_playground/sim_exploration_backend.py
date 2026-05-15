@@ -985,7 +985,7 @@ def _start_pose_from_environment_payload(map_payload: dict[str, Any]) -> Pose2D 
         pose = _pose_from_map_payload(place.get("pose"))
         if pose is not None:
             return pose
-    return None
+    return Pose2D(0.0, 0.0, 0.0)
 
 
 def _ros_map_from_environment_payload(map_payload: dict[str, Any]) -> RosOccupancyMap | None:
