@@ -8,7 +8,7 @@ import {
   Eraser,
   Eye,
   Home,
-  Map,
+  Map as MapIcon,
   Navigation,
   Pause,
   PenLine,
@@ -221,7 +221,7 @@ function EnvironmentCard({
         <div className="environment-detail">{environment.description}</div>
       </div>
       <div className="environment-metrics">
-        <span><Map size={15} /> {environment.regionCount} regions</span>
+        <span><MapIcon size={15} /> {environment.regionCount} regions</span>
         <span><Home size={15} /> {environment.objectCount} objects</span>
       </div>
       <div className="memory-picker">
@@ -235,7 +235,7 @@ function EnvironmentCard({
         </select>
         <div className="new-memory-row">
           <input value={newMemoryId || ""} onChange={(event) => setNewMemoryId?.(event.target.value)} placeholder="new environment" />
-          <button className="compact-button" onClick={onCreateMemory}><Map size={15} /> New</button>
+          <button className="compact-button" onClick={onCreateMemory}><MapIcon size={15} /> New</button>
         </div>
       </div>
       <button className="compact-button" onClick={onConfigure}><Settings size={15} /> Configure</button>
@@ -406,7 +406,7 @@ function ExplorationConsole({ onExit }) {
         <Panel title="Control">
           <div className="toolbar">
             <button className="primary" disabled={!backendOnline} onClick={() => post("/api/explore/start", { area: "downstairs", session: activeEnvironmentId() })}><Play size={16} /> Start</button>
-            <button disabled={!backendOnline} onClick={() => post("/api/create_map/start", { area: "downstairs", session: activeEnvironmentId() })}><Map size={16} /> Create Map</button>
+            <button disabled={!backendOnline} onClick={() => post("/api/create_map/start", { area: "downstairs", session: activeEnvironmentId() })}><MapIcon size={16} /> Create Map</button>
             <button disabled={!backendOnline} onClick={() => post("/api/scan/perform", {})}><Eye size={16} /> Scan</button>
             <button disabled={!backendOnline} onClick={() => post("/api/task/pause", { task_id: activeTask?.task_id })}><Pause size={16} /> Pause</button>
             <button disabled={!backendOnline} onClick={() => post("/api/task/resume", { task_id: activeTask?.task_id })}><Play size={16} /> Resume</button>
@@ -432,7 +432,7 @@ function ExplorationConsole({ onExit }) {
             </select>
             <div className="toolbar">
               <button disabled={!backendOnline || !selectedMemoryId} onClick={loadEnvironment}><Eye size={16} /> Load</button>
-              <button disabled={!backendOnline} onClick={createEnvironment}><Map size={16} /> New</button>
+              <button disabled={!backendOnline} onClick={createEnvironment}><MapIcon size={16} /> New</button>
             </div>
             <input value={newEnvironmentId} onChange={(event) => setNewEnvironmentId(event.target.value)} placeholder="environment id" />
             <div className="memory-mini-list">
@@ -456,7 +456,7 @@ function ExplorationConsole({ onExit }) {
             <ModeButton disabled={!backendOnline} mode={mode} value="reset" setMode={setMode} icon={<RotateCcw size={16} />} label="Reset" />
             <ModeButton disabled={!backendOnline} mode={mode} value="preview" setMode={setMode} icon={<Eye size={16} />} label="Preview" />
             <ModeButton disabled={!backendOnline} mode={mode} value="waypoint" setMode={setMode} icon={<Navigation size={16} />} label="Go" />
-            <ModeButton disabled={!backendOnline} mode={mode} value="region" setMode={setMode} icon={<Map size={16} />} label="Region" />
+            <ModeButton disabled={!backendOnline} mode={mode} value="region" setMode={setMode} icon={<MapIcon size={16} />} label="Region" />
           </div>
           {mode === "region" ? (
             <div className="region-draft">
@@ -747,7 +747,7 @@ function ExplorationMap({
 function OfflineExplorationPlaceholder({ onRetry }) {
   return (
     <div className="offline-map">
-      <div className="offline-icon"><Map size={26} /></div>
+      <div className="offline-icon"><MapIcon size={26} /></div>
       <strong>Exploration backend offline</strong>
       <span>Start the exploration backend to load the map editor, then retry the connection.</span>
       <button onClick={onRetry}><RotateCcw size={16} /> Retry Connection</button>
