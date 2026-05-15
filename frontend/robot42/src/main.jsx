@@ -496,6 +496,7 @@ function ExplorationConsole({ onExit }) {
               setSelectedRegionId={setSelectedRegionId}
               post={post}
               setNavMessage={setNavMessage}
+              activeTask={activeTask}
               lastWaypoint={lastWaypoint}
               setLastWaypoint={setLastWaypoint}
               draftRegion={draftRegion}
@@ -555,6 +556,7 @@ function ExplorationMap({
   setSelectedRegionId,
   post,
   setNavMessage,
+  activeTask,
   lastWaypoint,
   setLastWaypoint,
   draftRegion,
@@ -718,10 +720,11 @@ function ExplorationMap({
     return <circle key={`draft-${index}`} cx={p.x} cy={p.y} r="6" className="draft-handle" />;
   });
 
-  const trajectory = (map.trajectory || []).map((point) => {
+  const showTrajectory = Boolean(activeTask) && !map.artifacts?.hide_exploration_trajectory;
+  const trajectory = showTrajectory ? (map.trajectory || []).map((point) => {
     const p = project(point);
     return `${p.x},${p.y}`;
-  }).join(" ");
+  }).join(" ") : "";
   const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0];
   const robot = robotPose ? project(robotPose) : null;
   const headingLength = Math.max(map.occupancy?.resolution || 0.25, 0.25) * 3.5;
