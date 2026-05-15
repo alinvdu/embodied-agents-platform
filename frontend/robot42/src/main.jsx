@@ -261,6 +261,7 @@ function ExplorationConsole({ onExit }) {
   const [newRegionLabel, setNewRegionLabel] = useState("kitchen");
   const [newRegionPurpose, setNewRegionPurpose] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
+  const [navMessage, setNavMessage] = useState("");
 
   const refresh = useCallback(async () => {
     try {
@@ -487,19 +488,23 @@ function ExplorationConsole({ onExit }) {
       </div>
       <div className="map-panel">
         {backendOnline ? (
-          <ExplorationMap
-            map={map}
-            mode={mode}
-            selectedRegionId={selectedRegionId}
-            setSelectedRegionId={setSelectedRegionId}
-            post={post}
-            lastWaypoint={lastWaypoint}
-            setLastWaypoint={setLastWaypoint}
-            draftRegion={draftRegion}
-            setDraftRegion={setDraftRegion}
-            selectedRegion={selectedRegionForMap}
-            updateSelectedPolygon={updateSelectedPolygon}
-          />
+          <>
+            <ExplorationMap
+              map={map}
+              mode={mode}
+              selectedRegionId={selectedRegionId}
+              setSelectedRegionId={setSelectedRegionId}
+              post={post}
+              setNavMessage={setNavMessage}
+              lastWaypoint={lastWaypoint}
+              setLastWaypoint={setLastWaypoint}
+              draftRegion={draftRegion}
+              setDraftRegion={setDraftRegion}
+              selectedRegion={selectedRegionForMap}
+              updateSelectedPolygon={updateSelectedPolygon}
+            />
+            {navMessage ? <div className="map-status">{navMessage}</div> : null}
+          </>
         ) : (
           <OfflineExplorationPlaceholder onRetry={refresh} />
         )}
@@ -549,6 +554,7 @@ function ExplorationMap({
   selectedRegionId,
   setSelectedRegionId,
   post,
+  setNavMessage,
   lastWaypoint,
   setLastWaypoint,
   draftRegion,
@@ -580,6 +586,7 @@ function ExplorationMap({
     if (!matrix) return null;
     const local = point.matrixTransform(matrix.inverse());
     const world = worldFromSvg(bounds, local.x, local.y);
+    if (!world) return null;
     const resolution = map.occupancy?.resolution || 0.25;
     const cell = {
       cell_x: Math.floor((world.x - bounds.min_x) / resolution),
@@ -593,7 +600,7 @@ function ExplorationMap({
 
   const pointerDown = async (event) => {
     event.preventDefault();
-    if (event.target.closest?.("[data-region-id]") && mode !== "region") return;
+    if (event.target.closest?.("[data-region-id]") && !["region", "preview", "waypoint"].includes(mode)) return;
     const cell = cellFromEvent(event);
     if (!cell) return;
     if (mode === "region") {
@@ -604,7 +611,15 @@ function ExplorationMap({
       const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0] || {};
       const pose = { x: cell.x, y: cell.y, yaw: Number(robotPose.yaw || 0) };
       setLastWaypoint(pose);
-      await post(mode === "preview" ? "/api/nav/preview" : "/api/nav/waypoint", { pose });
+      setNavMessage?.(`${mode === "preview" ? "Previewing" : "Sending"} waypoint (${round3(pose.x)}, ${round3(pose.y)})...`);
+      try {
+        const response = await post(mode === "preview" ? "/api/nav/preview" : "/api/nav/waypoint", { pose });
+        const resolvedPose = response.normalized_pose || response.requested_pose || pose;
+        setLastWaypoint(resolvedPose);
+        setNavMessage?.(`${mode === "preview" ? "Preview" : "Go"} ${response.status || "sent"}: ${response.reason || "Nav2 request returned."}`);
+      } catch (error) {
+        setNavMessage?.(`${mode === "preview" ? "Preview" : "Go"} failed: ${error.message || String(error)}`);
+      }
       return;
     }
     painting.current = true;
@@ -709,6 +724,11 @@ function ExplorationMap({
   }).join(" ");
   const robotPose = map.robot_pose || (map.trajectory || []).slice(-1)[0];
   const robot = robotPose ? project(robotPose) : null;
+  const headingLength = Math.max(map.occupancy?.resolution || 0.25, 0.25) * 3.5;
+  const robotHeading = robotPose ? project({
+    x: Number(robotPose.x || 0) + Math.cos(Number(robotPose.yaw || 0)) * headingLength,
+    y: Number(robotPose.y || 0) + Math.sin(Number(robotPose.yaw || 0)) * headingLength,
+  }) : null;
   const places = (map.named_places || []).map((place) => {
     const p = project(place.pose || { x: 0, y: 0 });
     return (
@@ -739,6 +759,8 @@ function ExplorationMap({
       {places}
       {manual ? <circle cx={manual.x} cy={manual.y} r="9" fill="#2563eb" /> : null}
       {robot ? <circle cx={robot.x} cy={robot.y} r="11" fill="#b42318" /> : null}
+      {robot && robotHeading ? <line x1={robot.x} y1={robot.y} x2={robotHeading.x} y2={robotHeading.y} className="robot-heading" /> : null}
+      {robot && robotHeading ? <circle cx={robotHeading.x} cy={robotHeading.y} r="4" fill="#6d0f0a" /> : null}
       {robot ? <text x={robot.x + 12} y={robot.y - 12} className="robot-label">robot</text> : null}
     </svg>
   );
@@ -870,12 +892,14 @@ function mapViewport(bounds) {
 
 function worldFromSvg(bounds, svgX, svgY) {
   const viewport = mapViewport(bounds);
+  const right = viewport.left + viewport.drawW;
+  const bottom = viewport.top + viewport.drawH;
+  if (svgX < viewport.left || svgX > right || svgY < viewport.top || svgY > bottom) {
+    return null;
+  }
   const x = bounds.min_x + (svgX - viewport.left) / viewport.scale;
   const y = bounds.max_y - (svgY - viewport.top) / viewport.scale;
-  return {
-    x: Math.min(Math.max(x, bounds.min_x), bounds.max_x),
-    y: Math.min(Math.max(y, bounds.min_y), bounds.max_y),
-  };
+  return { x, y };
 }
 
 createRoot(document.getElementById("root")).render(<App />);

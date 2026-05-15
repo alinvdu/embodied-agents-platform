@@ -528,6 +528,7 @@ label {
 
 .map-panel {
   padding: 12px;
+  position: relative;
 }
 
 .map-canvas {
@@ -604,6 +605,27 @@ label {
   font-size: 12px;
   font-weight: 800;
   fill: #b42318;
+}
+
+.robot-heading {
+  stroke: #6d0f0a;
+  stroke-width: 4.5;
+  stroke-linecap: round;
+}
+
+.map-status {
+  position: absolute;
+  left: 18px;
+  bottom: 18px;
+  max-width: calc(100% - 36px);
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.92);
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 650;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
 }
 
 .vertex-handle {
