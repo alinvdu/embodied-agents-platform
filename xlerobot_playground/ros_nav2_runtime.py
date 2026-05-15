@@ -504,6 +504,9 @@ class RosExplorationRuntime(Node):
         self._nav_goal_history: list[dict[str, Any]] = []
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
+        self._published_navigation_map: RosOccupancyMap | None = None
+        self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self._force_publish_navigation_state = False
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, config.initial_pose_topic, 10)
         self._point_cloud_update_map_enabled_pub = self.create_publisher(
@@ -539,9 +542,6 @@ class RosExplorationRuntime(Node):
         self.create_subscription(PointCloud2, config.point_cloud_topic, self._on_point_cloud, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
-        self._published_navigation_map: RosOccupancyMap | None = None
-        self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
-        self._force_publish_navigation_state = False
         self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
 
     def _spin_once(self, *, timeout_sec: float) -> None:
