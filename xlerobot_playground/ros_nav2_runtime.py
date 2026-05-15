@@ -546,14 +546,11 @@ class RosExplorationRuntime(Node):
 
     def _spin_once(self, *, timeout_sec: float) -> None:
         with self._spin_lock:
-            self._publish_internal_navigation_state()
             rclpy.spin_once(self, timeout_sec=timeout_sec)
 
     def _spin_until_future_complete(self, future: Any) -> None:
         with self._spin_lock:
-            while not future.done():
-                self._publish_internal_navigation_state()
-                rclpy.spin_once(self, timeout_sec=0.05)
+            rclpy.spin_until_future_complete(self, future)
 
     def _on_map(self, message: OccupancyGrid) -> None:
         self.latest_map = RosOccupancyMap(
