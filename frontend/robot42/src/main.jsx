@@ -856,6 +856,10 @@ function eventText(event) {
   return event.summary || event.message || event.kind || event.type || "Updated.";
 }
 
+function round3(value) {
+  return Math.round(Number(value || 0) * 1000) / 1000;
+}
+
 function mapBounds(map) {
   if (map?.occupancy?.bounds) return map.occupancy.bounds;
   const points = [];
