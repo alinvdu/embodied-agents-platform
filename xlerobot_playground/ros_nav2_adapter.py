@@ -218,6 +218,7 @@ class RemoteRosExplorationRuntime:
         *,
         map_to_odom: Pose2D | None = None,
         force_publish: bool = False,
+        publish_map_to_odom: bool = True,
     ) -> None:
         self._request_json(
             "/api/runtime/publish_navigation_map",
@@ -225,6 +226,7 @@ class RemoteRosExplorationRuntime:
                 "occupancy_map": serialize_map(occupancy_map),
                 "map_to_odom": serialize_pose(map_to_odom),
                 "force_publish": force_publish,
+                "publish_map_to_odom": publish_map_to_odom,
             },
         )
 
@@ -419,6 +421,7 @@ class RosNav2AdapterServer:
                             occupancy_map,
                             map_to_odom=pose_from_payload(payload.get("map_to_odom")),
                             force_publish=bool(payload.get("force_publish", False)),
+                            publish_map_to_odom=bool(payload.get("publish_map_to_odom", True)),
                         )
                         self._send_json({"status": "ok", "runtime_state": outer._runtime_state_payload()})
                         return

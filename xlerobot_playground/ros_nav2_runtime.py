@@ -506,6 +506,7 @@ class RosExplorationRuntime(Node):
         self._nav_scan_history: list[dict[str, Any]] = []
         self._published_navigation_map: RosOccupancyMap | None = None
         self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
+        self._publish_map_to_odom_enabled = True
         self._force_publish_navigation_state = False
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, config.initial_pose_topic, 10)
@@ -1363,10 +1364,13 @@ class RosExplorationRuntime(Node):
         *,
         map_to_odom: Pose2D | None = None,
         force_publish: bool = False,
+        publish_map_to_odom: bool = True,
     ) -> None:
         self._published_navigation_map = occupancy_map
+        self._publish_map_to_odom_enabled = bool(publish_map_to_odom)
         if map_to_odom is not None:
             self._map_to_odom = map_to_odom
+            self._publish_map_to_odom_enabled = True
         if force_publish:
             self._force_publish_navigation_state = True
         self.latest_map = occupancy_map
@@ -1418,7 +1422,8 @@ class RosExplorationRuntime(Node):
     def _publish_internal_navigation_state(self) -> None:
         if not self.config.publish_internal_navigation_map and not self._force_publish_navigation_state:
             return
-        self._publish_map_to_odom_transform()
+        if self._publish_map_to_odom_enabled:
+            self._publish_map_to_odom_transform()
         if self._published_navigation_map is None:
             return
         self._map_pub.publish(self._occupancy_grid_message(self._published_navigation_map))

@@ -3345,16 +3345,27 @@ class RosExplorationSession:
             )
             start_pose = _start_pose_from_environment_payload(map_payload)
             initial_pose_result = None
-            if start_pose is not None:
+            use_static_identity_tf = (
+                start_pose is not None
+                and abs(float(start_pose.x)) < 1e-6
+                and abs(float(start_pose.y)) < 1e-6
+                and abs(float(start_pose.yaw)) < 1e-6
+            )
+            if start_pose is not None and not use_static_identity_tf:
                 self.status = "navigation_only_setting_initial_pose"
                 initial_pose_result = self.runtime.set_initial_pose(start_pose)
             effective_map = EditableOccupancyMap(saved_map, self.manual_occupancy_edits)
             self.runtime.publish_navigation_map(
                 _occupancy_map_like_to_ros_map(effective_map),
-                map_to_odom=_pose_from_map_payload(initial_pose_result.get("map_to_odom"))
-                if isinstance(initial_pose_result, dict)
-                else None,
+                map_to_odom=None
+                if use_static_identity_tf
+                else (
+                    _pose_from_map_payload(initial_pose_result.get("map_to_odom"))
+                    if isinstance(initial_pose_result, dict)
+                    else None
+                ),
                 force_publish=True,
+                publish_map_to_odom=not use_static_identity_tf,
             )
             self.runtime.spin_for(0.3)
             live_pose = self.runtime.current_pose()
