@@ -33,9 +33,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--specialist-model", default=None)
     parser.add_argument("--specialist-base-url", default=None)
     parser.add_argument("--specialist-api-key", default=None)
-    parser.add_argument("--execute-navigation", action="store_true")
-    parser.add_argument("--live-tools", action="store_true", help="Disable dry-run mode for navigation/skill tool calls.")
-    parser.add_argument("--allow-skills-without-approval", action="store_true")
     return parser
 
 
@@ -55,7 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Main model: {config.model.provider}/{config.model.model}")
     if config.specialist_model:
         print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
-    print(f"Dry run: {config.dry_run}")
+    print("Exposed tools: resolve_navigation_to_region")
     server.serve_forever()
     return 0
 
@@ -86,9 +83,6 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
         port=args.port or config.port,
         model=model,
         specialist_model=specialist,
-        dry_run=False if args.live_tools else config.dry_run,
-        auto_execute_navigation=True if args.execute_navigation else config.auto_execute_navigation,
-        require_skill_approval=False if args.allow_skills_without_approval else config.require_skill_approval,
     )
 
 
