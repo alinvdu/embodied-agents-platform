@@ -3840,7 +3840,12 @@ class RosExplorationSession:
                 }
                 with self._lock:
                     self.status = "relocalization_skipped"
-                    self.guardrail_events.append({"type": "relocalization", "result": result})
+                    self.guardrail_events.append(
+                        {
+                            "type": "relocalization",
+                            "result": {key: value for key, value in result.items() if key != "map"},
+                        }
+                    )
                     self._manual_scan_in_progress = False
                     self._push_progress_update(message=str(result["reason"]), frontier_id=None)
                     result["map"] = self._build_map_payload()
@@ -3932,7 +3937,12 @@ class RosExplorationSession:
                         }
             with self._lock:
                 self.status = "relocalization_corrected" if result.get("status") == "corrected" else "relocalization_skipped"
-                self.guardrail_events.append({"type": "relocalization", "result": result})
+                self.guardrail_events.append(
+                    {
+                        "type": "relocalization",
+                        "result": {key: value for key, value in result.items() if key != "map"},
+                    }
+                )
                 self._manual_scan_in_progress = False
                 self._push_progress_update(
                     message=str(result.get("message") or result.get("reason") or "Relocalization complete."),
