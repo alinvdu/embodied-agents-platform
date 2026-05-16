@@ -306,6 +306,7 @@ class RosRuntimeConfig:
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
     initial_pose_topic: str = "/initialpose"
+    odom_reset_topic: str = "/xlerobot/odom/set_pose"
     map_frame: str = "map"
     odom_frame: str = "odom"
     base_frame: str = "base_link"
@@ -517,6 +518,7 @@ class RosExplorationRuntime(Node):
         self._force_publish_navigation_state = False
         self._cmd_vel_pub = self.create_publisher(Twist, config.cmd_vel_topic, 10)
         self._initial_pose_pub = self.create_publisher(PoseWithCovarianceStamped, config.initial_pose_topic, 10)
+        self._odom_reset_pose_pub = self.create_publisher(PoseWithCovarianceStamped, config.odom_reset_topic, 10)
         self._point_cloud_update_map_enabled_pub = self.create_publisher(
             Bool,
             config.point_cloud_update_map_enabled_topic,
@@ -1448,6 +1450,47 @@ class RosExplorationRuntime(Node):
             self._publish_map_to_odom_enabled
             and (self.config.publish_internal_navigation_map or self._force_publish_navigation_state)
         )
+
+    def reset_odom_pose(
+        self,
+        pose: Pose2D,
+        *,
+        publish_count: int = 3,
+        subscriber_timeout_s: float = 1.0,
+        covariance_xy_m2: float = 0.05,
+        covariance_yaw_rad2: float = 0.10,
+    ) -> dict[str, Any]:
+        deadline = time.time() + max(float(subscriber_timeout_s), 0.0)
+        subscriber_count = int(self._odom_reset_pose_pub.get_subscription_count())
+        while subscriber_count <= 0 and time.time() < deadline:
+            self._spin_once(timeout_sec=0.05)
+            subscriber_count = int(self._odom_reset_pose_pub.get_subscription_count())
+        if subscriber_count <= 0:
+            return {
+                "status": "unavailable",
+                "reason": f"No subscribers are listening on odom reset topic `{self.config.odom_reset_topic}`.",
+                "odom_reset_topic": self.config.odom_reset_topic,
+                "subscriber_count": subscriber_count,
+            }
+        for _ in range(max(int(publish_count), 1)):
+            message = PoseWithCovarianceStamped()
+            message.header.stamp = self.get_clock().now().to_msg()
+            message.header.frame_id = self.config.odom_frame
+            message.pose.pose.position.x = float(pose.x)
+            message.pose.pose.position.y = float(pose.y)
+            message.pose.pose.position.z = 0.0
+            message.pose.pose.orientation = quaternion_from_yaw(float(pose.yaw))
+            message.pose.covariance[0] = float(covariance_xy_m2)
+            message.pose.covariance[7] = float(covariance_xy_m2)
+            message.pose.covariance[35] = float(covariance_yaw_rad2)
+            self._odom_reset_pose_pub.publish(message)
+            self._spin_once(timeout_sec=0.05)
+        return {
+            "status": "ok",
+            "odom_pose": pose.to_dict(),
+            "odom_reset_topic": self.config.odom_reset_topic,
+            "subscriber_count": subscriber_count,
+        }
 
     def set_initial_pose(
         self,

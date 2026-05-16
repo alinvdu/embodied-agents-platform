@@ -391,9 +391,9 @@ Expected temporary topics:
 /relocalization_octomap_full
 ```
 
-When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and directly applies the correction if confidence is high enough and the backend owns `map -> odom`.
+When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and publishes the corrected robot pose to `/xlerobot/odom/set_pose` if confidence is high enough.
 
-The temporary `odom -> relocalization_map` static transform is separate from navigation. The correction itself still updates navigation localization through `map -> odom`. For correction tests, start `real_agentic_exploration` with `--ros-publish-identity-map-to-odom` and do not run a competing `map -> odom` static publisher. The `odom -> relocalization_map` static publisher above should still run.
+Keep the normal static `map -> odom` identity publisher running. `rgbd_visual_odometry` owns `/odom` and `odom -> base_link`; relocalization reseeds that odometry pose so `/odom` and TF stay consistent. The `odom -> relocalization_map` static publisher above should still run for the temporary OctoMap.
 
 In RViz:
 
@@ -448,6 +448,7 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --camera-info-topic /camera/head/camera_info \
   --imu-topic /imu/filtered_yaw \
   --odom-topic /odom \
+  --odom-reset-topic /xlerobot/odom/set_pose \
   --camera-pan-topic /camera/head/pan_rad \
   --scan-active-topic /xlerobot/scan_active \
   --nav-active-topic /xlerobot/nav_active \

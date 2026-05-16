@@ -73,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
     parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
+    parser.add_argument("--ros-odom-reset-topic", default="/xlerobot/odom/set_pose")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
@@ -165,6 +166,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_relocalization_map_topic,
         "--ros-relocalization-reset-service",
         args.ros_relocalization_reset_service,
+        "--ros-odom-reset-topic",
+        args.ros_odom_reset_topic,
         "--ros-scan-topic",
         args.ros_scan_topic,
         "--ros-point-cloud-topic",

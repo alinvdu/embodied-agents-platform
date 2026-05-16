@@ -128,6 +128,7 @@ class SimExplorationConfig:
     ros_publish_identity_map_to_odom: bool = False
     ros_relocalization_map_topic: str = "/relocalization_projected_map"
     ros_relocalization_reset_service: str = "/relocalization_octomap_server/reset"
+    ros_odom_reset_topic: str = "/xlerobot/odom/set_pose"
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
     ros_scan_active_topic: str = "/xlerobot/scan_active"
@@ -3250,6 +3251,7 @@ class RosExplorationSession:
                     map_updates_topic=config.ros_map_updates_topic,
                     relocalization_map_topic=config.ros_relocalization_map_topic,
                     relocalization_reset_service=config.ros_relocalization_reset_service,
+                    odom_reset_topic=config.ros_odom_reset_topic,
                     scan_topic=config.ros_scan_topic,
                     point_cloud_topic=config.ros_point_cloud_topic,
                     scan_active_topic=config.ros_scan_active_topic,
@@ -3898,19 +3900,13 @@ class RosExplorationSession:
                 confidence = float(match.get("confidence", 0.0) or 0.0)
                 corrected_pose = _pose_from_map_payload(match.get("corrected_pose"))
                 if match.get("status") == "matched" and confidence >= 0.60 and corrected_pose is not None:
-                    publishes_map_to_odom = getattr(self.runtime, "publishes_map_to_odom", None)
-                    map_to_odom_owned = (
-                        bool(publishes_map_to_odom())
-                        if callable(publishes_map_to_odom)
-                        else bool(getattr(self.runtime, "_publish_map_to_odom_enabled", False))
-                    )
-                    if not map_to_odom_owned:
+                    reset_odom_pose = getattr(self.runtime, "reset_odom_pose", None)
+                    if not callable(reset_odom_pose):
                         result = {
                             "status": "matched_not_applied",
                             "reason": (
-                                "Relocalization matched, but the backend is not publishing map->odom. "
-                                "Restart the backend with --ros-publish-identity-map-to-odom and do not run "
-                                "a competing static map->odom publisher to apply corrections."
+                                "Relocalization matched, but this runtime cannot reset the odometry pose. "
+                                "Run rgbd_visual_odometry with the odom reset topic enabled."
                             ),
                             "reset": reset_result,
                             "scan": {key: value for key, value in scan_event.items() if key != "observations"},
@@ -3918,23 +3914,34 @@ class RosExplorationSession:
                             "match": match,
                         }
                     else:
-                        correction = self.runtime.set_initial_pose(corrected_pose)
-                        self._update_pose_history(corrected_pose)
-                        self._set_alert(
-                            "Relocalized "
-                            f"dx={match.get('delta', {}).get('dx_m', 0.0)}m "
-                            f"dy={match.get('delta', {}).get('dy_m', 0.0)}m "
-                            f"yaw={match.get('delta', {}).get('dyaw_deg', 0.0)}deg."
-                        )
-                        result = {
-                            "status": "corrected",
-                            "message": "Relocalization correction applied.",
-                            "reset": reset_result,
-                            "scan": {key: value for key, value in scan_event.items() if key != "observations"},
-                            "local_map_frame": local_map_frame,
-                            "match": match,
-                            "correction": correction,
-                        }
+                        correction = reset_odom_pose(corrected_pose)
+                        if correction.get("status") != "ok":
+                            result = {
+                                "status": "matched_not_applied",
+                                "reason": correction.get("reason") or "Odometry pose reset was not accepted.",
+                                "reset": reset_result,
+                                "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                                "local_map_frame": local_map_frame,
+                                "match": match,
+                                "correction": correction,
+                            }
+                        else:
+                            self._update_pose_history(corrected_pose)
+                            self._set_alert(
+                                "Relocalized "
+                                f"dx={match.get('delta', {}).get('dx_m', 0.0)}m "
+                                f"dy={match.get('delta', {}).get('dy_m', 0.0)}m "
+                                f"yaw={match.get('delta', {}).get('dyaw_deg', 0.0)}deg."
+                            )
+                            result = {
+                                "status": "corrected",
+                                "message": "Relocalization correction applied to odometry pose.",
+                                "reset": reset_result,
+                                "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                                "local_map_frame": local_map_frame,
+                                "match": match,
+                                "correction": correction,
+                            }
             with self._lock:
                 self.status = "relocalization_corrected" if result.get("status") == "corrected" else "relocalization_skipped"
                 self.guardrail_events.append(
@@ -5661,6 +5668,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
     parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
+    parser.add_argument("--ros-odom-reset-topic", default="/xlerobot/odom/set_pose")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
@@ -5798,6 +5806,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_publish_identity_map_to_odom=args.ros_publish_identity_map_to_odom,
             ros_relocalization_map_topic=args.ros_relocalization_map_topic,
             ros_relocalization_reset_service=args.ros_relocalization_reset_service,
+            ros_odom_reset_topic=args.ros_odom_reset_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_scan_active_topic=args.ros_scan_active_topic,

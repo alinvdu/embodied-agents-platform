@@ -21,7 +21,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
 
 try:
     import rclpy
-    from geometry_msgs.msg import Quaternion, TransformStamped
+    from geometry_msgs.msg import PoseWithCovarianceStamped, Quaternion, TransformStamped
     from nav_msgs.msg import Odometry
     from rclpy.node import Node
     from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -32,6 +32,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     IMPORT_ERROR = exc
     rclpy = None
     Quaternion = None
+    PoseWithCovarianceStamped = None
     TransformStamped = None
     Odometry = None
     Node = object
@@ -68,6 +69,7 @@ class RgbdVoConfig:
     camera_info_topic: str = "/camera/head/camera_info"
     imu_topic: str = "/imu"
     odom_topic: str = "/odom"
+    odom_reset_topic: str = "/xlerobot/odom/set_pose"
     odom_frame: str = "odom"
     base_frame: str = "base_link"
     camera_frame: str = "head_camera_link"
@@ -389,6 +391,7 @@ class RgbdVisualOdometryNode(Node):
         self.estimator = FeatureRgbdOdometry(config)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
+        self.create_subscription(PoseWithCovarianceStamped, config.odom_reset_topic, self._on_odom_reset_pose, 10)
         self.latest_rgb: Any | None = None
         self.latest_depth: Any | None = None
         self.latest_imu: Any | None = None
@@ -443,7 +446,7 @@ class RgbdVisualOdometryNode(Node):
             f"freeze_odom_during_scan={config.freeze_odom_during_scan} "
             f"freeze_orientation_during_scan={config.freeze_orientation_during_scan} "
             f"odom_requires_nav_active={config.odom_requires_nav_active} "
-            f"imu={config.imu_topic} odom={config.odom_topic}"
+            f"imu={config.imu_topic} odom={config.odom_topic} odom_reset={config.odom_reset_topic}"
         )
 
     def _record_estimate(self, estimate: VisualOdomEstimate) -> None:
@@ -626,6 +629,29 @@ class RgbdVisualOdometryNode(Node):
             self.get_logger().info("Allowing odom pose updates while nav_active is true.")
         else:
             self.get_logger().info("Holding odom pose while nav_active is false; RGB-D translation and IMU yaw updates are ignored.")
+
+    def _on_odom_reset_pose(self, message: Any) -> None:
+        pose = message.pose.pose
+        yaw = yaw_from_quaternion_xyzw(
+            float(pose.orientation.x),
+            float(pose.orientation.y),
+            float(pose.orientation.z),
+            float(pose.orientation.w),
+        )
+        self.pose = PlanarPose(float(pose.position.x), float(pose.position.y), angle_wrap(yaw))
+        self.planar_velocity_x_m_s = 0.0
+        self.planar_velocity_y_m_s = 0.0
+        self.previous_frame = None
+        self._last_prediction_stamp_s = None
+        self._pending_predicted_yaw_rad = 0.0
+        self._reset_imu_origin_to_current_pose()
+        stamp = self.get_clock().now().to_msg()
+        self._publish_odom(stamp)
+        self.get_logger().info(
+            "Applied odom pose reset "
+            f"topic={self.config.odom_reset_topic} frame={message.header.frame_id or '<empty>'} "
+            f"x={self.pose.x:.3f} y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
+        )
 
     def _on_imu(self, message: Any) -> None:
         self.latest_imu = message
@@ -958,6 +984,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-info-topic", default="/camera/head/camera_info")
     parser.add_argument("--imu-topic", default="/imu")
     parser.add_argument("--odom-topic", default="/odom")
+    parser.add_argument(
+        "--odom-reset-topic",
+        default="/xlerobot/odom/set_pose",
+        help="PoseWithCovarianceStamped topic used to reseed odom->base_link after relocalization.",
+    )
     parser.add_argument("--odom-frame", default="odom")
     parser.add_argument("--base-frame", default="base_link")
     parser.add_argument("--camera-frame", default="head_camera_link")
@@ -1100,6 +1131,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_info_topic=args.camera_info_topic,
         imu_topic=args.imu_topic,
         odom_topic=args.odom_topic,
+        odom_reset_topic=args.odom_reset_topic,
         odom_frame=args.odom_frame,
         base_frame=args.base_frame,
         camera_frame=args.camera_frame,
