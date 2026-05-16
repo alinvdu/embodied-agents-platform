@@ -458,10 +458,10 @@ python -m xlerobot_playground.rgbd_visual_odometry \
   --imu-frame-convention base_link \
   --odom-yaw-sign -1 \
   --imu-bias-calibration-s 0.0 \
-  --publish-rate-hz 30 \
-  --min-translation-update-m 0.001 \
+  --publish-rate-hz 200 \
+  --min-translation-update-m 0.0006 \
   --jitter-threshold \
-  --min-yaw-update-deg 0.15
+  --min-yaw-update-deg 0.09
 ```
 
 This consumes RGB-D for translation and the filtered yaw IMU topic for authoritative yaw. Accelerometer double integration is not used for odometry position. With `--odom-requires-nav-active`, pose updates are accepted only while the exploration runtime publishes `/xlerobot/nav_active=true` around a Nav2 waypoint goal; when the robot is sitting, previewing, or scanning, odom keeps publishing the held pose and refreshes the VO keyframe without accumulating stationary drift. `--no-odom-requires-nav-active` is useful only for direct teleop/debug runs that do not publish `/xlerobot/nav_active`.
@@ -493,8 +493,8 @@ python -m xlerobot_playground.real_nav2_config \
   --odom-frame odom \
   --base-frame base_link \
   --max-laser-range 4.0 \
-  --max-linear-velocity 0.1 \
-  --max-angular-velocity 0.40 \
+  --max-linear-velocity 0.08 \
+  --max-angular-velocity 0.30 \
   --min-linear-velocity-threshold 0.005 \
   --trans-stopped-velocity 0.02 \
   --follow-path-xy-goal-tolerance-m 0.08 \
