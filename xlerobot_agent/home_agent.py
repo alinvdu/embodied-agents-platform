@@ -12,6 +12,7 @@ from typing import Any, Callable
 import uuid
 
 from .home_memory import (
+    DEFAULT_NAVIGATION_CLEARANCE_M,
     HomeMemoryStore,
     home_memory_preview_map,
     home_memory_agent_context,
@@ -124,7 +125,7 @@ class HomeAgentToolRuntime:
             self.memory,
             target_label,
             current_pose=self.current_pose,
-            min_clearance_m=float(constraints.get("min_clearance_m", 0.28) or 0.28),
+            min_clearance_m=float(constraints.get("min_clearance_m", DEFAULT_NAVIGATION_CLEARANCE_M) or DEFAULT_NAVIGATION_CLEARANCE_M),
         )
         self.emit(
             "tool_executed" if result.get("status") in {"succeeded", "low_clearance"} else "tool_blocked",

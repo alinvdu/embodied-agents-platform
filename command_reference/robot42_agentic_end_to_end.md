@@ -68,7 +68,7 @@ Current behavior:
 - the only exposed agent tool is `resolve_navigation_to_region`
 - execution, perception, and VLA/skill tools are intentionally not exposed yet
 
-Region polygons are semantic labels, not navigation goals. The agent should not choose a target from the region shape directly. When it needs to move to a region, it calls the region navigation resolver, which searches known-free occupancy cells inside the named region and prefers cells with clearance from occupied space.
+Region polygons are semantic labels, not navigation goals. The agent should not choose a target from the region shape directly. When it needs to move to a region, it calls the region navigation resolver, which searches known-free occupancy cells inside the named region, erodes free space by the robot footprint plus a small gap, and prefers centerline cells with higher clearance from occupied space.
 
 ## Configure Or Update Environment
 

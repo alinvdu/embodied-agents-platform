@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import heapq
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,14 @@ from .memory_discovery import HOME_MEMORY_FILENAME, default_environment_memory_d
 
 
 HOME_MEMORY_SCHEMA_VERSION = "home_memory.v1"
+XLEROBOT_FOOTPRINT_LENGTH_M = 0.3913
+XLEROBOT_FOOTPRINT_WIDTH_M = 0.459
+DEFAULT_NAVIGATION_SAFETY_GAP_M = 0.05
+DEFAULT_ROBOT_FOOTPRINT_RADIUS_M = math.hypot(
+    XLEROBOT_FOOTPRINT_LENGTH_M / 2.0,
+    XLEROBOT_FOOTPRINT_WIDTH_M / 2.0,
+)
+DEFAULT_NAVIGATION_CLEARANCE_M = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M + DEFAULT_NAVIGATION_SAFETY_GAP_M
 
 
 @dataclass(frozen=True)
@@ -266,7 +275,7 @@ def resolve_region_navigation_goal(
     name_or_label: str,
     *,
     current_pose: dict[str, Any] | None = None,
-    min_clearance_m: float = 0.28,
+    min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
 ) -> dict[str, Any]:
     """Resolve a semantic region into a concrete known-free navigation pose."""
     region = _best_region_match(memory, name_or_label)
@@ -334,22 +343,53 @@ def resolve_region_navigation_goal(
             "reason": "No known-free occupancy cells were found inside the region.",
         }
 
+    footprint_radius_m = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M
+    safety_gap_m = max(float(min_clearance_m) - footprint_radius_m, 0.0)
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    if not footprint_safe_cells:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "No known-free cells satisfy the robot footprint clearance.",
+            "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "safety_gap_m": round(safety_gap_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
+
     start_cell = _cell_for_pose(current_pose, grid) if current_pose else None
-    reachable = _reachable_free_cells(grid, start_cell) if start_cell is not None else set(grid["free"])
+    reachable = _reachable_cells(grid, start_cell, footprint_safe_cells) if start_cell is not None else set(footprint_safe_cells)
     candidates = [cell for cell in region_free_cells if cell in reachable]
     if not candidates:
-        candidates = region_free_cells
+        candidates = [cell for cell in region_free_cells if cell in footprint_safe_cells]
+    if not candidates:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "No footprint-safe known-free cells were found inside the region.",
+            "candidate_count": len(region_free_cells),
+            "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "safety_gap_m": round(safety_gap_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
     scored = [
         (
             _cell_clearance_m(cell, grid),
-            -float(_path_distance_cells(start_cell, cell, reachable) if start_cell is not None and cell in reachable else 0),
+            -float(_path_distance_cells(start_cell, cell, reachable) if start_cell is not None and cell in reachable else 0)
+            * float(grid["resolution"]),
             cell,
         )
         for cell in candidates
     ]
     scored.sort(reverse=True)
     best_clearance, _, best = scored[0]
-    path_cells = _shortest_path_cells(grid, start_cell, best) if start_cell is not None and best in reachable else []
+    path_cells = _centered_path_cells(grid, start_cell, best, footprint_safe_cells) if start_cell is not None and best in reachable else []
+    path_clearance = min((_cell_clearance_m(cell, grid) for cell in path_cells), default=best_clearance)
     goal_pose = {
         "x": round(grid["origin_x"] + (best[0] + 0.5) * resolution, 3),
         "y": round(grid["origin_y"] + (best[1] + 0.5) * resolution, 3),
@@ -366,8 +406,13 @@ def resolve_region_navigation_goal(
         "source": "home_memory.occupancy_region_free_space",
         "candidate_count": len(region_free_cells),
         "reachable_candidate_count": len([cell for cell in region_free_cells if cell in reachable]),
+        "footprint_safe_candidate_count": len([cell for cell in region_free_cells if cell in footprint_safe_cells]),
         "clearance_m": round(best_clearance, 3),
+        "path_clearance_m": round(path_clearance, 3),
         "min_clearance_m": round(float(min_clearance_m), 3),
+        "robot_footprint_radius_m": round(footprint_radius_m, 3),
+        "safety_gap_m": round(safety_gap_m, 3),
+        "path_strategy": "footprint_eroded_centerline_weighted_grid",
         "path": _path_payload(path_cells, grid),
     }
 
@@ -525,20 +570,46 @@ def _cell_for_pose(pose: dict[str, Any] | None, grid: dict[str, Any]) -> tuple[i
         return None
 
 
-def _reachable_free_cells(grid: dict[str, Any], start: tuple[int, int] | None) -> set[tuple[int, int]]:
+def _footprint_safe_cells(grid: dict[str, Any], clearance_m: float) -> set[tuple[int, int]]:
     free = set(grid["free"])
-    if not free:
+    resolution = float(grid["resolution"])
+    clearance_m = max(float(clearance_m), 0.0)
+    radius_cells = max(0, int(math.ceil((clearance_m + resolution * 0.5) / resolution)))
+    safe: set[tuple[int, int]] = set()
+    for cell in free:
+        ok = True
+        for dx in range(-radius_cells, radius_cells + 1):
+            if not ok:
+                break
+            for dy in range(-radius_cells, radius_cells + 1):
+                distance_m = math.hypot(dx, dy) * resolution
+                if distance_m > clearance_m + resolution * 0.5:
+                    continue
+                if (cell[0] + dx, cell[1] + dy) not in free:
+                    ok = False
+                    break
+        if ok:
+            safe.add(cell)
+    return safe
+
+
+def _reachable_cells(
+    grid: dict[str, Any],
+    start: tuple[int, int] | None,
+    traversable: set[tuple[int, int]],
+) -> set[tuple[int, int]]:
+    if not traversable:
         return set()
-    if start not in free:
-        start = _nearest_free_cell(start, free)
+    if start not in traversable:
+        start = _nearest_free_cell(start, traversable)
     if start is None:
-        return set(free)
+        return set(traversable)
     visited = {start}
     queue = [start]
     while queue:
         cell = queue.pop(0)
         for neighbor in _neighbors4(cell):
-            if neighbor in free and neighbor not in visited:
+            if neighbor in traversable and neighbor not in visited:
                 visited.add(neighbor)
                 queue.append(neighbor)
     return visited
@@ -563,7 +634,7 @@ def _cell_clearance_m(cell: tuple[int, int], grid: dict[str, Any]) -> float:
         return 99.0
     resolution = float(grid["resolution"])
     nearest_cells = min(math.hypot(cell[0] - item[0], cell[1] - item[1]) for item in occupied)
-    return nearest_cells * resolution
+    return max(0.0, nearest_cells * resolution - resolution * 0.5)
 
 
 def _path_distance_cells(
@@ -580,28 +651,37 @@ def _path_distance_cells(
     return abs(start[0] - goal[0]) + abs(start[1] - goal[1])
 
 
-def _shortest_path_cells(
+def _centered_path_cells(
     grid: dict[str, Any],
     start: tuple[int, int] | None,
     goal: tuple[int, int],
+    traversable: set[tuple[int, int]],
 ) -> list[tuple[int, int]]:
-    free = set(grid["free"])
-    if not free:
+    if not traversable:
         return []
-    if start not in free:
-        start = _nearest_free_cell(start, free)
-    if start is None or goal not in free:
+    if start not in traversable:
+        start = _nearest_free_cell(start, traversable)
+    if start is None or goal not in traversable:
         return []
-    queue = [start]
+    open_heap: list[tuple[float, int, tuple[int, int]]] = [(0.0, 0, start)]
     parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
-    while queue:
-        cell = queue.pop(0)
+    cost_so_far: dict[tuple[int, int], float] = {start: 0.0}
+    sequence = 1
+    while open_heap:
+        _, _, cell = heapq.heappop(open_heap)
         if cell == goal:
             break
-        for neighbor in _neighbors4(cell):
-            if neighbor in free and neighbor not in parent:
+        for neighbor in _neighbors8(cell, traversable):
+            clearance = max(_cell_clearance_m(neighbor, grid), float(grid["resolution"]) * 0.25)
+            distance = math.hypot(neighbor[0] - cell[0], neighbor[1] - cell[1])
+            centerline_penalty = 1.0 + (1.25 / max(clearance, float(grid["resolution"]) * 0.25))
+            new_cost = cost_so_far[cell] + distance * centerline_penalty
+            if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
+                cost_so_far[neighbor] = new_cost
+                priority = new_cost + math.hypot(goal[0] - neighbor[0], goal[1] - neighbor[1])
                 parent[neighbor] = cell
-                queue.append(neighbor)
+                heapq.heappush(open_heap, (priority, sequence, neighbor))
+                sequence += 1
     if goal not in parent:
         return []
     path = []
@@ -610,6 +690,22 @@ def _shortest_path_cells(
         path.append(cell)
         cell = parent[cell]
     return list(reversed(path))
+
+
+def _neighbors8(cell: tuple[int, int], traversable: set[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    x, y = cell
+    result: list[tuple[int, int]] = []
+    for dx in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            neighbor = (x + dx, y + dy)
+            if neighbor not in traversable:
+                continue
+            if dx != 0 and dy != 0 and ((x + dx, y) not in traversable or (x, y + dy) not in traversable):
+                continue
+            result.append(neighbor)
+    return tuple(result)
 
 
 def _path_payload(path_cells: list[tuple[int, int]], grid: dict[str, Any]) -> list[dict[str, float]]:

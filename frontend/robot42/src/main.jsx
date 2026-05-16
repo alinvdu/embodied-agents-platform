@@ -27,6 +27,8 @@ const EXPLORATION_BASE = "/exploration-api";
 const VIEW_W = 1000;
 const VIEW_H = 700;
 const PAD = 34;
+const AGENT_VIEW_H = 390;
+const AGENT_PAD = 14;
 
 function App() {
   const [view, setView] = useState("agent");
@@ -249,9 +251,9 @@ function EnvironmentCard({
 
 function AgentMapPreview({ memory, preview }) {
   const hasMap = Boolean(memory?.occupancy?.cells?.length || memory?.regions?.length);
+  const bounds = useMemo(() => agentPreviewBounds(memory, preview), [memory, preview]);
+  const project = useMemo(() => makeProjector(bounds, { height: AGENT_VIEW_H, pad: AGENT_PAD }), [bounds]);
   if (!hasMap && !preview) return null;
-  const bounds = useMemo(() => mapBounds(memory), [memory]);
-  const project = useMemo(() => makeProjector(bounds), [bounds]);
   const cells = (memory?.occupancy?.cells || []).map((cell, index) => {
     const resolution = memory?.occupancy?.resolution || 0.25;
     const p1 = project({ x: cell.x, y: cell.y });
@@ -295,8 +297,8 @@ function AgentMapPreview({ memory, preview }) {
         <span><MapIcon size={17} /> Navigation Preview</span>
         <small>{subtitle}</small>
       </div>
-      <svg viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} className="agent-map-canvas">
-        <rect width={VIEW_W} height={VIEW_H} fill="#fbfbf8" />
+      <svg viewBox={`0 0 ${VIEW_W} ${AGENT_VIEW_H}`} className="agent-map-canvas">
+        <rect width={VIEW_W} height={AGENT_VIEW_H} fill="#fbfbf8" />
         {cells}
         {regions}
         {pathPoints ? <polyline points={pathPoints} fill="none" stroke="#0f766e" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" /> : null}
@@ -962,6 +964,36 @@ function polygonLabelPoint(polygon) {
   };
 }
 
+function agentPreviewBounds(memory, preview) {
+  const points = [];
+  const resolution = memory?.occupancy?.resolution || 0.25;
+  for (const cell of memory?.occupancy?.cells || []) {
+    if (cell?.state !== "free" && cell?.state !== "occupied") continue;
+    const x = Number(cell.x || 0);
+    const y = Number(cell.y || 0);
+    points.push([x, y], [x + resolution, y + resolution]);
+  }
+  for (const region of memory?.regions || []) {
+    for (const point of region.polygon_2d || []) points.push(point);
+  }
+  for (const point of preview?.path || []) points.push([point.x, point.y]);
+  if (preview?.goal_pose) points.push([preview.goal_pose.x, preview.goal_pose.y]);
+  const startPose = memory?.start_pose?.pose || memory?.start_pose;
+  if (startPose) points.push([startPose.x, startPose.y]);
+  if (!points.length) return mapBounds(memory);
+  const minX = Math.min(...points.map((point) => Number(point[0] || 0)));
+  const maxX = Math.max(...points.map((point) => Number(point[0] || 0)));
+  const minY = Math.min(...points.map((point) => Number(point[1] || 0)));
+  const maxY = Math.max(...points.map((point) => Number(point[1] || 0)));
+  const pad = Math.max(resolution * 2, 0.16);
+  return {
+    min_x: minX - pad,
+    max_x: maxX + pad,
+    min_y: minY - pad,
+    max_y: maxY + pad,
+  };
+}
+
 function mapBounds(map) {
   if (map?.occupancy?.bounds) return map.occupancy.bounds;
   const points = [];
@@ -977,22 +1009,24 @@ function mapBounds(map) {
   };
 }
 
-function makeProjector(bounds) {
-  const viewport = mapViewport(bounds);
+function makeProjector(bounds, options = {}) {
+  const viewport = mapViewport(bounds, options);
   return (point) => ({
     x: viewport.left + (Number(point?.x || 0) - bounds.min_x) * viewport.scale,
     y: viewport.top + (bounds.max_y - Number(point?.y || 0)) * viewport.scale,
   });
 }
 
-function mapViewport(bounds) {
+function mapViewport(bounds, options = {}) {
+  const height = options.height || VIEW_H;
+  const pad = options.pad ?? PAD;
   const worldW = Math.max(bounds.max_x - bounds.min_x, 1);
   const worldH = Math.max(bounds.max_y - bounds.min_y, 1);
-  const scale = Math.min((VIEW_W - PAD * 2) / worldW, (VIEW_H - PAD * 2) / worldH);
+  const scale = Math.min((VIEW_W - pad * 2) / worldW, (height - pad * 2) / worldH);
   const drawW = worldW * scale;
   const drawH = worldH * scale;
-  const left = PAD + (VIEW_W - PAD * 2 - drawW) / 2;
-  const top = PAD + (VIEW_H - PAD * 2 - drawH) / 2;
+  const left = pad + (VIEW_W - pad * 2 - drawW) / 2;
+  const top = pad + (height - pad * 2 - drawH) / 2;
   return { left, top, scale, drawW, drawH };
 }
 

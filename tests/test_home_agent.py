@@ -14,6 +14,7 @@ from xlerobot_agent.home_agent import (
     discover_latest_home_memory_path,
 )
 from xlerobot_agent.home_memory import (
+    DEFAULT_NAVIGATION_CLEARANCE_M,
     home_memory_agent_context,
     resolve_home_memory_target,
     resolve_region_navigation_goal,
@@ -100,6 +101,29 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertEqual(result["target_label"], "kitchen")
         self.assertIn("goal_pose", result)
         self.assertGreater(result["candidate_count"], 0)
+        self.assertGreaterEqual(result["clearance_m"], DEFAULT_NAVIGATION_CLEARANCE_M)
+        self.assertEqual(result["path_strategy"], "footprint_eroded_centerline_weighted_grid")
+
+    def test_region_navigation_goal_blocks_footprint_unsafe_corridor(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[0.5, 0.25], [3.5, 0.25], [3.5, 0.75], [0.5, 0.75]]
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "free" if y == 2 and 1 <= x <= 14 else "occupied",
+                }
+                for x in range(16)
+                for y in range(5)
+            ],
+        }
+        result = resolve_region_navigation_goal(memory, "go to kitchen", current_pose={"x": 0.75, "y": 0.5, "yaw": 0.0})
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("footprint", result["reason"])
 
 
 class HomeTaskAgentTests(unittest.TestCase):
