@@ -5323,6 +5323,7 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
+        relocalizer: Callable[[], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -5331,6 +5332,7 @@ class _GatedExplorationUIController(LocalExplorationUIController):
             waypoint_navigator=waypoint_navigator,
             waypoint_previewer=waypoint_previewer,
             scan_performer=scan_performer,
+            relocalizer=relocalizer,
             navigation_session_starter=navigation_session_starter,
             navigation_session_stopper=navigation_session_stopper,
         )
