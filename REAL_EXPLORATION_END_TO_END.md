@@ -368,7 +368,7 @@ cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
-ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 relocalization_map odom
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 odom relocalization_map
 ```
 
 In OC-1C, start the temporary OctoMap:
@@ -391,9 +391,9 @@ Expected temporary topics:
 /relocalization_octomap_full
 ```
 
-When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and directly applies the correction if confidence is high enough.
+When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and directly applies the correction if confidence is high enough and the backend owns `map -> odom`.
 
-The temporary `relocalization_map -> odom` static transform is separate from navigation. The correction itself still updates navigation localization through `map -> odom`. For correction tests, start `real_agentic_exploration` with `--ros-publish-identity-map-to-odom` and do not run a competing `map -> odom` static publisher. The `relocalization_map -> odom` static publisher above should still run.
+The temporary `odom -> relocalization_map` static transform is separate from navigation. The correction itself still updates navigation localization through `map -> odom`. For correction tests, start `real_agentic_exploration` with `--ros-publish-identity-map-to-odom` and do not run a competing `map -> odom` static publisher. The `odom -> relocalization_map` static publisher above should still run.
 
 In RViz:
 

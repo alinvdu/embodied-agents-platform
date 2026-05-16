@@ -849,6 +849,10 @@ class RosExplorationRuntime(Node):
             if remaining <= 0.0:
                 return {"status": "timeout", "reason": f"Timed out calling `{service}`."}
             self._spin_once(timeout_sec=min(0.05, remaining))
+        try:
+            future.result()
+        except Exception as exc:
+            return {"status": "failed", "reason": f"Relocalization reset service `{service}` failed: {exc}"}
         return {"status": "ok", "service": service}
 
     def latest_map_summary(self) -> dict[str, Any] | None:
@@ -1438,6 +1442,12 @@ class RosExplorationRuntime(Node):
         self.latest_map = occupancy_map
         self.latest_map_stamp_s = time.time()
         self._publish_internal_navigation_state()
+
+    def publishes_map_to_odom(self) -> bool:
+        return bool(
+            self._publish_map_to_odom_enabled
+            and (self.config.publish_internal_navigation_map or self._force_publish_navigation_state)
+        )
 
     def set_initial_pose(
         self,

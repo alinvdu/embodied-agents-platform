@@ -3826,20 +3826,44 @@ class RosExplorationSession:
             if callable(reset):
                 reset_result = reset(timeout_s=2.0)
                 before_stamp_s = float(getattr(self.runtime, "latest_relocalization_map_stamp_s", 0.0) or 0.0)
+            else:
+                reset_result = {
+                    "status": "unavailable",
+                    "reason": "Runtime does not expose a relocalization map reset service.",
+                }
+            if reset_result.get("status") != "ok":
+                result = {
+                    "status": "skipped",
+                    "reason": reset_result.get("reason") or "Relocalization map reset failed.",
+                    "reset": reset_result,
+                    "scan": {},
+                }
+                with self._lock:
+                    self.status = "relocalization_skipped"
+                    self.guardrail_events.append({"type": "relocalization", "result": result})
+                    self._manual_scan_in_progress = False
+                    self._push_progress_update(message=str(result["reason"]), frontier_id=None)
+                    result["map"] = self._build_map_payload()
+                    return result
             self.runtime.set_point_cloud_map_updates_enabled(True)
+            got_relocalization_update = False
             try:
                 scan_event = self.runtime.perform_turnaround_scan(reason="operator_relocalization_scan")
                 wait_for_update = getattr(self.runtime, "wait_for_relocalization_map_update", None)
                 if callable(wait_for_update):
-                    wait_for_update(after_stamp_s=before_stamp_s, timeout_s=5.0)
+                    got_relocalization_update = bool(wait_for_update(after_stamp_s=before_stamp_s, timeout_s=5.0))
             finally:
                 self.runtime.set_point_cloud_map_updates_enabled(False)
             local_map = getattr(self.runtime, "latest_relocalization_map", None)
             local_map_frame = str(getattr(self.runtime, "latest_relocalization_map_header_frame_id", "") or "")
-            if local_map is None:
+            if local_map is None or not got_relocalization_update:
                 result = {
                     "status": "skipped",
-                    "reason": "Relocalization projected map is unavailable.",
+                    "reason": (
+                        "Relocalization projected map did not update after the scan."
+                        if local_map is not None
+                        else "Relocalization projected map is unavailable."
+                    ),
                     "reset": reset_result,
                     "scan": {key: value for key, value in scan_event.items() if key != "observations"},
                 }
@@ -3869,23 +3893,43 @@ class RosExplorationSession:
                 confidence = float(match.get("confidence", 0.0) or 0.0)
                 corrected_pose = _pose_from_map_payload(match.get("corrected_pose"))
                 if match.get("status") == "matched" and confidence >= 0.60 and corrected_pose is not None:
-                    correction = self.runtime.set_initial_pose(corrected_pose)
-                    self._update_pose_history(corrected_pose)
-                    self._set_alert(
-                        "Relocalized "
-                        f"dx={match.get('delta', {}).get('dx_m', 0.0)}m "
-                        f"dy={match.get('delta', {}).get('dy_m', 0.0)}m "
-                        f"yaw={match.get('delta', {}).get('dyaw_deg', 0.0)}deg."
+                    publishes_map_to_odom = getattr(self.runtime, "publishes_map_to_odom", None)
+                    map_to_odom_owned = (
+                        bool(publishes_map_to_odom())
+                        if callable(publishes_map_to_odom)
+                        else bool(getattr(self.runtime, "_publish_map_to_odom_enabled", False))
                     )
-                    result = {
-                        "status": "corrected",
-                        "message": "Relocalization correction applied.",
-                        "reset": reset_result,
-                        "scan": {key: value for key, value in scan_event.items() if key != "observations"},
-                        "local_map_frame": local_map_frame,
-                        "match": match,
-                        "correction": correction,
-                    }
+                    if not map_to_odom_owned:
+                        result = {
+                            "status": "matched_not_applied",
+                            "reason": (
+                                "Relocalization matched, but the backend is not publishing map->odom. "
+                                "Restart the backend with --ros-publish-identity-map-to-odom and do not run "
+                                "a competing static map->odom publisher to apply corrections."
+                            ),
+                            "reset": reset_result,
+                            "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                            "local_map_frame": local_map_frame,
+                            "match": match,
+                        }
+                    else:
+                        correction = self.runtime.set_initial_pose(corrected_pose)
+                        self._update_pose_history(corrected_pose)
+                        self._set_alert(
+                            "Relocalized "
+                            f"dx={match.get('delta', {}).get('dx_m', 0.0)}m "
+                            f"dy={match.get('delta', {}).get('dy_m', 0.0)}m "
+                            f"yaw={match.get('delta', {}).get('dyaw_deg', 0.0)}deg."
+                        )
+                        result = {
+                            "status": "corrected",
+                            "message": "Relocalization correction applied.",
+                            "reset": reset_result,
+                            "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                            "local_map_frame": local_map_frame,
+                            "match": match,
+                            "correction": correction,
+                        }
             with self._lock:
                 self.status = "relocalization_corrected" if result.get("status") == "corrected" else "relocalization_skipped"
                 self.guardrail_events.append({"type": "relocalization", "result": result})
