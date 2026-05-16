@@ -13,6 +13,7 @@ import uuid
 
 from .home_memory import (
     HomeMemoryStore,
+    home_memory_preview_map,
     home_memory_agent_context,
     resolve_region_navigation_goal,
     summarize_home_memory,
@@ -663,6 +664,7 @@ class HomeAgentController:
                     "path": str(memory_path) if memory_path is not None else self.config.home_memory_path,
                     "summary": summarize_home_memory(memory) if memory else "No home memory loaded.",
                     "context": home_memory_agent_context(memory) if memory else {},
+                    "preview_map": home_memory_preview_map(memory) if memory else {},
                 },
                 "environment_memories": self.list_environment_memories(),
                 "record": record,

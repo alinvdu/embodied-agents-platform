@@ -176,6 +176,26 @@ def home_memory_agent_context(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def home_memory_preview_map(memory: dict[str, Any]) -> dict[str, Any]:
+    """Return geometry for UI previews without putting it in the agent prompt."""
+    return {
+        "memory_id": memory.get("memory_id"),
+        "frame": memory.get("frame", "map"),
+        "start_pose": _json_clone(memory.get("start_pose")),
+        "occupancy": _json_clone(memory.get("occupancy") or {}),
+        "manual_occupancy_edits": _json_clone(memory.get("manual_occupancy_edits") or {}),
+        "regions": [
+            {
+                "region_id": region.get("region_id"),
+                "label": region.get("label"),
+                "polygon_2d": _json_clone(region.get("polygon_2d") or []),
+            }
+            for region in memory.get("regions", [])
+            if isinstance(region, dict)
+        ],
+    }
+
+
 def resolve_home_memory_target(
     memory: dict[str, Any],
     name_or_label: str,

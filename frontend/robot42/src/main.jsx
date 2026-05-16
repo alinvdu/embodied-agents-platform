@@ -102,10 +102,12 @@ function AgentChat({ onConfigure }) {
   const events = state?.report?.events || state?.events || [];
   const lastEvent = events.slice(-1)[0];
   const memoryContext = state?.home_memory?.context || {};
+  const homeMemory = state?.home_memory?.preview_map || {};
   const regions = memoryContext.regions || [];
   const objects = memoryContext.objects || [];
   const agentMemories = state?.environment_memories || [];
   const environment = environmentStatus(state, explorationState);
+  const navigationPreview = latestNavigationPreview(events);
 
   const selectAgentMemory = async (memoryId) => {
     if (!memoryId) return;
@@ -169,6 +171,7 @@ function AgentChat({ onConfigure }) {
         {error ? <div className="error-line">{error}</div> : null}
         </div>
       </div>
+      <AgentMapPreview memory={homeMemory} preview={navigationPreview} />
       <div className="agent-actions">
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/pause", {}).then(refresh)}><Pause size={16} /> Pause</button>
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/resume", {}).then(refresh)}><Play size={16} /> Resume</button>
@@ -241,6 +244,68 @@ function EnvironmentCard({
       </div>
       <button className="compact-button" onClick={onConfigure}><Settings size={15} /> Configure</button>
     </div>
+  );
+}
+
+function AgentMapPreview({ memory, preview }) {
+  const hasMap = Boolean(memory?.occupancy?.cells?.length || memory?.regions?.length);
+  if (!hasMap && !preview) return null;
+  const bounds = useMemo(() => mapBounds(memory), [memory]);
+  const project = useMemo(() => makeProjector(bounds), [bounds]);
+  const cells = (memory?.occupancy?.cells || []).map((cell, index) => {
+    const resolution = memory?.occupancy?.resolution || 0.25;
+    const p1 = project({ x: cell.x, y: cell.y });
+    const p2 = project({ x: Number(cell.x || 0) + resolution, y: Number(cell.y || 0) + resolution });
+    const fill = cell.state === "occupied"
+      ? "rgba(31, 41, 55, 0.52)"
+      : cell.state === "free"
+        ? "rgba(134, 148, 166, 0.20)"
+        : "rgba(134, 148, 166, 0.10)";
+    return <rect key={index} x={p1.x} y={p2.y} width={Math.max(1.5, p2.x - p1.x)} height={Math.max(1.5, p1.y - p2.y)} fill={fill} />;
+  });
+  const regions = (memory?.regions || []).map((region, index) => {
+    const points = (region.polygon_2d || []).map((point) => {
+      const p = project({ x: point[0], y: point[1] });
+      return `${p.x},${p.y}`;
+    }).join(" ");
+    if (!points) return null;
+    const labelPoint = polygonLabelPoint(region.polygon_2d || []);
+    const label = project(labelPoint);
+    return (
+      <g key={region.region_id || region.label || index}>
+        <polygon points={points} fill={`hsla(${index * 53 + 170}, 45%, 45%, 0.10)`} stroke="rgba(17, 24, 39, 0.24)" strokeWidth="1.4" />
+        <text x={label.x} y={label.y} textAnchor="middle" className="agent-map-region-label">{region.label}</text>
+      </g>
+    );
+  });
+  const pathPoints = (preview?.path || []).map((point) => {
+    const p = project(point);
+    return `${p.x},${p.y}`;
+  }).join(" ");
+  const goal = preview?.goal_pose ? project(preview.goal_pose) : null;
+  const startPose = memory?.start_pose?.pose || memory?.start_pose;
+  const start = startPose ? project(startPose) : null;
+  const subtitle = preview?.goal_pose
+    ? `${preview.target_label || "target"} -> (${round3(preview.goal_pose.x)}, ${round3(preview.goal_pose.y)})`
+    : "Ask for a region target to see the selected point.";
+
+  return (
+    <section className="agent-map-card">
+      <div className="section-head">
+        <span><MapIcon size={17} /> Navigation Preview</span>
+        <small>{subtitle}</small>
+      </div>
+      <svg viewBox={`0 0 ${VIEW_W} ${VIEW_H}`} className="agent-map-canvas">
+        <rect width={VIEW_W} height={VIEW_H} fill="#fbfbf8" />
+        {cells}
+        {regions}
+        {pathPoints ? <polyline points={pathPoints} fill="none" stroke="#0f766e" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" /> : null}
+        {start ? <circle cx={start.x} cy={start.y} r="8" fill="#111827" /> : null}
+        {goal ? <circle cx={goal.x} cy={goal.y} r="12" fill="#b42318" /> : null}
+        {goal ? <circle cx={goal.x} cy={goal.y} r="21" fill="none" stroke="#b42318" strokeWidth="3" opacity="0.22" /> : null}
+        {goal ? <text x={goal.x + 14} y={goal.y - 13} className="agent-map-goal-label">goal</text> : null}
+      </svg>
+    </section>
   );
 }
 
@@ -875,8 +940,26 @@ function eventText(event) {
   return event.summary || event.message || event.kind || event.type || "Updated.";
 }
 
+function latestNavigationPreview(events) {
+  for (let index = (events || []).length - 1; index >= 0; index -= 1) {
+    const details = events[index]?.details || {};
+    if (details.tool === "resolve_region_navigation_goal" && details.goal_pose) {
+      return details;
+    }
+  }
+  return null;
+}
+
 function round3(value) {
   return Math.round(Number(value || 0) * 1000) / 1000;
+}
+
+function polygonLabelPoint(polygon) {
+  if (!polygon?.length) return { x: 0, y: 0 };
+  return {
+    x: polygon.reduce((sum, point) => sum + Number(point[0] || 0), 0) / polygon.length,
+    y: polygon.reduce((sum, point) => sum + Number(point[1] || 0), 0) / polygon.length,
+  };
 }
 
 function mapBounds(map) {
