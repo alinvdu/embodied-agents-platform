@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import replace
+import os
 from pathlib import Path
+import shlex
 import sys
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    _load_dotenv(REPO_ROOT / ".env")
     args = build_parser().parse_args(argv)
     config = _merge_args(config_from_env(), args)
     controller = HomeAgentController.from_config(config)
@@ -84,6 +87,29 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
         model=model,
         specialist_model=specialist,
     )
+
+
+def _load_dotenv(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, raw_value = stripped.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        if not key or key in os.environ:
+            continue
+        value = raw_value.strip()
+        try:
+            parsed = shlex.split(value, comments=False, posix=True)
+            if len(parsed) == 1:
+                value = parsed[0]
+        except ValueError:
+            value = value.strip("\"'")
+        os.environ[key] = value
 
 
 if __name__ == "__main__":
