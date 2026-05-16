@@ -98,6 +98,9 @@ class ExplorationUIController(Protocol):
     def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def relocalize_here(self) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
     def __init__(
@@ -107,6 +110,7 @@ class LocalExplorationUIController:
         waypoint_navigator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
+        relocalizer: Callable[[], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -114,6 +118,7 @@ class LocalExplorationUIController:
         self.waypoint_navigator = waypoint_navigator
         self.waypoint_previewer = waypoint_previewer
         self.scan_performer = scan_performer
+        self.relocalizer = relocalizer
         self.navigation_session_starter = navigation_session_starter
         self.navigation_session_stopper = navigation_session_stopper
 
@@ -225,6 +230,11 @@ class LocalExplorationUIController:
             return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
         return self.waypoint_previewer(pose)
 
+    def relocalize_here(self) -> dict[str, Any]:
+        if self.relocalizer is None:
+            return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
+        return self.relocalizer()
+
 
 class RemoteExplorationUIController:
     def __init__(self, client: OffloadClient) -> None:
@@ -322,6 +332,9 @@ class RemoteExplorationUIController:
 
     def preview_waypoint(self, *, pose: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote waypoint previews are not implemented yet."}
+
+    def relocalize_here(self) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote relocalization is not implemented yet."}
 
 
 HTML_PAGE = """<!doctype html>
@@ -1453,6 +1466,9 @@ class ExplorationReviewServer:
                         pose=dict(payload.get("pose", {})),
                     )
                     self._send_json(response)
+                    return
+                if self.path == "/api/nav/relocalize":
+                    self._send_json(controller.relocalize_here())
                     return
                 if self.path == "/api/approve":
                     self._send_json(controller.approve_map() or {"status": "missing"})

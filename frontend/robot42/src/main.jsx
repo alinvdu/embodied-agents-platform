@@ -5,6 +5,7 @@ import {
   Bot,
   Bug,
   Check,
+  Crosshair,
   Eraser,
   Eye,
   Home,
@@ -393,6 +394,20 @@ function ExplorationConsole({ onExit }) {
     );
   };
 
+  const relocalizeHere = async () => {
+    setSaveMessage("Running relocalization scan...");
+    const result = await post("/api/nav/relocalize", {});
+    const match = result?.match || {};
+    const delta = match?.delta || {};
+    if (result?.status === "corrected") {
+      setSaveMessage(
+        `Relocalized: dx ${delta.dx_m ?? 0}m, dy ${delta.dy_m ?? 0}m, yaw ${delta.dyaw_deg ?? 0}deg, confidence ${match.confidence ?? "n/a"}.`
+      );
+    } else {
+      setSaveMessage(`Relocalization ${result?.status || "skipped"}: ${result?.reason || "confidence too low"}.`);
+    }
+  };
+
   return (
     <section className="environment-shell">
       <header className="environment-topbar">
@@ -414,6 +429,7 @@ function ExplorationConsole({ onExit }) {
             <button disabled={!backendOnline} className="danger" onClick={() => post("/api/task/cancel", { task_id: activeTask?.task_id })}><Square size={16} /> Cancel</button>
             <button disabled={!backendOnline || !map} onClick={startNavigationSession}><Navigation size={16} /> Start Nav Session</button>
             <button disabled={!backendOnline} onClick={stopNavigationSession}><Square size={16} /> Stop Nav Session</button>
+            <button disabled={!backendOnline || !map} onClick={relocalizeHere}><Crosshair size={16} /> Relocalize</button>
             <button disabled={!backendOnline || !map} onClick={setDockPose}><Home size={16} /> Set Dock Pose</button>
             <button disabled={!backendOnline || !map} className="primary" onClick={approveAndSaveMemory}><Check size={16} /> Approve + Save Memory</button>
             {!backendOnline ? <button onClick={refresh}><RotateCcw size={16} /> Retry Connection</button> : null}

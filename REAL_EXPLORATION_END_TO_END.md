@@ -357,6 +357,44 @@ Expected output topics include:
 /projected_map_updates
 ```
 
+### Optional Terminals OC-1B/OC-1C: Temporary Relocalization OctoMap
+
+Use this when testing the `Relocalize` button during a loaded long-term-memory navigation session. This starts a separate OctoMap whose fixed frame is `relocalization_map`, so the temporary 360 scan publishes to its own map topics.
+
+In OC-1B, publish the temporary frame:
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 relocalization_map odom
+```
+
+In OC-1C, start the temporary OctoMap:
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+ros2 launch /home/alin/Robot42/launch/xlerobot_relocalization_octomap.launch.py \
+  cloud_topic:=/camera/head/points
+```
+
+Expected temporary topics:
+
+```text
+/relocalization_projected_map
+/relocalization_projected_map_updates
+/relocalization_octomap_binary
+/relocalization_octomap_full
+```
+
+When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and directly applies the correction if confidence is high enough.
+
+The temporary `relocalization_map -> odom` static transform is separate from navigation. The correction itself still updates navigation localization through `map -> odom`. For correction tests, start `real_agentic_exploration` with `--ros-publish-identity-map-to-odom` and do not run a competing `map -> odom` static publisher. The `relocalization_map -> odom` static publisher above should still run.
+
 In RViz:
 
 - set `Fixed Frame` to `map` for Nav2 validation

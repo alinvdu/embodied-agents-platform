@@ -44,6 +44,8 @@ from xlerobot_playground.ros_nav2_runtime import (
     RosExplorationRuntime,
     RosOccupancyMap,
     RosRuntimeConfig,
+    compose_pose_2d,
+    inverse_pose_2d,
     path_length_m,
     require_runtime_dependencies as require_ros_nav2_runtime_dependencies,
     ros_goal_status_label,
@@ -123,6 +125,9 @@ class SimExplorationConfig:
     ros_map_topic: str = "/map"
     ros_map_updates_topic: str | None = None
     ros_fuse_external_projected_map_snapshots: bool = False
+    ros_publish_identity_map_to_odom: bool = False
+    ros_relocalization_map_topic: str = "/relocalization_projected_map"
+    ros_relocalization_reset_service: str = "/relocalization_octomap_server/reset"
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
     ros_scan_active_topic: str = "/xlerobot/scan_active"
@@ -986,6 +991,187 @@ def _start_pose_from_environment_payload(map_payload: dict[str, Any]) -> Pose2D 
         if pose is not None:
             return pose
     return Pose2D(0.0, 0.0, 0.0)
+
+
+def _transform_pose_point(origin: Pose2D, target_origin: Pose2D, point: Pose2D) -> Pose2D:
+    return compose_pose_2d(target_origin, compose_pose_2d(inverse_pose_2d(origin), point))
+
+
+def _near_saved_occupied(occupancy_map: EditableOccupancyMap, x: float, y: float, *, radius_cells: int = 1) -> bool:
+    cell_x, cell_y = occupancy_map.world_to_cell(x, y)
+    for dy in range(-radius_cells, radius_cells + 1):
+        for dx in range(-radius_cells, radius_cells + 1):
+            if occupancy_map.is_occupied(cell_x + dx, cell_y + dy):
+                return True
+    return False
+
+
+def _sample_relocalization_cells(
+    occupancy_map: RosOccupancyMap,
+    *,
+    occupied_limit: int = 600,
+    free_limit: int = 1000,
+) -> tuple[list[tuple[Pose2D, float]], list[Pose2D]]:
+    occupied: list[tuple[Pose2D, float]] = []
+    free: list[Pose2D] = []
+    for cell_y in range(occupancy_map.height):
+        for cell_x in range(occupancy_map.width):
+            value = occupancy_map.value(cell_x, cell_y)
+            if value > 50:
+                neighbors = 0
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if dx == 0 and dy == 0:
+                            continue
+                        if occupancy_map.is_occupied(cell_x + dx, cell_y + dy):
+                            neighbors += 1
+                if neighbors <= 1:
+                    weight = 0.25
+                elif neighbors <= 3:
+                    weight = 0.65
+                else:
+                    weight = 1.0
+                occupied.append((occupancy_map.cell_to_pose(cell_x, cell_y), weight))
+            elif value == 0:
+                free.append(occupancy_map.cell_to_pose(cell_x, cell_y))
+
+    def _downsample(items: list[Any], limit: int) -> list[Any]:
+        if len(items) <= limit:
+            return items
+        stride = max(len(items) / float(limit), 1.0)
+        return [items[min(int(index * stride), len(items) - 1)] for index in range(limit)]
+
+    return _downsample(occupied, occupied_limit), _downsample(free, free_limit)
+
+
+def _score_relocalization_candidate(
+    *,
+    saved_map: EditableOccupancyMap,
+    local_occupied: list[tuple[Pose2D, float]],
+    local_free: list[Pose2D],
+    local_pose: Pose2D,
+    candidate_pose: Pose2D,
+) -> dict[str, Any]:
+    score = 0.0
+    total_weight = 0.0
+    occupied_matches = 0
+    occupied_conflicts = 0
+    free_matches = 0
+    free_conflicts = 0
+    for point, weight in local_occupied:
+        corrected = _transform_pose_point(local_pose, candidate_pose, point)
+        cell_x, cell_y = saved_map.world_to_cell(corrected.x, corrected.y)
+        total_weight += weight
+        if _near_saved_occupied(saved_map, corrected.x, corrected.y, radius_cells=1):
+            score += 1.0 * weight
+            occupied_matches += 1
+        elif saved_map.in_bounds(cell_x, cell_y) and saved_map.is_free(cell_x, cell_y):
+            score -= 0.65 * weight
+            occupied_conflicts += 1
+        else:
+            score -= 0.05 * weight
+    free_weight = 0.18
+    for point in local_free:
+        corrected = _transform_pose_point(local_pose, candidate_pose, point)
+        cell_x, cell_y = saved_map.world_to_cell(corrected.x, corrected.y)
+        total_weight += free_weight
+        if not saved_map.in_bounds(cell_x, cell_y) or saved_map.is_unknown(cell_x, cell_y):
+            continue
+        if saved_map.is_free(cell_x, cell_y):
+            score += 0.18
+            free_matches += 1
+        elif saved_map.is_occupied(cell_x, cell_y):
+            score -= 0.35
+            free_conflicts += 1
+    normalized = score / max(total_weight, 1e-6)
+    return {
+        "score": normalized,
+        "occupied_matches": occupied_matches,
+        "occupied_conflicts": occupied_conflicts,
+        "free_matches": free_matches,
+        "free_conflicts": free_conflicts,
+    }
+
+
+def _candidate_pose_from_delta(estimated_pose: Pose2D, dx: float, dy: float, dyaw: float) -> Pose2D:
+    return Pose2D(
+        float(estimated_pose.x) + float(dx),
+        float(estimated_pose.y) + float(dy),
+        math.atan2(math.sin(float(estimated_pose.yaw) + float(dyaw)), math.cos(float(estimated_pose.yaw) + float(dyaw))),
+    )
+
+
+def _match_relocalization_pose(
+    *,
+    saved_map: EditableOccupancyMap,
+    local_map: RosOccupancyMap,
+    estimated_pose: Pose2D,
+    local_pose: Pose2D | None = None,
+    max_xy_m: float = 0.50,
+    max_yaw_rad: float = math.radians(15.0),
+) -> dict[str, Any]:
+    local_occupied, local_free = _sample_relocalization_cells(local_map)
+    if len(local_occupied) < 12:
+        return {
+            "status": "skipped",
+            "reason": "Not enough occupied relocalization evidence.",
+            "occupied_evidence_cells": len(local_occupied),
+            "free_evidence_cells": len(local_free),
+        }
+    local_pose = local_pose or estimated_pose
+    current_score = _score_relocalization_candidate(
+        saved_map=saved_map,
+        local_occupied=local_occupied,
+        local_free=local_free,
+        local_pose=local_pose,
+        candidate_pose=estimated_pose,
+    )
+    candidates: list[dict[str, Any]] = []
+    xy_steps = [-max_xy_m, -0.30, -0.15, 0.0, 0.15, 0.30, max_xy_m]
+    yaw_steps = [-max_yaw_rad, math.radians(-7.5), 0.0, math.radians(7.5), max_yaw_rad]
+    for dx in xy_steps:
+        for dy in xy_steps:
+            for dyaw in yaw_steps:
+                pose = _candidate_pose_from_delta(estimated_pose, dx, dy, dyaw)
+                scored = _score_relocalization_candidate(
+                    saved_map=saved_map,
+                    local_occupied=local_occupied,
+                    local_free=local_free,
+                    local_pose=local_pose,
+                    candidate_pose=pose,
+                )
+                candidates.append({"pose": pose, "dx": dx, "dy": dy, "dyaw": dyaw, **scored})
+    candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+    best = candidates[0]
+    second_score = float(candidates[1]["score"]) if len(candidates) > 1 else float(current_score["score"])
+    improvement = float(best["score"]) - float(current_score["score"])
+    separation = float(best["score"]) - second_score
+    confidence = max(0.0, min(1.0, 0.50 + improvement * 1.2 + separation * 0.8))
+    corrected_pose = best["pose"]
+    return {
+        "status": "matched",
+        "estimated_pose": estimated_pose.to_dict(),
+        "local_pose": local_pose.to_dict(),
+        "corrected_pose": corrected_pose.to_dict(),
+        "delta": {
+            "dx_m": round(float(corrected_pose.x - estimated_pose.x), 3),
+            "dy_m": round(float(corrected_pose.y - estimated_pose.y), 3),
+            "dyaw_rad": round(math.atan2(math.sin(corrected_pose.yaw - estimated_pose.yaw), math.cos(corrected_pose.yaw - estimated_pose.yaw)), 4),
+            "dyaw_deg": round(math.degrees(math.atan2(math.sin(corrected_pose.yaw - estimated_pose.yaw), math.cos(corrected_pose.yaw - estimated_pose.yaw))), 2),
+        },
+        "confidence": round(confidence, 3),
+        "score": round(float(best["score"]), 4),
+        "current_score": round(float(current_score["score"]), 4),
+        "improvement": round(improvement, 4),
+        "separation": round(separation, 4),
+        "occupied_evidence_cells": len(local_occupied),
+        "free_evidence_cells": len(local_free),
+        "best_details": {
+            key: value
+            for key, value in best.items()
+            if key not in {"pose"}
+        },
+    }
 
 
 def _ros_map_from_environment_payload(map_payload: dict[str, Any]) -> RosOccupancyMap | None:
@@ -3062,6 +3248,8 @@ class RosExplorationSession:
                 RosRuntimeConfig(
                     map_topic=config.ros_map_topic,
                     map_updates_topic=config.ros_map_updates_topic,
+                    relocalization_map_topic=config.ros_relocalization_map_topic,
+                    relocalization_reset_service=config.ros_relocalization_reset_service,
                     scan_topic=config.ros_scan_topic,
                     point_cloud_topic=config.ros_point_cloud_topic,
                     scan_active_topic=config.ros_scan_active_topic,
@@ -3350,6 +3538,7 @@ class RosExplorationSession:
                 and abs(float(start_pose.x)) < 1e-6
                 and abs(float(start_pose.y)) < 1e-6
                 and abs(float(start_pose.yaw)) < 1e-6
+                and not self.config.ros_publish_identity_map_to_odom
             )
             if start_pose is not None and not use_static_identity_tf:
                 self.status = "navigation_only_setting_initial_pose"
@@ -3608,6 +3797,113 @@ class RosExplorationSession:
                 except Exception:
                     pass
                 try:
+                    map_payload = self._build_map_payload()
+                except Exception:
+                    map_payload = None
+                return {"status": "failed", "reason": str(exc), "map": map_payload}
+
+    def relocalize_here(self) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if self._manual_scan_in_progress:
+                return {"status": "busy", "reason": "A scan is already running."}
+            self._sync_manual_occupancy_edits()
+            estimated_pose = self._live_robot_pose()
+            if estimated_pose is None:
+                return {"status": "unavailable", "reason": "Current robot pose is unavailable."}
+            saved_map = self._require_effective_map()
+            self.status = "relocalization_scan_active"
+            self._manual_scan_in_progress = True
+            try:
+                self._push_progress_update(message="Running relocalization 360 degree scan.", frontier_id=None)
+            except Exception:
+                pass
+        reset_result: dict[str, Any] = {}
+        scan_event: dict[str, Any] = {}
+        try:
+            before_stamp_s = float(getattr(self.runtime, "latest_relocalization_map_stamp_s", 0.0) or 0.0)
+            reset = getattr(self.runtime, "reset_relocalization_map", None)
+            if callable(reset):
+                reset_result = reset(timeout_s=2.0)
+                before_stamp_s = float(getattr(self.runtime, "latest_relocalization_map_stamp_s", 0.0) or 0.0)
+            self.runtime.set_point_cloud_map_updates_enabled(True)
+            try:
+                scan_event = self.runtime.perform_turnaround_scan(reason="operator_relocalization_scan")
+                wait_for_update = getattr(self.runtime, "wait_for_relocalization_map_update", None)
+                if callable(wait_for_update):
+                    wait_for_update(after_stamp_s=before_stamp_s, timeout_s=5.0)
+            finally:
+                self.runtime.set_point_cloud_map_updates_enabled(False)
+            local_map = getattr(self.runtime, "latest_relocalization_map", None)
+            local_map_frame = str(getattr(self.runtime, "latest_relocalization_map_header_frame_id", "") or "")
+            if local_map is None:
+                result = {
+                    "status": "skipped",
+                    "reason": "Relocalization projected map is unavailable.",
+                    "reset": reset_result,
+                    "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                }
+            else:
+                estimated_pose_after_scan = self._live_robot_pose() or estimated_pose
+                local_pose = None
+                current_pose_in_frame = getattr(self.runtime, "current_pose_in_frame", None)
+                if callable(current_pose_in_frame):
+                    local_pose = current_pose_in_frame("relocalization_map")
+                    if local_pose is None:
+                        local_pose = current_pose_in_frame(self.config.ros_odom_frame)
+                local_pose = local_pose or estimated_pose_after_scan
+                match = _match_relocalization_pose(
+                    saved_map=saved_map,
+                    local_map=local_map,
+                    estimated_pose=estimated_pose_after_scan,
+                    local_pose=local_pose,
+                )
+                result = {
+                    "status": "skipped",
+                    "reason": match.get("reason", "Relocalization confidence is too low."),
+                    "reset": reset_result,
+                    "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                    "local_map_frame": local_map_frame,
+                    "match": match,
+                }
+                confidence = float(match.get("confidence", 0.0) or 0.0)
+                corrected_pose = _pose_from_map_payload(match.get("corrected_pose"))
+                if match.get("status") == "matched" and confidence >= 0.60 and corrected_pose is not None:
+                    correction = self.runtime.set_initial_pose(corrected_pose)
+                    self._update_pose_history(corrected_pose)
+                    self._set_alert(
+                        "Relocalized "
+                        f"dx={match.get('delta', {}).get('dx_m', 0.0)}m "
+                        f"dy={match.get('delta', {}).get('dy_m', 0.0)}m "
+                        f"yaw={match.get('delta', {}).get('dyaw_deg', 0.0)}deg."
+                    )
+                    result = {
+                        "status": "corrected",
+                        "message": "Relocalization correction applied.",
+                        "reset": reset_result,
+                        "scan": {key: value for key, value in scan_event.items() if key != "observations"},
+                        "local_map_frame": local_map_frame,
+                        "match": match,
+                        "correction": correction,
+                    }
+            with self._lock:
+                self.status = "relocalization_corrected" if result.get("status") == "corrected" else "relocalization_skipped"
+                self.guardrail_events.append({"type": "relocalization", "result": result})
+                self._manual_scan_in_progress = False
+                self._push_progress_update(
+                    message=str(result.get("message") or result.get("reason") or "Relocalization complete."),
+                    frontier_id=None,
+                )
+                result["map"] = self._build_map_payload()
+                return result
+        except Exception as exc:
+            with self._lock:
+                self._manual_scan_in_progress = False
+                self.status = "relocalization_failed"
+                self.last_error = f"Relocalization failed: {exc}"
+                self.guardrail_events.append({"type": "relocalization_failed", "reason": str(exc)})
+                try:
+                    self._push_progress_update(message=self.last_error, frontier_id=None)
                     map_payload = self._build_map_payload()
                 except Exception:
                     map_payload = None
@@ -5129,6 +5425,19 @@ class ExplorationRunner:
             return {"status": "unavailable", "reason": "The active exploration session does not support waypoint previews."}
         return preview(pose)
 
+    def relocalize_here(self) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        relocalize = getattr(session, "relocalize_here", None)
+        if not callable(relocalize):
+            return {"status": "unavailable", "reason": "The active session does not support relocalization."}
+        return relocalize()
+
     def perform_manual_scan(self) -> dict[str, Any]:
         with self._active_session_lock:
             session = self._active_session
@@ -5286,6 +5595,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
         ),
     )
+    parser.add_argument(
+        "--ros-publish-identity-map-to-odom",
+        action="store_true",
+        help=(
+            "When a loaded environment starts at 0,0,0, let this backend publish map->odom instead of relying "
+            "on an external static map->odom publisher. Use this for relocalization correction tests."
+        ),
+    )
+    parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
+    parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
@@ -5420,6 +5739,9 @@ def main(argv: list[str] | None = None) -> int:
             ros_map_topic=args.ros_map_topic,
             ros_map_updates_topic=args.ros_map_updates_topic,
             ros_fuse_external_projected_map_snapshots=args.ros_fuse_external_projected_map_snapshots,
+            ros_publish_identity_map_to_odom=args.ros_publish_identity_map_to_odom,
+            ros_relocalization_map_topic=args.ros_relocalization_map_topic,
+            ros_relocalization_reset_service=args.ros_relocalization_reset_service,
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,
             ros_scan_active_topic=args.ros_scan_active_topic,
@@ -5480,6 +5802,7 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
+                relocalizer=runner.relocalize_here,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )
@@ -5489,6 +5812,7 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_navigator=runner.navigate_to_waypoint,
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
+                relocalizer=runner.relocalize_here,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )

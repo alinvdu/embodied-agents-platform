@@ -43,6 +43,7 @@ try:
     from rclpy.time import Time as RosTime
     from sensor_msgs.msg import Image, Imu, LaserScan, PointCloud2
     from std_msgs.msg import Bool
+    from std_srvs.srv import Empty
     from tf2_ros import Buffer, TransformBroadcaster, TransformListener
     from tf2_ros import ConnectivityException, ExtrapolationException, LookupException
 except Exception as exc:  # pragma: no cover - runtime guard.
@@ -71,6 +72,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     LaserScan = None
     PointCloud2 = None
     Bool = None
+    Empty = None
     Buffer = None
     TransformBroadcaster = None
     TransformListener = None
@@ -292,6 +294,8 @@ def _select_turnaround_scan_observations(
 class RosRuntimeConfig:
     map_topic: str = "/map"
     map_updates_topic: str | None = None
+    relocalization_map_topic: str = "/relocalization_projected_map"
+    relocalization_reset_service: str = "/relocalization_octomap_server/reset"
     scan_topic: str = "/scan"
     point_cloud_topic: str = "/camera/head/points"
     point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
@@ -487,6 +491,9 @@ class RosExplorationRuntime(Node):
         self.latest_map: RosOccupancyMap | None = None
         self.latest_map_stamp_s: float = 0.0
         self.latest_map_header_frame_id: str = ""
+        self.latest_relocalization_map: RosOccupancyMap | None = None
+        self.latest_relocalization_map_stamp_s: float = 0.0
+        self.latest_relocalization_map_header_frame_id: str = ""
         self._last_map_log_s: float = 0.0
         self._last_map_update_log_s: float = 0.0
         self.latest_scan: LaserScan | None = None
@@ -529,6 +536,13 @@ class RosExplorationRuntime(Node):
         self._navigate_to_pose_client = ActionClient(self, NavigateToPose, "navigate_to_pose")
         self._spin_client = ActionClient(self, Spin, "spin")
         self.create_subscription(OccupancyGrid, config.map_topic, self._on_map, map_qos)
+        if config.relocalization_map_topic:
+            self.create_subscription(
+                OccupancyGrid,
+                config.relocalization_map_topic,
+                self._on_relocalization_map,
+                map_qos,
+            )
         self._map_updates_topic = config.map_updates_topic or default_map_updates_topic(config.map_topic)
         if OccupancyGridUpdate is not None:
             map_update_qos = QoSProfile(depth=20)
@@ -568,6 +582,18 @@ class RosExplorationRuntime(Node):
         if self.config.log_map_summaries and now - self._last_map_log_s >= 2.0:
             self._last_map_log_s = now
             print(f"[ros_nav2_runtime] received map topic={self.config.map_topic} summary={self.latest_map_summary()}")
+
+    def _on_relocalization_map(self, message: OccupancyGrid) -> None:
+        self.latest_relocalization_map = RosOccupancyMap(
+            resolution=float(message.info.resolution),
+            width=int(message.info.width),
+            height=int(message.info.height),
+            origin_x=float(message.info.origin.position.x),
+            origin_y=float(message.info.origin.position.y),
+            data=tuple(int(item) for item in message.data),
+        )
+        self.latest_relocalization_map_stamp_s = time.time()
+        self.latest_relocalization_map_header_frame_id = str(message.header.frame_id)
 
     def _on_map_update(self, message: Any) -> None:
         if self.latest_map is None:
@@ -795,6 +821,35 @@ class RosExplorationRuntime(Node):
             if self.latest_map is not None and self.latest_map_stamp_s > after_stamp_s:
                 return True
         return False
+
+    def wait_for_relocalization_map_update(self, *, after_stamp_s: float, timeout_s: float = 5.0) -> bool:
+        deadline = time.time() + max(float(timeout_s), 0.0)
+        while time.time() < deadline:
+            self._spin_once(timeout_sec=0.05)
+            if (
+                self.latest_relocalization_map is not None
+                and self.latest_relocalization_map_stamp_s > after_stamp_s
+            ):
+                return True
+        return False
+
+    def reset_relocalization_map(self, *, timeout_s: float = 2.0) -> dict[str, Any]:
+        service = str(getattr(self.config, "relocalization_reset_service", "") or "")
+        if not service:
+            return {"status": "unavailable", "reason": "No relocalization reset service configured."}
+        if Empty is None:
+            return {"status": "unavailable", "reason": "std_srvs/Empty is unavailable in this environment."}
+        client = self.create_client(Empty, service)
+        if not client.wait_for_service(timeout_sec=max(float(timeout_s), 0.0)):
+            return {"status": "unavailable", "reason": f"Relocalization reset service `{service}` is unavailable."}
+        future = client.call_async(Empty.Request())
+        deadline = time.time() + max(float(timeout_s), 0.0)
+        while not future.done():
+            remaining = deadline - time.time()
+            if remaining <= 0.0:
+                return {"status": "timeout", "reason": f"Timed out calling `{service}`."}
+            self._spin_once(timeout_sec=min(0.05, remaining))
+        return {"status": "ok", "service": service}
 
     def latest_map_summary(self) -> dict[str, Any] | None:
         occupancy_map = self.latest_map
@@ -1350,6 +1405,13 @@ class RosExplorationRuntime(Node):
             "latest_scan": self.latest_scan_stats,
             "latest_point_cloud": self.latest_point_cloud_stats,
             "latest_map": self.latest_map_summary(),
+            "latest_relocalization_map": None
+            if self.latest_relocalization_map is None
+            else self._occupancy_map_summary(
+                self.latest_relocalization_map,
+                frame_id=self.latest_relocalization_map_header_frame_id,
+                stamp_s=self.latest_relocalization_map_stamp_s,
+            ),
         }
 
     def record_goal(self, payload: dict[str, Any]) -> None:
@@ -1388,6 +1450,7 @@ class RosExplorationRuntime(Node):
         odom_pose = self.spin_until_odom_pose(timeout_s=self.config.ready_timeout_s)
         map_to_odom = compose_pose_2d(pose, inverse_pose_2d(odom_pose))
         self._map_to_odom = map_to_odom
+        self._publish_map_to_odom_enabled = True
         for _ in range(max(int(publish_count), 1)):
             message = PoseWithCovarianceStamped()
             message.header.stamp = self.get_clock().now().to_msg()

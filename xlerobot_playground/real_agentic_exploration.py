@@ -63,6 +63,16 @@ def build_parser() -> argparse.ArgumentParser:
             "Keep disabled for OctoMap, where /projected_map plus updates already contains accumulated evidence."
         ),
     )
+    parser.add_argument(
+        "--ros-publish-identity-map-to-odom",
+        action="store_true",
+        help=(
+            "When a loaded environment starts at 0,0,0, let this backend publish map->odom instead of relying "
+            "on an external static map->odom publisher. Use this for relocalization correction tests."
+        ),
+    )
+    parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
+    parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
     parser.add_argument("--ros-scan-active-topic", default="/xlerobot/scan_active")
@@ -151,6 +161,10 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_navigation_map_source,
         "--ros-map-topic",
         args.ros_map_topic,
+        "--ros-relocalization-map-topic",
+        args.ros_relocalization_map_topic,
+        "--ros-relocalization-reset-service",
+        args.ros_relocalization_reset_service,
         "--ros-scan-topic",
         args.ros_scan_topic,
         "--ros-point-cloud-topic",
@@ -230,6 +244,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         "--review-ui-flavor",
         args.review_ui_flavor,
     ]
+    if args.ros_publish_identity_map_to_odom:
+        items.append("--ros-publish-identity-map-to-odom")
     optional_pairs = [
         ("--max-control-steps", args.max_control_steps),
         ("--max-episode-steps", args.max_episode_steps),

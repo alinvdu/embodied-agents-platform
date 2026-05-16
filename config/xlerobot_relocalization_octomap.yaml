@@ -1,0 +1,28 @@
+relocalization_octomap_server:
+  ros__parameters:
+    frame_id: relocalization_map
+    base_frame_id: base_link
+    resolution: 0.08
+
+    sensor_model.max_range: 5.0
+
+    pointcloud_min_z: 0.12
+    pointcloud_max_z: 1.50
+    occupancy_min_z: 0.22
+    occupancy_max_z: 1.50
+
+    filter_ground_plane: false
+    ground_filter.distance: 0.08
+    ground_filter.angle: 0.20
+    ground_filter.plane_distance: 0.12
+
+    filter_speckles: true
+    publish_free_space: true
+    latch: true
+    incremental_2D_projection: false
+    compress_map: true
+
+    sensor_model.hit: 0.65
+    sensor_model.miss: 0.45
+    sensor_model.min: 0.12
+    sensor_model.max: 0.90
