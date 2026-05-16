@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import math
 from pathlib import Path
 import time
 from typing import Any
@@ -126,8 +127,11 @@ def home_memory_agent_context(memory: dict[str, Any]) -> dict[str, Any]:
                 "region_id": region.get("region_id"),
                 "label": region.get("label"),
                 "purpose": region.get("purpose", ""),
-                "centroid": _json_clone(region.get("centroid") or {}),
-                "default_waypoints": _json_clone(region.get("default_waypoints") or []),
+                "default_waypoints": [
+                    _json_clone(waypoint)
+                    for waypoint in region.get("default_waypoints", [])
+                    if isinstance(waypoint, dict) and not _is_auto_center_waypoint(region, waypoint)
+                ],
                 "adjacent_region_ids": list(region.get("adjacent_region_ids") or []),
             }
             for region in memory.get("regions", [])
@@ -202,7 +206,7 @@ def resolve_home_memory_target(
     for region in context.get("regions", []):
         label = str(region.get("label") or "")
         score = _lookup_score(query, label)
-        pose = _first_pose(region.get("default_waypoints")) or region.get("centroid")
+        pose = _first_pose(region.get("default_waypoints"))
         if score > 0 and _has_xy_pose(pose):
             candidates.append(
                 {
@@ -235,6 +239,117 @@ def resolve_home_memory_target(
     if not candidates:
         return None
     return max(candidates, key=lambda item: (float(item.get("confidence", 0.0)), _target_priority(item)))
+
+
+def resolve_region_navigation_goal(
+    memory: dict[str, Any],
+    name_or_label: str,
+    *,
+    current_pose: dict[str, Any] | None = None,
+    min_clearance_m: float = 0.28,
+) -> dict[str, Any]:
+    """Resolve a semantic region into a concrete known-free navigation pose."""
+    region = _best_region_match(memory, name_or_label)
+    if region is None:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "not_found",
+            "target_label": name_or_label,
+            "reason": "No matching region label was found in home memory.",
+        }
+    explicit = _first_pose(region.get("default_waypoints"))
+    if explicit is not None and not _is_auto_center_waypoint(region, explicit):
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "succeeded",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "goal_pose": _json_pose(explicit),
+            "source": "region.default_waypoints",
+            "candidate_count": 1,
+            "clearance_m": None,
+            "path": [],
+        }
+
+    polygon = region.get("polygon_2d")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "The matched region has no polygon and no explicit waypoint.",
+        }
+
+    grid = _memory_occupancy_grid(memory)
+    if not grid["free"]:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "Home memory has no known-free occupancy cells.",
+        }
+
+    resolution = float(grid["resolution"])
+    region_free_cells = [
+        cell
+        for cell in grid["free"]
+        if _point_in_polygon(
+            grid["origin_x"] + (cell[0] + 0.5) * resolution,
+            grid["origin_y"] + (cell[1] + 0.5) * resolution,
+            polygon,
+        )
+    ]
+    if not region_free_cells:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "No known-free occupancy cells were found inside the region.",
+        }
+
+    start_cell = _cell_for_pose(current_pose, grid) if current_pose else None
+    reachable = _reachable_free_cells(grid, start_cell) if start_cell is not None else set(grid["free"])
+    candidates = [cell for cell in region_free_cells if cell in reachable]
+    if not candidates:
+        candidates = region_free_cells
+    scored = [
+        (
+            _cell_clearance_m(cell, grid),
+            -float(_path_distance_cells(start_cell, cell, reachable) if start_cell is not None and cell in reachable else 0),
+            cell,
+        )
+        for cell in candidates
+    ]
+    scored.sort(reverse=True)
+    best_clearance, _, best = scored[0]
+    path_cells = _shortest_path_cells(grid, start_cell, best) if start_cell is not None and best in reachable else []
+    goal_pose = {
+        "x": round(grid["origin_x"] + (best[0] + 0.5) * resolution, 3),
+        "y": round(grid["origin_y"] + (best[1] + 0.5) * resolution, 3),
+        "yaw": _resolved_goal_yaw(current_pose),
+    }
+    status = "succeeded" if best_clearance >= min_clearance_m else "low_clearance"
+    return {
+        "tool": "resolve_region_navigation_goal",
+        "status": status,
+        "target_label": region.get("label") or name_or_label,
+        "target_type": "region",
+        "region_id": region.get("region_id"),
+        "goal_pose": goal_pose,
+        "source": "home_memory.occupancy_region_free_space",
+        "candidate_count": len(region_free_cells),
+        "reachable_candidate_count": len([cell for cell in region_free_cells if cell in reachable]),
+        "clearance_m": round(best_clearance, 3),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "path": _path_payload(path_cells, grid),
+    }
 
 
 def known_home_memory_labels(memory: dict[str, Any]) -> list[str]:
@@ -277,10 +392,11 @@ def _start_pose_from_map(map_payload: dict[str, Any]) -> dict[str, Any] | None:
 
 def _memory_region(region: dict[str, Any]) -> dict[str, Any]:
     label = str(region.get("label") or region.get("region_id") or "region")
-    default_waypoints = [_json_pose(waypoint) | {"name": str(waypoint.get("name") or f"{label}_waypoint")} for waypoint in region.get("default_waypoints", []) if isinstance(waypoint, dict)]
-    centroid = region.get("centroid")
-    if not default_waypoints and isinstance(centroid, dict):
-        default_waypoints.append({"name": f"{label.replace(' ', '_')}_center", **_json_pose(centroid)})
+    default_waypoints = [
+        _json_pose(waypoint) | {"name": str(waypoint.get("name") or f"{label}_waypoint")}
+        for waypoint in region.get("default_waypoints", [])
+        if isinstance(waypoint, dict) and not _is_auto_center_waypoint(region, waypoint)
+    ]
     return {
         "region_id": str(region.get("region_id") or label),
         "label": label,
@@ -294,6 +410,232 @@ def _memory_region(region: dict[str, Any]) -> dict[str, Any]:
         "adjacent_region_ids": list(region.get("adjacency") or region.get("adjacent_region_ids") or []),
         "evidence": _json_clone(region.get("evidence") or []),
     }
+
+
+def _is_auto_center_waypoint(region: dict[str, Any], waypoint: dict[str, Any]) -> bool:
+    name = str(waypoint.get("name") or "").lower().replace(" ", "_")
+    if not (name.endswith("_center") or name.endswith("_entry") or name == "center"):
+        return False
+    centroid = region.get("centroid")
+    if not isinstance(centroid, dict):
+        return False
+    try:
+        dx = float(waypoint.get("x", 0.0) or 0.0) - float(centroid.get("x", 0.0) or 0.0)
+        dy = float(waypoint.get("y", 0.0) or 0.0) - float(centroid.get("y", 0.0) or 0.0)
+    except Exception:
+        return False
+    return (dx * dx + dy * dy) ** 0.5 <= 0.10
+
+
+def _best_region_match(memory: dict[str, Any], name_or_label: str) -> dict[str, Any] | None:
+    query = _normalize_lookup_key(name_or_label)
+    if not query:
+        return None
+    matches: list[tuple[float, dict[str, Any]]] = []
+    for region in memory.get("regions", []):
+        if not isinstance(region, dict):
+            continue
+        label = str(region.get("label") or region.get("region_id") or "")
+        score = _lookup_score(query, label)
+        if score > 0:
+            matches.append((score, region))
+    if not matches:
+        return None
+    return max(matches, key=lambda item: item[0])[1]
+
+
+def _memory_occupancy_grid(memory: dict[str, Any]) -> dict[str, Any]:
+    occupancy = memory.get("occupancy") if isinstance(memory.get("occupancy"), dict) else {}
+    resolution = float(occupancy.get("resolution", 0.25) or 0.25)
+    bounds = occupancy.get("bounds") if isinstance(occupancy.get("bounds"), dict) else {}
+    origin_x = float(bounds.get("min_x", 0.0) or 0.0)
+    origin_y = float(bounds.get("min_y", 0.0) or 0.0)
+    free: set[tuple[int, int]] = set()
+    occupied: set[tuple[int, int]] = set()
+
+    for item in occupancy.get("cells", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            cell = (
+                int(math.floor((float(item.get("x", 0.0)) - origin_x) / resolution)),
+                int(math.floor((float(item.get("y", 0.0)) - origin_y) / resolution)),
+            )
+        except Exception:
+            continue
+        state = str(item.get("state") or "").lower()
+        if state == "free":
+            free.add(cell)
+            occupied.discard(cell)
+        elif state == "occupied":
+            occupied.add(cell)
+            free.discard(cell)
+
+    edits = memory.get("manual_occupancy_edits") if isinstance(memory.get("manual_occupancy_edits"), dict) else {}
+    for item in edits.get("blocked_cells", []) or []:
+        if isinstance(item, dict) and "cell_x" in item and "cell_y" in item:
+            cell = (int(item["cell_x"]), int(item["cell_y"]))
+            occupied.add(cell)
+            free.discard(cell)
+    for item in edits.get("cleared_cells", []) or []:
+        if isinstance(item, dict) and "cell_x" in item and "cell_y" in item:
+            cell = (int(item["cell_x"]), int(item["cell_y"]))
+            free.add(cell)
+            occupied.discard(cell)
+
+    return {
+        "resolution": resolution,
+        "origin_x": origin_x,
+        "origin_y": origin_y,
+        "free": free,
+        "occupied": occupied,
+    }
+
+
+def _cell_for_pose(pose: dict[str, Any] | None, grid: dict[str, Any]) -> tuple[int, int] | None:
+    if not isinstance(pose, dict):
+        return None
+    try:
+        resolution = float(grid["resolution"])
+        return (
+            int(math.floor((float(pose.get("x", 0.0)) - float(grid["origin_x"])) / resolution)),
+            int(math.floor((float(pose.get("y", 0.0)) - float(grid["origin_y"])) / resolution)),
+        )
+    except Exception:
+        return None
+
+
+def _reachable_free_cells(grid: dict[str, Any], start: tuple[int, int] | None) -> set[tuple[int, int]]:
+    free = set(grid["free"])
+    if not free:
+        return set()
+    if start not in free:
+        start = _nearest_free_cell(start, free)
+    if start is None:
+        return set(free)
+    visited = {start}
+    queue = [start]
+    while queue:
+        cell = queue.pop(0)
+        for neighbor in _neighbors4(cell):
+            if neighbor in free and neighbor not in visited:
+                visited.add(neighbor)
+                queue.append(neighbor)
+    return visited
+
+
+def _nearest_free_cell(start: tuple[int, int] | None, free: set[tuple[int, int]]) -> tuple[int, int] | None:
+    if not free:
+        return None
+    if start is None:
+        return next(iter(free))
+    return min(free, key=lambda cell: abs(cell[0] - start[0]) + abs(cell[1] - start[1]))
+
+
+def _neighbors4(cell: tuple[int, int]) -> tuple[tuple[int, int], ...]:
+    x, y = cell
+    return ((x + 1, y), (x - 1, y), (x, y + 1), (x, y - 1))
+
+
+def _cell_clearance_m(cell: tuple[int, int], grid: dict[str, Any]) -> float:
+    occupied = grid["occupied"]
+    if not occupied:
+        return 99.0
+    resolution = float(grid["resolution"])
+    nearest_cells = min(math.hypot(cell[0] - item[0], cell[1] - item[1]) for item in occupied)
+    return nearest_cells * resolution
+
+
+def _path_distance_cells(
+    start: tuple[int, int] | None,
+    goal: tuple[int, int],
+    reachable: set[tuple[int, int]],
+) -> int:
+    if start is None:
+        return 0
+    if start not in reachable:
+        start = _nearest_free_cell(start, reachable)
+    if start is None:
+        return 0
+    return abs(start[0] - goal[0]) + abs(start[1] - goal[1])
+
+
+def _shortest_path_cells(
+    grid: dict[str, Any],
+    start: tuple[int, int] | None,
+    goal: tuple[int, int],
+) -> list[tuple[int, int]]:
+    free = set(grid["free"])
+    if not free:
+        return []
+    if start not in free:
+        start = _nearest_free_cell(start, free)
+    if start is None or goal not in free:
+        return []
+    queue = [start]
+    parent: dict[tuple[int, int], tuple[int, int] | None] = {start: None}
+    while queue:
+        cell = queue.pop(0)
+        if cell == goal:
+            break
+        for neighbor in _neighbors4(cell):
+            if neighbor in free and neighbor not in parent:
+                parent[neighbor] = cell
+                queue.append(neighbor)
+    if goal not in parent:
+        return []
+    path = []
+    cell: tuple[int, int] | None = goal
+    while cell is not None:
+        path.append(cell)
+        cell = parent[cell]
+    return list(reversed(path))
+
+
+def _path_payload(path_cells: list[tuple[int, int]], grid: dict[str, Any]) -> list[dict[str, float]]:
+    if not path_cells:
+        return []
+    goal = path_cells[-1]
+    if len(path_cells) > 32:
+        stride = max(1, len(path_cells) // 31)
+        path_cells = path_cells[::stride]
+        if path_cells[-1] != goal:
+            path_cells.append(goal)
+    resolution = float(grid["resolution"])
+    return [
+        {
+            "x": round(float(grid["origin_x"]) + (cell[0] + 0.5) * resolution, 3),
+            "y": round(float(grid["origin_y"]) + (cell[1] + 0.5) * resolution, 3),
+        }
+        for cell in path_cells
+    ]
+
+
+def _resolved_goal_yaw(current_pose: dict[str, Any] | None) -> float:
+    if isinstance(current_pose, dict) and "yaw" in current_pose:
+        try:
+            return round(float(current_pose.get("yaw", 0.0) or 0.0), 3)
+        except Exception:
+            pass
+    return 0.0
+
+
+def _point_in_polygon(point_x: float, point_y: float, polygon: list[Any]) -> bool:
+    if len(polygon) < 3:
+        return False
+    inside = False
+    previous = len(polygon) - 1
+    for current in range(len(polygon)):
+        try:
+            xi, yi = float(polygon[current][0]), float(polygon[current][1])
+            xj, yj = float(polygon[previous][0]), float(polygon[previous][1])
+        except Exception:
+            previous = current
+            continue
+        if ((yi > point_y) != (yj > point_y)) and (point_x < (xj - xi) * (point_y - yi) / ((yj - yi) or 1e-9) + xi):
+            inside = not inside
+        previous = current
+    return inside
 
 
 def _memory_place(place: dict[str, Any]) -> dict[str, Any]:

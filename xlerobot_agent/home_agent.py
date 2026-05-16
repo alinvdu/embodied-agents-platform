@@ -14,8 +14,7 @@ import uuid
 from .home_memory import (
     HomeMemoryStore,
     home_memory_agent_context,
-    known_home_memory_labels,
-    resolve_home_memory_target,
+    resolve_region_navigation_goal,
     summarize_home_memory,
 )
 from .memory_discovery import EnvironmentMemoryDiscovery
@@ -113,6 +112,45 @@ class HomeAgentToolRuntime:
         )
         return result
 
+    def resolve_navigation_to_region(
+        self,
+        *,
+        target_label: str,
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        constraints = constraints or {}
+        result = resolve_region_navigation_goal(
+            self.memory,
+            target_label,
+            current_pose=self.current_pose,
+            min_clearance_m=float(constraints.get("min_clearance_m", 0.28) or 0.28),
+        )
+        self.emit(
+            "tool_executed" if result.get("status") in {"succeeded", "low_clearance"} else "tool_blocked",
+            "Region Navigation Resolver",
+            (
+                f"Resolved `{target_label}` to known free space."
+                if result.get("goal_pose")
+                else f"Could not resolve `{target_label}` to a safe navigation pose."
+            ),
+            result,
+        )
+        return result
+
+    def preview_path_to_region(
+        self,
+        *,
+        target_label: str,
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_navigation_to_region(target_label=target_label, constraints=constraints)
+        pose = resolved.get("goal_pose")
+        if not isinstance(pose, dict):
+            return resolved
+        preview = self.preview_path_to_pose(target_label=target_label, pose=pose, constraints=constraints)
+        preview["resolved_goal"] = resolved
+        return preview
+
     def navigate_to_pose(
         self,
         *,
@@ -143,6 +181,26 @@ class HomeAgentToolRuntime:
             result,
         )
         return result
+
+    def navigate_to_region(
+        self,
+        *,
+        target_label: str,
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved = self.resolve_navigation_to_region(target_label=target_label, constraints=constraints)
+        pose = resolved.get("goal_pose")
+        if not isinstance(pose, dict):
+            return resolved
+        if resolved.get("status") != "succeeded":
+            return {
+                **resolved,
+                "status": "blocked",
+                "reason": resolved.get("reason") or "Resolved region target did not meet navigation clearance requirements.",
+            }
+        nav = self.navigate_to_pose(target_label=target_label, pose=pose, constraints=constraints)
+        nav["resolved_goal"] = resolved
+        return nav
 
     def perceive_scene(self, *, target_label: str = "") -> dict[str, Any]:
         world_state = {
@@ -382,32 +440,26 @@ class HomeTaskAgent:
             self.emit("agent_blocked", "Missing Memory", record.summary, {})
             return
         if "stop" in command.lower():
-            runtime.stop_robot(reason=command)
-            record.summary = "Stop request handled."
+            record.status = "blocked"
+            record.summary = "Only region navigation resolution is exposed in this phase."
+            self.emit("agent_blocked", "Tool Not Exposed", record.summary, {"requested": "stop_robot"})
             return
 
         target = self._target_from_command(command, memory)
-        skill_id = self._skill_from_command(command, memory)
         if target is None:
-            labels = ", ".join(known_home_memory_labels(memory)) or "none"
+            labels = ", ".join(_known_region_labels(memory)) or "none"
             record.status = "blocked"
-            record.summary = f"I could not match the command to a known home-memory target. Known labels: {labels}."
-            self.emit("agent_blocked", "Target Not Found", record.summary, {"known_labels": known_home_memory_labels(memory)})
+            record.summary = f"I could not match the command to a known region. Known regions: {labels}."
+            self.emit("agent_blocked", "Target Not Found", record.summary, {"known_regions": _known_region_labels(memory)})
             return
 
         self.emit("memory_resolved", "Memory Target", f"Resolved `{target['label']}` from home memory.", target)
-        if skill_id:
-            nav = self._navigation_call(runtime, target)
-            scene = runtime.perceive_scene(target_label=str(target["label"]))
-            skill = runtime.run_skill(skill_id=skill_id, target_label=str(target["label"]))
-            record.summary = (
-                f"Resolved `{target['label']}`, prepared navigation, refreshed perception, "
-                f"and staged `{skill_id}` with status `{skill.get('status')}`."
-            )
-            return
-
         result = self._navigation_call(runtime, target)
-        record.summary = f"Resolved `{target['label']}` and prepared `{result['tool']}`."
+        if result.get("goal_pose"):
+            record.summary = f"Resolved `{target['label']}` to a concrete navigation preview point."
+        else:
+            record.status = "blocked"
+            record.summary = f"Could not resolve `{target['label']}` to a safe navigation preview point."
 
     def _run_agents_sdk(
         self,
@@ -422,58 +474,14 @@ class HomeTaskAgent:
             raise RuntimeError("OpenAI Agents SDK is not installed") from exc
 
         @function_tool
-        def preview_path_to_pose(target_label: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
-            """Preview a Nav2 path to a concrete map pose."""
+        def resolve_navigation_to_region(target_label: str, constraints_json: str = "{}") -> str:
+            """Resolve a semantic region label into a concrete known-free map pose using long-term occupancy memory."""
             return json.dumps(
-                runtime.preview_path_to_pose(
+                runtime.resolve_navigation_to_region(
                     target_label=target_label,
-                    pose={"x": x, "y": y, "yaw": yaw},
                     constraints=_loads_object(constraints_json),
                 )
             )
-
-        @function_tool
-        def navigate_to_pose(target_label: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
-            """Send a concrete map pose to Nav2, or dry-run it when the backend is in dry-run mode."""
-            return json.dumps(
-                runtime.navigate_to_pose(
-                    target_label=target_label,
-                    pose={"x": x, "y": y, "yaw": yaw},
-                    constraints=_loads_object(constraints_json),
-                )
-            )
-
-        @function_tool
-        def perceive_scene(target_label: str = "") -> str:
-            """Refresh short-term RGB-D scene understanding for the current robot pose."""
-            return json.dumps(runtime.perceive_scene(target_label=target_label))
-
-        @function_tool
-        def analyze_embodied_scene(target_label: str = "", question: str = "") -> str:
-            """Ask the optional embodied-reasoning specialist about physical scene feasibility."""
-            return json.dumps(runtime.analyze_embodied_scene(target_label=target_label, question=question))
-
-        @function_tool
-        def run_skill(skill_id: str, target_label: str = "", constraints_json: str = "{}", approved: bool = False) -> str:
-            """Invoke a registered scripted/VLA skill, subject to safety approval."""
-            return json.dumps(
-                runtime.run_skill(
-                    skill_id=skill_id,
-                    target_label=target_label,
-                    constraints=_loads_object(constraints_json),
-                    approved=approved,
-                )
-            )
-
-        @function_tool
-        def ask_human_approval(reason: str, action_json: str = "{}") -> str:
-            """Request operator approval before uncertain navigation or manipulation."""
-            return json.dumps(runtime.ask_human_approval(reason=reason, action=_loads_object(action_json)))
-
-        @function_tool
-        def stop_robot(reason: str = "") -> str:
-            """Stop robot motion or decline unsafe work."""
-            return json.dumps(runtime.stop_robot(reason=reason))
 
         agent = Agent(
             name="HomeTaskAgent",
@@ -484,13 +492,7 @@ class HomeTaskAgent:
                 max_tokens=self.config.model.max_tokens,
             ),
             tools=[
-                preview_path_to_pose,
-                navigate_to_pose,
-                perceive_scene,
-                analyze_embodied_scene,
-                run_skill,
-                ask_human_approval,
-                stop_robot,
+                resolve_navigation_to_region,
             ],
         )
         result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
@@ -498,35 +500,15 @@ class HomeTaskAgent:
 
     def _agent_instructions(self, memory: dict[str, Any] | None) -> str:
         context = home_memory_agent_context(memory) if memory else {}
-        specialist = None
-        if self.config.specialist_model is not None:
-            specialist = {
-                "provider": self.config.specialist_model.provider,
-                "model": self.config.specialist_model.model,
-                "role": "specialist embodied visual/spatial reasoning, not the main planner",
-            }
         return "\n".join(
             [
                 "You are Robot42's HomeTaskAgent.",
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
-                "Only call tools when you need robot action, Nav2 path/goal handling, perception, skill execution, approval, or stop.",
-                "For place navigation, choose a concrete pose from a region default waypoint, named place, or object approach pose.",
-                "If navigation is not explicitly allowed by the backend, navigate_to_pose returns a dry-run goal; that is acceptable for early tests.",
-                "For manipulation or VLA/scripted skills, perceive first and ask for approval when uncertain or when the tool reports approval_required.",
-                "Use analyze_embodied_scene only for physical/spatial uncertainty where a robotics specialist model is configured.",
-                "Return a concise final summary of what was prepared or executed.",
-                "",
-                "Backend settings:",
-                json.dumps(
-                    {
-                        "dry_run": self.config.dry_run,
-                        "auto_execute_navigation": self.config.auto_execute_navigation,
-                        "require_skill_approval": self.config.require_skill_approval,
-                        "specialist_model": specialist,
-                    },
-                    indent=2,
-                    sort_keys=True,
-                ),
+                "The only exposed tool in this phase is resolve_navigation_to_region.",
+                "For semantic region navigation such as `go to kitchen`, call resolve_navigation_to_region; the UI will show the returned preview path and chosen point.",
+                "Do not call or describe navigation execution, perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
+                "Do not infer a navigation target yourself from a region shape.",
+                "Return a concise final summary of the resolved region target and whether a preview point was found.",
                 "",
                 "Long-term home memory context:",
                 json.dumps(context, indent=2, sort_keys=True),
@@ -557,12 +539,30 @@ class HomeTaskAgent:
         return self.config.model.model
 
     def _target_from_command(self, command: str, memory: dict[str, Any]) -> dict[str, Any] | None:
-        labels = sorted(known_home_memory_labels(memory), key=len, reverse=True)
+        labels = sorted(_known_region_labels(memory), key=len, reverse=True)
         command_key = command.lower().replace("_", " ")
         for label in labels:
             if label.lower().replace("_", " ") in command_key:
-                return resolve_home_memory_target(memory, label)
-        return resolve_home_memory_target(memory, command)
+                region = self._semantic_region_target(memory, label)
+                if region is not None:
+                    return region
+        return self._semantic_region_target(memory, command)
+
+    def _semantic_region_target(self, memory: dict[str, Any], name_or_label: str) -> dict[str, Any] | None:
+        query = name_or_label.lower().replace("_", " ")
+        for region in memory.get("regions", []):
+            if not isinstance(region, dict):
+                continue
+            label = str(region.get("label") or region.get("region_id") or "")
+            normalized = label.lower().replace("_", " ")
+            if normalized and (query == normalized or normalized in query or query in normalized):
+                return {
+                    "target_type": "region",
+                    "label": label,
+                    "region_id": region.get("region_id"),
+                    "source": "home_memory.regions.semantic",
+                }
+        return None
 
     def _skill_from_command(self, command: str, memory: dict[str, Any]) -> str | None:
         normalized = command.lower().replace("_", " ")
@@ -582,11 +582,8 @@ class HomeTaskAgent:
         return None
 
     def _navigation_call(self, runtime: HomeAgentToolRuntime, target: dict[str, Any]) -> dict[str, Any]:
-        pose = target.get("pose") or {}
         label = str(target.get("label") or "target")
-        if self.config.auto_execute_navigation:
-            return runtime.navigate_to_pose(target_label=label, pose=pose)
-        return runtime.preview_path_to_pose(target_label=label, pose=pose)
+        return runtime.resolve_navigation_to_region(target_label=label)
 
 
 class HomeAgentController:
@@ -911,6 +908,15 @@ def _loads_object(payload: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _known_region_labels(memory: dict[str, Any]) -> list[str]:
+    labels = [
+        str(region.get("label") or region.get("region_id"))
+        for region in memory.get("regions", [])
+        if isinstance(region, dict) and (region.get("label") or region.get("region_id"))
+    ]
+    return sorted(set(labels), key=lambda item: item.lower())
 
 
 def _llm_model_config(config: HomeAgentModelConfig) -> ModelConfig:

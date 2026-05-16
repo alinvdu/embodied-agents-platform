@@ -58,15 +58,17 @@ Example commands:
 
 ```text
 go to the kitchen
-go to the fridge
-open the fridge
-inspect fridge contents
+go to the office
 ```
 
 Current behavior:
-- the agent reads regions, places, objects, dock pose, and skills from `home_memory.json`
+- the agent reads regions and occupancy from `home_memory.json`
 - memory lookup is prompt/context, not a tool call
-- navigation and skill execution are still dry-run/placeholders until live tools are wired
+- region navigation uses a tool call: `go to the kitchen` resolves `kitchen` against saved occupancy/free space and produces a concrete safe pose
+- the only exposed agent tool is `resolve_navigation_to_region`
+- execution, perception, and VLA/skill tools are intentionally not exposed yet
+
+Region polygons are semantic labels, not navigation goals. The agent should not choose a target from the region shape directly. When it needs to move to a region, it calls the region navigation resolver, which searches known-free occupancy cells inside the named region and prefers cells with clearance from occupied space.
 
 ## Configure Or Update Environment
 

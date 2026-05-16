@@ -13,7 +13,11 @@ from xlerobot_agent.home_agent import (
     HomeTaskAgent,
     discover_latest_home_memory_path,
 )
-from xlerobot_agent.home_memory import home_memory_agent_context, resolve_home_memory_target
+from xlerobot_agent.home_memory import (
+    home_memory_agent_context,
+    resolve_home_memory_target,
+    resolve_region_navigation_goal,
+)
 
 
 def sample_memory() -> dict:
@@ -74,9 +78,32 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertEqual(target["label"], "kitchen")
         self.assertEqual(target["pose"]["x"], 3.1)
 
+    def test_region_navigation_goal_uses_occupancy_when_no_explicit_pose(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[2.0, 1.0], [4.0, 1.0], [4.0, 3.0], [2.0, 3.0]]
+        memory["occupancy"] = {
+            "resolution": 0.5,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.5,
+                    "y": y * 0.5,
+                    "state": "occupied" if x in {0, 9} or y in {0, 5} else "free",
+                }
+                for x in range(10)
+                for y in range(6)
+            ],
+        }
+        result = resolve_region_navigation_goal(memory, "go to kitchen", current_pose={"x": 0.5, "y": 0.5, "yaw": 0.0})
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["target_label"], "kitchen")
+        self.assertIn("goal_pose", result)
+        self.assertGreater(result["candidate_count"], 0)
+
 
 class HomeTaskAgentTests(unittest.TestCase):
-    def test_mock_agent_previews_navigation_to_known_region(self) -> None:
+    def test_mock_agent_resolves_navigation_to_known_region(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = Path(tmpdir) / "house.home_memory.json"
             memory_path.write_text(json.dumps(sample_memory()))
@@ -92,8 +119,39 @@ class HomeTaskAgentTests(unittest.TestCase):
             )
             record = agent.run("go to the kitchen")
         self.assertEqual(record.status, "completed")
-        self.assertTrue(any(action.get("tool") == "preview_path_to_pose" for action in record.actions))
+        self.assertTrue(any(action.get("tool") == "resolve_region_navigation_goal" for action in record.actions))
+        self.assertFalse(any(action.get("tool") == "preview_path_to_pose" for action in record.actions))
         self.assertTrue(any(event["kind"] == "memory_resolved" for event in events))
+
+    def test_mock_agent_resolves_region_navigation_from_occupancy(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[2.0, 1.0], [4.0, 1.0], [4.0, 3.0], [2.0, 3.0]]
+        memory["occupancy"] = {
+            "resolution": 0.5,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.5,
+                    "y": y * 0.5,
+                    "state": "occupied" if x in {0, 9} or y in {0, 5} else "free",
+                }
+                for x in range(10)
+                for y in range(6)
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_path = Path(tmpdir) / "house.home_memory.json"
+            memory_path.write_text(json.dumps(memory))
+            record = HomeTaskAgent(
+                HomeAgentConfig(
+                    home_memory_path=str(memory_path),
+                    model=HomeAgentModelConfig(provider="mock", model="mock"),
+                )
+            ).run("go to the kitchen")
+        self.assertEqual(record.status, "completed")
+        self.assertTrue(any(action.get("tool") == "resolve_region_navigation_goal" for action in record.actions))
+        self.assertFalse(any(action.get("tool") == "preview_path_to_pose" for action in record.actions))
 
     def test_agent_auto_discovers_latest_home_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -138,7 +196,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(selected["home_memory_path"], str(memory_path))
         self.assertEqual(snapshot["home_memory"]["context"]["memory_id"], "house_v1")
 
-    def test_mock_agent_stages_skill_with_approval_required(self) -> None:
+    def test_mock_agent_does_not_expose_skill_tools_yet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = Path(tmpdir) / "house.home_memory.json"
             memory_path.write_text(json.dumps(sample_memory()))
@@ -148,9 +206,8 @@ class HomeTaskAgentTests(unittest.TestCase):
                     model=HomeAgentModelConfig(provider="mock", model="mock"),
                 )
             ).run("open the fridge")
-        self.assertEqual(record.status, "completed")
-        skill_actions = [action for action in record.actions if action.get("tool") == "run_skill"]
-        self.assertEqual(skill_actions[-1]["status"], "approval_required")
+        self.assertEqual(record.status, "blocked")
+        self.assertFalse(any(action.get("tool") == "run_skill" for action in record.actions))
 
     def test_controller_snapshot_matches_react_chat_shape(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

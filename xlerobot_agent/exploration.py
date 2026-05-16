@@ -496,6 +496,7 @@ class ExplorationBackend:
             if self._current_map is None:
                 return None
             self._ensure_start_pose()
+            self._rebuild_named_places()
             self._current_map["approved"] = True
             self._current_map["approved_at"] = time.time()
             self._maps[self._current_map["map_id"]] = json.loads(json.dumps(self._current_map))
@@ -593,12 +594,7 @@ class ExplorationBackend:
                 "evidence": ["manual region annotation"],
                 "default_waypoints": [_json_pose(item) for item in default_waypoints]
                 if default_waypoints is not None
-                else [
-                    {
-                        "name": f"{_slug(normalized_label)}_center",
-                        **_json_pose({"x": centroid["x"], "y": centroid["y"], "yaw": 0.0}),
-                    }
-                ],
+                else [],
             }
             if purpose:
                 created["purpose"] = str(purpose)
@@ -624,12 +620,7 @@ class ExplorationBackend:
                 "adjacency": sorted({item for region in selected for item in region.get("adjacency", []) if item not in set(region_ids)}),
                 "representative_keyframes": [item for region in selected for item in region.get("representative_keyframes", [])][:6],
                 "evidence": [item for region in selected for item in region.get("evidence", [])][:8],
-                "default_waypoints": [
-                    {
-                        "name": f"{(new_label or selected[0]['label']).replace(' ', '_')}_center",
-                        **_json_pose({"x": _polygon_centroid(merged_polygon)["x"], "y": _polygon_centroid(merged_polygon)["y"], "yaw": 0.0}),
-                    }
-                ],
+                "default_waypoints": [],
             }
             self._current_map["regions"] = [
                 region
@@ -665,12 +656,7 @@ class ExplorationBackend:
                     "adjacency": list(region.get("adjacency", [])),
                     "representative_keyframes": list(region.get("representative_keyframes", [])),
                     "evidence": list(region.get("evidence", [])),
-                    "default_waypoints": [
-                        {
-                            "name": f"{region['label']}_{index}_center",
-                            **_json_pose({"x": centroid["x"], "y": centroid["y"], "yaw": 0.0}),
-                        }
-                    ],
+                    "default_waypoints": [],
                 }
                 created.append(created_region)
             self._current_map["regions"].extend(created)
@@ -997,17 +983,9 @@ class ExplorationBackend:
             if item.get("source") in {"manual", "operator_dock_pose"}
         ]
         for region in self._current_map.get("regions", []):
-            label = str(region["label"]).replace(" ", "_")
-            centroid = region.get("centroid") or _polygon_centroid(region["polygon_2d"])
-            named_places.append(
-                {
-                    "name": f"{label}_entry",
-                    "pose": _json_pose({"x": centroid["x"], "y": centroid["y"], "yaw": 0.0}),
-                    "region_id": region["region_id"],
-                    "source": "derived",
-                }
-            )
             for waypoint in region.get("default_waypoints", []):
+                if _is_auto_centroid_waypoint(region, waypoint):
+                    continue
                 named_places.append(
                     {
                         "name": waypoint["name"],
@@ -1293,6 +1271,23 @@ def _region_id_for_pose(map_payload: dict[str, Any], pose: dict[str, Any]) -> st
         if isinstance(polygon, list) and _point_in_polygon(x, y, polygon):
             return region.get("region_id")
     return None
+
+
+def _is_auto_centroid_waypoint(region: dict[str, Any], waypoint: dict[str, Any]) -> bool:
+    if not isinstance(waypoint, dict):
+        return True
+    name = str(waypoint.get("name") or "").lower().replace(" ", "_")
+    if not (name.endswith("_center") or name.endswith("_entry") or name == "center"):
+        return False
+    centroid = region.get("centroid")
+    if not isinstance(centroid, dict):
+        return False
+    try:
+        dx = float(waypoint.get("x", 0.0)) - float(centroid.get("x", 0.0))
+        dy = float(waypoint.get("y", 0.0)) - float(centroid.get("y", 0.0))
+    except Exception:
+        return False
+    return math.hypot(dx, dy) <= 0.10
 
 
 def _point_in_polygon(x: float, y: float, polygon: list[Any]) -> bool:
