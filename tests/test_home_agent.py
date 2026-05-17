@@ -564,6 +564,60 @@ class HomeTaskAgentTests(unittest.TestCase):
             else:
                 os.environ.pop("OPENAI_API_KEY", None)
 
+    def test_gpt55_agents_sdk_settings_omit_temperature(self) -> None:
+        class FakeModelSettings:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        agent = HomeTaskAgent(
+            HomeAgentConfig(
+                model=HomeAgentModelConfig(
+                    provider="openai",
+                    model="gpt-5.5",
+                    temperature=0.7,
+                    max_tokens=4096,
+                    reasoning_effort="high",
+                    verbosity="medium",
+                ),
+            )
+        )
+
+        settings = agent._sdk_model_settings(FakeModelSettings)
+
+        self.assertNotIn("temperature", settings.kwargs)
+        self.assertEqual(settings.kwargs["max_tokens"], 4096)
+        self.assertEqual(settings.kwargs["verbosity"], "medium")
+        reasoning = settings.kwargs["reasoning"]
+        if isinstance(reasoning, dict):
+            self.assertEqual(reasoning["effort"], "high")
+        else:
+            self.assertEqual(reasoning.effort, "high")
+
+    def test_non_openai_gpt55_compatible_settings_keep_temperature(self) -> None:
+        class FakeModelSettings:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        agent = HomeTaskAgent(
+            HomeAgentConfig(
+                model=HomeAgentModelConfig(
+                    provider="openai-compatible",
+                    model="gemini-1.6-er",
+                    temperature=0.7,
+                    max_tokens=4096,
+                    reasoning_effort="high",
+                    verbosity="medium",
+                ),
+            )
+        )
+
+        settings = agent._sdk_model_settings(FakeModelSettings)
+
+        self.assertEqual(settings.kwargs["temperature"], 0.7)
+        self.assertEqual(settings.kwargs["max_tokens"], 4096)
+        self.assertNotIn("reasoning", settings.kwargs)
+        self.assertNotIn("verbosity", settings.kwargs)
+
 
 if __name__ == "__main__":
     unittest.main()

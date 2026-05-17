@@ -38,6 +38,8 @@ class HomeAgentModelConfig:
     api_key: str | None = None
     temperature: float = 0.2
     max_tokens: int = 1200
+    reasoning_effort: str | None = None
+    verbosity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -590,10 +592,7 @@ class HomeTaskAgent:
             name="NavigationAgent",
             instructions=self._agent_instructions(memory),
             model=self._sdk_model(),
-            model_settings=ModelSettings(
-                temperature=self.config.model.temperature,
-                max_tokens=self.config.model.max_tokens,
-            ),
+            model_settings=self._sdk_model_settings(ModelSettings),
             tools=[
                 resolve_navigation_to_region,
                 navigate_to_waypoint,
@@ -661,6 +660,20 @@ class HomeTaskAgent:
         if provider == "openai" and self.config.model.api_key and not os.getenv("OPENAI_API_KEY"):
             os.environ["OPENAI_API_KEY"] = self.config.model.api_key
         return self.config.model.model
+
+    def _sdk_model_settings(self, model_settings_cls: Any) -> Any:
+        kwargs: dict[str, Any] = {
+            "max_tokens": self.config.model.max_tokens,
+        }
+        if self._uses_gpt5_model_settings():
+            kwargs["reasoning"] = _reasoning_setting(self.config.model.reasoning_effort or "medium")
+            kwargs["verbosity"] = self.config.model.verbosity or "low"
+        else:
+            kwargs["temperature"] = self.config.model.temperature
+        return model_settings_cls(**kwargs)
+
+    def _uses_gpt5_model_settings(self) -> bool:
+        return self.config.model.provider == "openai" and _normalized_model_name(self.config.model.model).startswith("gpt-5")
 
     def _target_from_command(self, command: str, memory: dict[str, Any]) -> dict[str, Any] | None:
         labels = sorted(_known_region_labels(memory), key=len, reverse=True)
@@ -953,6 +966,8 @@ def config_from_env() -> HomeAgentConfig:
             api_key=os.getenv("ROBOT42_AGENT_API_KEY") or os.getenv("OPENAI_API_KEY"),
             temperature=float(os.getenv("ROBOT42_AGENT_TEMPERATURE", "0.2")),
             max_tokens=int(os.getenv("ROBOT42_AGENT_MAX_TOKENS", "1200")),
+            reasoning_effort=os.getenv("ROBOT42_AGENT_REASONING_EFFORT"),
+            verbosity=os.getenv("ROBOT42_AGENT_VERBOSITY"),
         ),
         specialist_model=specialist,
         dry_run=_env_bool("ROBOT42_AGENT_DRY_RUN", True),
@@ -1209,6 +1224,18 @@ def _llm_model_config(config: HomeAgentModelConfig) -> ModelConfig:
         temperature=config.temperature,
         max_tokens=config.max_tokens,
     )
+
+
+def _normalized_model_name(model: str) -> str:
+    return model.strip().lower()
+
+
+def _reasoning_setting(effort: str) -> Any:
+    try:
+        from openai.types.shared import Reasoning
+    except Exception:
+        return {"effort": effort}
+    return Reasoning(effort=effort)
 
 
 def _timestamp() -> str:

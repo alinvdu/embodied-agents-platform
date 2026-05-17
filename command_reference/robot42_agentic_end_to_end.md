@@ -121,7 +121,7 @@ python examples/robot42_agent_backend.py \
   --provider openai \
   --model gpt-5.5 \
   --exploration-backend-url http://127.0.0.1:8770 \
-  --navigation-waypoint-horizon-m 2.0
+  --navigation-waypoint-horizon-m 1.5
 ```
 
 ## Load A Saved Environment For Review Or Editing
