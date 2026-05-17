@@ -10,10 +10,25 @@ Use this when the environment has already been approved and saved under `artifac
 
 From the repo root:
 
+For live agent navigation with OpenAI traces:
+
+```bash
+python examples/robot42_agent_backend.py \
+  --memory-root ./artifacts/memories \
+  --provider openai \
+  --model gpt-5.5 \
+  --exploration-backend-url http://127.0.0.1:8770 \
+  --navigation-waypoint-horizon-m 2.0
+```
+
+For preview-only local testing, omit the provider:
+
 ```bash
 python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories
 ```
+
+The preview-only command runs `mock/mock`: it resolves the region and shows the waypoint, but it does not call `navigate_to_waypoint`, does not move the robot, and will not show OpenAI Agent traces.
 
 The agent backend automatically discovers environment folders under `artifacts/memories`.
 
@@ -98,11 +113,13 @@ Then in Robot42 UI:
 - click `Set Dock Pose`
 - click `Approve + Save Memory`
 
-After approval, the agent can be run later with only:
+After approval, the live navigation agent can be run later with:
 
 ```bash
 python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories \
+  --provider openai \
+  --model gpt-5.5 \
   --exploration-backend-url http://127.0.0.1:8770 \
   --navigation-waypoint-horizon-m 2.0
 ```

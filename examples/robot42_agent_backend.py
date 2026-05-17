@@ -61,6 +61,10 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
     print("Exposed tools: resolve_navigation_to_region, navigate_to_waypoint, relocalize_here")
     print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
+    if config.model.provider == "mock":
+        print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")
+    else:
+        print("Mode: live agent provider. Navigation tools can call Nav2 when the exploration nav session is active.")
     server.serve_forever()
     return 0
 
