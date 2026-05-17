@@ -27,10 +27,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--memory-root", default=None)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--max-turns", type=int, default=None)
     parser.add_argument("--provider", choices=("mock", "openai", "openai-compatible", "litellm"), default=None)
     parser.add_argument("--model", default=None)
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
+    parser.add_argument("--exploration-backend-url", default=None)
+    parser.add_argument("--navigation-waypoint-horizon-m", type=float, default=None)
+    parser.add_argument("--backend-request-timeout-s", type=float, default=None)
     parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
     parser.add_argument("--specialist-model", default=None)
     parser.add_argument("--specialist-base-url", default=None)
@@ -55,7 +59,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Main model: {config.model.provider}/{config.model.model}")
     if config.specialist_model:
         print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
-    print("Exposed tools: resolve_navigation_to_region")
+    print("Exposed tools: resolve_navigation_to_region, navigate_to_waypoint, relocalize_here")
+    print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
     server.serve_forever()
     return 0
 
@@ -84,8 +89,24 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
         home_memory_search_roots=(args.memory_root,) if args.memory_root else config.home_memory_search_roots,
         host=args.host or config.host,
         port=args.port or config.port,
+        max_turns=args.max_turns if args.max_turns is not None else config.max_turns,
         model=model,
         specialist_model=specialist,
+        exploration_backend_url=(
+            args.exploration_backend_url
+            if args.exploration_backend_url is not None
+            else config.exploration_backend_url
+        ),
+        navigation_waypoint_horizon_m=(
+            args.navigation_waypoint_horizon_m
+            if args.navigation_waypoint_horizon_m is not None
+            else config.navigation_waypoint_horizon_m
+        ),
+        backend_request_timeout_s=(
+            args.backend_request_timeout_s
+            if args.backend_request_timeout_s is not None
+            else config.backend_request_timeout_s
+        ),
     )
 
 

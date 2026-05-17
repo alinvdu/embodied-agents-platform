@@ -285,10 +285,11 @@ function AgentMapPreview({ memory, preview }) {
     return `${p.x},${p.y}`;
   }).join(" ");
   const goal = preview?.goal_pose ? project(preview.goal_pose) : null;
+  const nextWaypoint = preview?.next_waypoint ? project(preview.next_waypoint) : null;
   const startPose = memory?.start_pose?.pose || memory?.start_pose;
   const start = startPose ? project(startPose) : null;
   const subtitle = preview?.goal_pose
-    ? `${preview.target_label || "target"} -> (${round3(preview.goal_pose.x)}, ${round3(preview.goal_pose.y)})`
+    ? `${preview.target_label || "target"} -> next (${round3(preview.next_waypoint?.x ?? preview.goal_pose.x)}, ${round3(preview.next_waypoint?.y ?? preview.goal_pose.y)})`
     : "Ask for a region target to see the selected point.";
 
   return (
@@ -303,6 +304,9 @@ function AgentMapPreview({ memory, preview }) {
         {regions}
         {pathPoints ? <polyline points={pathPoints} fill="none" stroke="#0f766e" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" /> : null}
         {start ? <circle cx={start.x} cy={start.y} r="8" fill="#111827" /> : null}
+        {nextWaypoint ? <circle cx={nextWaypoint.x} cy={nextWaypoint.y} r="10" fill="#d97706" /> : null}
+        {nextWaypoint ? <circle cx={nextWaypoint.x} cy={nextWaypoint.y} r="18" fill="none" stroke="#d97706" strokeWidth="3" opacity="0.28" /> : null}
+        {nextWaypoint ? <text x={nextWaypoint.x + 13} y={nextWaypoint.y + 20} className="agent-map-waypoint-label">waypoint</text> : null}
         {goal ? <circle cx={goal.x} cy={goal.y} r="12" fill="#b42318" /> : null}
         {goal ? <circle cx={goal.x} cy={goal.y} r="21" fill="none" stroke="#b42318" strokeWidth="3" opacity="0.22" /> : null}
         {goal ? <text x={goal.x + 14} y={goal.y - 13} className="agent-map-goal-label">goal</text> : null}
@@ -977,6 +981,7 @@ function agentPreviewBounds(memory, preview) {
     for (const point of region.polygon_2d || []) points.push(point);
   }
   for (const point of preview?.path || []) points.push([point.x, point.y]);
+  if (preview?.next_waypoint) points.push([preview.next_waypoint.x, preview.next_waypoint.y]);
   if (preview?.goal_pose) points.push([preview.goal_pose.x, preview.goal_pose.y]);
   const startPose = memory?.start_pose?.pose || memory?.start_pose;
   if (startPose) points.push([startPose.x, startPose.y]);

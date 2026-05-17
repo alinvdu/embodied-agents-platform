@@ -20,6 +20,7 @@ DEFAULT_ROBOT_FOOTPRINT_RADIUS_M = math.hypot(
     XLEROBOT_FOOTPRINT_WIDTH_M / 2.0,
 )
 DEFAULT_NAVIGATION_CLEARANCE_M = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M + DEFAULT_NAVIGATION_SAFETY_GAP_M
+DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M = 2.0
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,7 @@ def resolve_region_navigation_goal(
     *,
     current_pose: dict[str, Any] | None = None,
     min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
+    waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
 ) -> dict[str, Any]:
     """Resolve a semantic region into a concrete known-free navigation pose."""
     region = _best_region_match(memory, name_or_label)
@@ -295,6 +297,13 @@ def resolve_region_navigation_goal(
             "target_type": "region",
             "region_id": region.get("region_id"),
             "goal_pose": _json_pose(explicit),
+            "next_waypoint": _explicit_waypoint_payload(
+                region.get("label") or name_or_label,
+                region.get("region_id"),
+                _json_pose(explicit),
+                current_pose,
+                waypoint_horizon_m,
+            ),
             "source": "region.default_waypoints",
             "candidate_count": 1,
             "clearance_m": None,
@@ -362,8 +371,23 @@ def resolve_region_navigation_goal(
     start_cell = _cell_for_pose(current_pose, grid) if current_pose else None
     reachable = _reachable_cells(grid, start_cell, footprint_safe_cells) if start_cell is not None else set(footprint_safe_cells)
     candidates = [cell for cell in region_free_cells if cell in reachable]
-    if not candidates:
+    if not candidates and start_cell is None:
         candidates = [cell for cell in region_free_cells if cell in footprint_safe_cells]
+    if not candidates and start_cell is not None:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region.get("label") or name_or_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "reason": "No footprint-safe known-free cells inside the region are reachable from the current pose.",
+            "candidate_count": len(region_free_cells),
+            "reachable_candidate_count": 0,
+            "footprint_safe_candidate_count": len([cell for cell in region_free_cells if cell in footprint_safe_cells]),
+            "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "safety_gap_m": round(safety_gap_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
     if not candidates:
         return {
             "tool": "resolve_region_navigation_goal",
@@ -395,6 +419,16 @@ def resolve_region_navigation_goal(
         "y": round(grid["origin_y"] + (best[1] + 0.5) * resolution, 3),
         "yaw": _resolved_goal_yaw(current_pose),
     }
+    path_length_m = _path_length_m(_path_points_for_waypoint(path_cells, grid, current_pose, goal_pose))
+    next_waypoint = _next_waypoint_payload(
+        path_cells,
+        grid,
+        current_pose,
+        goal_pose,
+        waypoint_horizon_m,
+        target_label=region.get("label") or name_or_label,
+        region_id=region.get("region_id"),
+    )
     status = "succeeded" if best_clearance >= min_clearance_m else "low_clearance"
     return {
         "tool": "resolve_region_navigation_goal",
@@ -403,6 +437,7 @@ def resolve_region_navigation_goal(
         "target_type": "region",
         "region_id": region.get("region_id"),
         "goal_pose": goal_pose,
+        "next_waypoint": next_waypoint,
         "source": "home_memory.occupancy_region_free_space",
         "candidate_count": len(region_free_cells),
         "reachable_candidate_count": len([cell for cell in region_free_cells if cell in reachable]),
@@ -413,6 +448,7 @@ def resolve_region_navigation_goal(
         "robot_footprint_radius_m": round(footprint_radius_m, 3),
         "safety_gap_m": round(safety_gap_m, 3),
         "path_strategy": "footprint_eroded_centerline_weighted_grid",
+        "path_length_m": round(path_length_m, 3),
         "path": _path_payload(path_cells, grid),
     }
 
@@ -725,6 +761,160 @@ def _path_payload(path_cells: list[tuple[int, int]], grid: dict[str, Any]) -> li
         }
         for cell in path_cells
     ]
+
+
+def _next_waypoint_payload(
+    path_cells: list[tuple[int, int]],
+    grid: dict[str, Any],
+    current_pose: dict[str, Any] | None,
+    goal_pose: dict[str, float],
+    horizon_m: float,
+    *,
+    target_label: str,
+    region_id: Any,
+) -> dict[str, Any]:
+    horizon_m = max(float(horizon_m or DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M), float(grid["resolution"]))
+    points = _path_points_for_waypoint(path_cells, grid, current_pose, goal_pose)
+    if len(points) < 2:
+        return _waypoint_payload(
+            target_label,
+            region_id,
+            goal_pose,
+            horizon_m=horizon_m,
+            distance_from_start_m=0.0,
+            remaining_to_goal_m=0.0,
+            is_final_waypoint=True,
+        )
+
+    total_m = _path_length_m(points)
+    target_m = min(horizon_m, total_m)
+    travelled_m = 0.0
+    selected = dict(points[-1])
+    yaw = _resolved_goal_yaw(current_pose)
+    for previous, nxt in zip(points, points[1:]):
+        segment_m = math.hypot(float(nxt["x"]) - float(previous["x"]), float(nxt["y"]) - float(previous["y"]))
+        if segment_m <= 1e-9:
+            continue
+        if travelled_m + segment_m >= target_m:
+            ratio = (target_m - travelled_m) / segment_m
+            x = float(previous["x"]) + (float(nxt["x"]) - float(previous["x"])) * ratio
+            y = float(previous["y"]) + (float(nxt["y"]) - float(previous["y"])) * ratio
+            yaw = math.atan2(float(nxt["y"]) - float(previous["y"]), float(nxt["x"]) - float(previous["x"]))
+            selected = {"x": round(x, 3), "y": round(y, 3), "yaw": round(yaw, 3)}
+            break
+        travelled_m += segment_m
+    else:
+        if len(points) >= 2:
+            previous = points[-2]
+            nxt = points[-1]
+            yaw = math.atan2(float(nxt["y"]) - float(previous["y"]), float(nxt["x"]) - float(previous["x"]))
+        selected = {**goal_pose, "yaw": round(yaw, 3)}
+
+    remaining_m = max(total_m - target_m, 0.0)
+    final_tolerance_m = max(float(grid["resolution"]) * 2.0, 0.20)
+    return _waypoint_payload(
+        target_label,
+        region_id,
+        selected,
+        horizon_m=horizon_m,
+        distance_from_start_m=target_m,
+        remaining_to_goal_m=remaining_m,
+        is_final_waypoint=remaining_m <= final_tolerance_m,
+    )
+
+
+def _explicit_waypoint_payload(
+    target_label: str,
+    region_id: Any,
+    goal_pose: dict[str, float],
+    current_pose: dict[str, Any] | None,
+    horizon_m: float,
+) -> dict[str, Any]:
+    distance_m = _pose_distance_m(current_pose, goal_pose) if current_pose else 0.0
+    return _waypoint_payload(
+        target_label,
+        region_id,
+        goal_pose,
+        horizon_m=max(float(horizon_m or DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M), 0.01),
+        distance_from_start_m=distance_m,
+        remaining_to_goal_m=0.0,
+        is_final_waypoint=True,
+    )
+
+
+def _waypoint_payload(
+    target_label: str,
+    region_id: Any,
+    pose: dict[str, Any],
+    *,
+    horizon_m: float,
+    distance_from_start_m: float,
+    remaining_to_goal_m: float,
+    is_final_waypoint: bool,
+) -> dict[str, Any]:
+    waypoint_pose = _json_pose(pose)
+    waypoint_id = (
+        f"{_slug(str(target_label or region_id or 'target'))}_"
+        f"h{int(round(horizon_m * 100.0))}_"
+        f"x{int(round(waypoint_pose['x'] * 100.0))}_"
+        f"y{int(round(waypoint_pose['y'] * 100.0))}"
+    )
+    return {
+        "waypoint_id": waypoint_id,
+        "target_label": target_label,
+        "region_id": region_id,
+        "x": waypoint_pose["x"],
+        "y": waypoint_pose["y"],
+        "yaw": waypoint_pose["yaw"],
+        "horizon_m": round(horizon_m, 3),
+        "distance_from_start_m": round(distance_from_start_m, 3),
+        "remaining_to_goal_m": round(remaining_to_goal_m, 3),
+        "is_final_waypoint": bool(is_final_waypoint),
+    }
+
+
+def _path_points_for_waypoint(
+    path_cells: list[tuple[int, int]],
+    grid: dict[str, Any],
+    current_pose: dict[str, Any] | None,
+    goal_pose: dict[str, float],
+) -> list[dict[str, float]]:
+    points: list[dict[str, float]] = []
+    if isinstance(current_pose, dict):
+        points.append(_json_pose(current_pose))
+    points.extend(_cell_center_pose(cell, grid) for cell in path_cells)
+    if not points or _pose_distance_m(points[-1], goal_pose) > float(grid["resolution"]) * 0.75:
+        points.append(_json_pose(goal_pose))
+    deduped: list[dict[str, float]] = []
+    for point in points:
+        if deduped and _pose_distance_m(deduped[-1], point) < 1e-6:
+            continue
+        deduped.append(point)
+    return deduped
+
+
+def _cell_center_pose(cell: tuple[int, int], grid: dict[str, Any]) -> dict[str, float]:
+    resolution = float(grid["resolution"])
+    return {
+        "x": round(float(grid["origin_x"]) + (cell[0] + 0.5) * resolution, 3),
+        "y": round(float(grid["origin_y"]) + (cell[1] + 0.5) * resolution, 3),
+        "yaw": 0.0,
+    }
+
+
+def _path_length_m(points: list[dict[str, Any]]) -> float:
+    return sum(_pose_distance_m(previous, nxt) for previous, nxt in zip(points, points[1:]))
+
+
+def _pose_distance_m(a: dict[str, Any] | None, b: dict[str, Any] | None) -> float:
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return 0.0
+    return math.hypot(float(a.get("x", 0.0) or 0.0) - float(b.get("x", 0.0) or 0.0), float(a.get("y", 0.0) or 0.0) - float(b.get("y", 0.0) or 0.0))
+
+
+def _slug(value: str) -> str:
+    normalized = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    return "_".join(part for part in normalized.split("_") if part) or "target"
 
 
 def _resolved_goal_yaw(current_pose: dict[str, Any] | None) -> float:

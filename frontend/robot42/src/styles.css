@@ -316,6 +316,12 @@ label {
   fill: #b42318;
 }
 
+.agent-map-waypoint-label {
+  font-size: 12px;
+  font-weight: 800;
+  fill: #92400e;
+}
+
 .agent-actions {
   display: flex;
   gap: 8px;

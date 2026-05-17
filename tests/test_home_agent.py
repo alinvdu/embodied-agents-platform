@@ -4,6 +4,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 from xlerobot_agent.home_agent import (
     HomeAgentConfig,
@@ -15,6 +16,7 @@ from xlerobot_agent.home_agent import (
 )
 from xlerobot_agent.home_memory import (
     DEFAULT_NAVIGATION_CLEARANCE_M,
+    DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
     home_memory_agent_context,
     resolve_home_memory_target,
     resolve_region_navigation_goal,
@@ -63,6 +65,20 @@ def sample_memory() -> dict:
     }
 
 
+class FakeHTTPResponse:
+    def __init__(self, payload: dict) -> None:
+        self.payload = payload
+
+    def __enter__(self) -> "FakeHTTPResponse":
+        return self
+
+    def __exit__(self, *_args) -> None:
+        return None
+
+    def read(self) -> bytes:
+        return json.dumps(self.payload).encode("utf-8")
+
+
 class HomeMemoryAgentContextTests(unittest.TestCase):
     def test_agent_context_exposes_regions_places_objects_and_skills(self) -> None:
         context = home_memory_agent_context(sample_memory())
@@ -103,6 +119,9 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertGreater(result["candidate_count"], 0)
         self.assertGreaterEqual(result["clearance_m"], DEFAULT_NAVIGATION_CLEARANCE_M)
         self.assertEqual(result["path_strategy"], "footprint_eroded_centerline_weighted_grid")
+        self.assertIn("next_waypoint", result)
+        self.assertLessEqual(result["next_waypoint"]["distance_from_start_m"], DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M)
+        self.assertIn("waypoint_id", result["next_waypoint"])
 
     def test_region_navigation_goal_blocks_footprint_unsafe_corridor(self) -> None:
         memory = sample_memory()
@@ -124,6 +143,61 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         result = resolve_region_navigation_goal(memory, "go to kitchen", current_pose={"x": 0.75, "y": 0.5, "yaw": 0.0})
         self.assertEqual(result["status"], "blocked")
         self.assertIn("footprint", result["reason"])
+
+    def test_region_navigation_goal_blocks_unreachable_region_from_current_pose(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[3.0, 0.5], [4.5, 0.5], [4.5, 2.5], [3.0, 2.5]]
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "occupied" if x == 9 or y in {0, 11} or x in {0, 19} else "free",
+                }
+                for x in range(20)
+                for y in range(12)
+            ],
+        }
+        result = resolve_region_navigation_goal(
+            memory,
+            "go to kitchen",
+            current_pose={"x": 0.5, "y": 1.0, "yaw": 0.0},
+            min_clearance_m=0.25,
+        )
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("reachable", result["reason"])
+
+    def test_region_navigation_goal_accepts_configurable_short_horizon_waypoint(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[2.0, 1.0], [4.0, 1.0], [4.0, 3.0], [2.0, 3.0]]
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "occupied" if x in {0, 19} or y in {0, 15} else "free",
+                }
+                for x in range(20)
+                for y in range(16)
+            ],
+        }
+        result = resolve_region_navigation_goal(
+            memory,
+            "go to kitchen",
+            current_pose={"x": 0.5, "y": 0.5, "yaw": 0.0},
+            waypoint_horizon_m=1.0,
+        )
+        self.assertEqual(result["status"], "succeeded")
+        waypoint = result["next_waypoint"]
+        self.assertAlmostEqual(waypoint["distance_from_start_m"], 1.0, delta=0.05)
+        self.assertFalse(waypoint["is_final_waypoint"])
+        self.assertNotEqual((waypoint["x"], waypoint["y"]), (result["goal_pose"]["x"], result["goal_pose"]["y"]))
 
 
 class HomeTaskAgentTests(unittest.TestCase):
@@ -280,6 +354,215 @@ class HomeTaskAgentTests(unittest.TestCase):
             result = runtime.analyze_embodied_scene(target_label="fridge", question="is this reachable?")
         self.assertEqual(result["status"], "succeeded")
         self.assertTrue(any(event["kind"] == "specialist_result" for event in events))
+
+    def test_runtime_navigate_to_waypoint_calls_exploration_backend(self) -> None:
+        events = []
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda kind, title, summary, details=None: events.append(
+                {"kind": kind, "title": title, "summary": summary, "details": details or {}}
+            ),
+        )
+        payload = {
+            "status": "succeeded",
+            "reason": "Nav2 reached the requested goal pose",
+            "nav2_result": {
+                "status": "succeeded",
+                "reason": "Nav2 reached the requested goal pose",
+                "reached_pose": {"x": 1.2, "y": 0.4, "yaw": 0.1},
+                "travelled_distance_m": 1.1,
+                "plan": {"status": "succeeded", "path_length_m": 1.1},
+                "feedback_samples": [{"remaining_distance_m": 0.0}],
+            },
+            "map": {"robot_pose": {"x": 1.2, "y": 0.4, "yaw": 0.1}},
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(payload)) as mocked:
+            result = runtime.navigate_to_waypoint(waypoint_id="kitchen_step", x=1.2, y=0.4, yaw=0.1)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["current_pose"], {"x": 1.2, "y": 0.4, "yaw": 0.1})
+        self.assertEqual(runtime.current_pose, {"x": 1.2, "y": 0.4, "yaw": 0.1})
+        self.assertEqual(result["distance_remaining_m"], 0.0)
+        request = mocked.call_args.args[0]
+        self.assertEqual(request.full_url, "http://explore.local/api/nav/waypoint")
+        self.assertTrue(any(event["details"].get("tool") == "navigate_to_waypoint" for event in events))
+
+    def test_runtime_navigate_does_not_treat_normalized_goal_as_current_pose(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        payload = {
+            "status": "failed",
+            "reason": "controller patience exceeded",
+            "normalized_pose": {"x": 3.0, "y": 0.0, "yaw": 0.0},
+            "nav2_result": {
+                "status": "failed",
+                "reason": "controller patience exceeded",
+                "reached_pose": None,
+                "plan": {"status": "succeeded", "path_length_m": 3.0},
+            },
+            "map": {"robot_pose": {"x": 0.8, "y": 0.1, "yaw": 0.0}},
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(payload)):
+            result = runtime.navigate_to_waypoint(waypoint_id="kitchen_step", x=3.0, y=0.0, yaw=0.0)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["current_pose"], {"x": 0.8, "y": 0.1, "yaw": 0.0})
+        self.assertEqual(result["normalized_pose"], {"x": 3.0, "y": 0.0, "yaw": 0.0})
+        self.assertEqual(runtime.current_pose, {"x": 0.8, "y": 0.1, "yaw": 0.0})
+
+    def test_runtime_relocalize_here_reuses_exploration_backend(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        payload = {
+            "status": "corrected",
+            "message": "Relocalization correction applied to odometry pose.",
+            "match": {
+                "status": "matched",
+                "confidence": 0.82,
+                "delta": {"dx_m": -0.1, "dy_m": 0.2, "dyaw_deg": 2.0},
+                "corrected_pose": {"x": 0.9, "y": 0.2, "yaw": 0.03},
+            },
+            "correction": {"status": "ok"},
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(payload)) as mocked:
+            result = runtime.relocalize_here()
+
+        self.assertEqual(result["status"], "corrected")
+        self.assertEqual(result["current_pose"], {"x": 0.9, "y": 0.2, "yaw": 0.03})
+        self.assertEqual(runtime.current_pose, {"x": 0.9, "y": 0.2, "yaw": 0.03})
+        request = mocked.call_args.args[0]
+        self.assertEqual(request.full_url, "http://explore.local/api/nav/relocalize")
+
+    def test_navigation_happy_path_resolves_moves_relocalizes_and_resolves_again(self) -> None:
+        memory = sample_memory()
+        memory["start_pose"] = {"name": "dock", "pose": {"x": 0.75, "y": 2.0, "yaw": 0.0}}
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[5.0, 1.0], [7.0, 1.0], [7.0, 3.0], [5.0, 3.0]]
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "occupied" if x in {0, 35} or y in {0, 19} else "free",
+                }
+                for x in range(36)
+                for y in range(20)
+            ],
+        }
+        runtime = HomeAgentToolRuntime(
+            memory=memory,
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                navigation_waypoint_horizon_m=1.0,
+            ),
+            emit=lambda *_args, **_kwargs: None,
+        )
+
+        first = runtime.resolve_navigation_to_region(target_label="kitchen")
+        self.assertEqual(first["status"], "succeeded")
+        self.assertFalse(first["next_waypoint"]["is_final_waypoint"])
+        self.assertGreater(first["path_length_m"], 1.0)
+        waypoint = first["next_waypoint"]
+        last_pose = {}
+        called_paths = []
+
+        def fake_urlopen(request, timeout=0):
+            called_paths.append(request.full_url)
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/waypoint"):
+                pose = body["pose"]
+                last_pose.clear()
+                last_pose.update(pose)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "Nav2 reached the requested goal pose",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "Nav2 reached the requested goal pose",
+                            "reached_pose": pose,
+                            "travelled_distance_m": waypoint["distance_from_start_m"],
+                            "plan": {"status": "succeeded", "path_length_m": waypoint["distance_from_start_m"]},
+                            "feedback_samples": [{"remaining_distance_m": 0.0}],
+                        },
+                        "map": {"robot_pose": pose},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/relocalize"):
+                corrected = {
+                    "x": round(float(last_pose["x"]) + 0.05, 3),
+                    "y": round(float(last_pose["y"]), 3),
+                    "yaw": round(float(last_pose.get("yaw", 0.0)), 3),
+                }
+                return FakeHTTPResponse(
+                    {
+                        "status": "corrected",
+                        "message": "Relocalization correction applied to odometry pose.",
+                        "match": {
+                            "status": "matched",
+                            "confidence": 0.9,
+                            "delta": {"dx_m": 0.05, "dy_m": 0.0, "dyaw_deg": 0.0},
+                            "corrected_pose": corrected,
+                        },
+                        "correction": {"status": "ok"},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            nav = runtime.navigate_to_waypoint(
+                waypoint_id=waypoint["waypoint_id"],
+                x=waypoint["x"],
+                y=waypoint["y"],
+                yaw=waypoint["yaw"],
+            )
+            relocalized = runtime.relocalize_here()
+            second = runtime.resolve_navigation_to_region(target_label="kitchen")
+
+        self.assertEqual(nav["status"], "succeeded")
+        self.assertEqual(nav["distance_remaining_m"], 0.0)
+        self.assertEqual(relocalized["status"], "corrected")
+        self.assertEqual(second["status"], "succeeded")
+        self.assertLess(second["path_length_m"], first["path_length_m"])
+        self.assertEqual(
+            called_paths,
+            ["http://explore.local/api/nav/waypoint", "http://explore.local/api/nav/relocalize"],
+        )
+
+    def test_agent_instructions_include_navigation_tool_loop_examples(self) -> None:
+        agent = HomeTaskAgent(HomeAgentConfig(navigation_waypoint_horizon_m=2.0))
+        instructions = agent._agent_instructions(sample_memory())
+        self.assertIn("Example navigation loop", instructions)
+        self.assertIn("navigate_to_waypoint", instructions)
+        self.assertIn("relocalize_here", instructions)
+        self.assertIn("constraints_json='{}'", instructions)
+        self.assertIn("After each successful waypoint", instructions)
+
+    def test_openai_provider_applies_cli_api_key_to_agents_sdk_env(self) -> None:
+        agent = HomeTaskAgent(
+            HomeAgentConfig(
+                model=HomeAgentModelConfig(provider="openai", model="gpt-test", api_key="test-key"),
+            )
+        )
+        previous = os.environ.pop("OPENAI_API_KEY", None)
+        try:
+            model = agent._sdk_model()
+            self.assertEqual(model, "gpt-test")
+            self.assertEqual(os.environ.get("OPENAI_API_KEY"), "test-key")
+        finally:
+            if previous is not None:
+                os.environ["OPENAI_API_KEY"] = previous
+            else:
+                os.environ.pop("OPENAI_API_KEY", None)
 
 
 if __name__ == "__main__":

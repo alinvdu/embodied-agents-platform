@@ -9,10 +9,13 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Callable
+import urllib.error
+import urllib.request
 import uuid
 
 from .home_memory import (
     DEFAULT_NAVIGATION_CLEARANCE_M,
+    DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
     HomeMemoryStore,
     home_memory_preview_map,
     home_memory_agent_context,
@@ -48,7 +51,10 @@ class HomeAgentConfig:
     require_skill_approval: bool = True
     host: str = "127.0.0.1"
     port: int = 8765
-    max_turns: int = 8
+    max_turns: int = 18
+    exploration_backend_url: str | None = "http://127.0.0.1:8770"
+    navigation_waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M
+    backend_request_timeout_s: float = 120.0
 
 
 @dataclass
@@ -126,6 +132,10 @@ class HomeAgentToolRuntime:
             target_label,
             current_pose=self.current_pose,
             min_clearance_m=float(constraints.get("min_clearance_m", DEFAULT_NAVIGATION_CLEARANCE_M) or DEFAULT_NAVIGATION_CLEARANCE_M),
+            waypoint_horizon_m=float(
+                constraints.get("waypoint_horizon_m", self.config.navigation_waypoint_horizon_m)
+                or self.config.navigation_waypoint_horizon_m
+            ),
         )
         self.emit(
             "tool_executed" if result.get("status") in {"succeeded", "low_clearance"} else "tool_blocked",
@@ -135,6 +145,79 @@ class HomeAgentToolRuntime:
                 if result.get("goal_pose")
                 else f"Could not resolve `{target_label}` to a safe navigation pose."
             ),
+            result,
+        )
+        return result
+
+    def navigate_to_waypoint(
+        self,
+        *,
+        waypoint_id: str,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        pose = _json_pose({"x": x, "y": y, "yaw": yaw})
+        if not self.config.exploration_backend_url:
+            result = {
+                "tool": "navigate_to_waypoint",
+                "status": "unavailable",
+                "waypoint_id": waypoint_id,
+                "requested_pose": pose,
+                "reason": "No exploration backend URL is configured for Nav2 waypoint execution.",
+            }
+            self.emit("tool_blocked", "Waypoint Navigation", result["reason"], result)
+            return result
+
+        response = _post_exploration_backend(
+            self.config,
+            "/api/nav/waypoint",
+            {"pose": pose, "waypoint_id": waypoint_id, "constraints": constraints or {}},
+        )
+        result = _navigation_tool_result(
+            response,
+            waypoint_id=waypoint_id,
+            requested_pose=pose,
+            backend_url=self.config.exploration_backend_url,
+        )
+        current_pose = result.get("current_pose")
+        if isinstance(current_pose, dict):
+            self.current_pose = _json_pose(current_pose)
+        elif result.get("status") == "succeeded":
+            self.current_pose = pose
+            result["current_pose"] = dict(pose)
+        self.emit(
+            "tool_executed" if result.get("status") == "succeeded" else "tool_blocked",
+            "Waypoint Navigation",
+            (
+                f"Nav2 reached waypoint `{waypoint_id}`."
+                if result.get("status") == "succeeded"
+                else f"Nav2 waypoint `{waypoint_id}` returned `{result.get('status')}`."
+            ),
+            result,
+        )
+        return result
+
+    def relocalize_here(self) -> dict[str, Any]:
+        if not self.config.exploration_backend_url:
+            result = {
+                "tool": "relocalize_here",
+                "status": "unavailable",
+                "reason": "No exploration backend URL is configured for relocalization.",
+            }
+            self.emit("tool_blocked", "Relocalization", result["reason"], result)
+            return result
+
+        response = _post_exploration_backend(self.config, "/api/nav/relocalize", {})
+        result = _relocalization_tool_result(response, backend_url=self.config.exploration_backend_url)
+        current_pose = result.get("current_pose")
+        if isinstance(current_pose, dict):
+            self.current_pose = _json_pose(current_pose)
+        self.emit(
+            "tool_executed" if result.get("status") in {"corrected", "skipped"} else "tool_blocked",
+            "Relocalization",
+            str(result.get("message") or result.get("reason") or f"Relocalization {result.get('status')}."),
             result,
         )
         return result
@@ -477,7 +560,7 @@ class HomeTaskAgent:
 
         @function_tool
         def resolve_navigation_to_region(target_label: str, constraints_json: str = "{}") -> str:
-            """Resolve a semantic region label into a concrete known-free map pose using long-term occupancy memory."""
+            """Resolve a semantic region label into a concrete safe path, final pose, and short-horizon waypoint."""
             return json.dumps(
                 runtime.resolve_navigation_to_region(
                     target_label=target_label,
@@ -485,8 +568,26 @@ class HomeTaskAgent:
                 )
             )
 
+        @function_tool
+        def navigate_to_waypoint(waypoint_id: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
+            """Send a resolved waypoint to the live exploration/Nav2 backend and wait for the result."""
+            return json.dumps(
+                runtime.navigate_to_waypoint(
+                    waypoint_id=waypoint_id,
+                    x=x,
+                    y=y,
+                    yaw=yaw,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def relocalize_here() -> str:
+            """Run the existing exploration backend relocalization scan and odometry correction."""
+            return json.dumps(runtime.relocalize_here())
+
         agent = Agent(
-            name="HomeTaskAgent",
+            name="NavigationAgent",
             instructions=self._agent_instructions(memory),
             model=self._sdk_model(),
             model_settings=ModelSettings(
@@ -495,6 +596,8 @@ class HomeTaskAgent:
             ),
             tools=[
                 resolve_navigation_to_region,
+                navigate_to_waypoint,
+                relocalize_here,
             ],
         )
         result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
@@ -505,12 +608,29 @@ class HomeTaskAgent:
         return "\n".join(
             [
                 "You are Robot42's HomeTaskAgent.",
+                "For navigation commands, act as the NavigationAgent delegated by HomeTaskAgent.",
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
-                "The only exposed tool in this phase is resolve_navigation_to_region.",
-                "For semantic region navigation such as `go to kitchen`, call resolve_navigation_to_region; the UI will show the returned preview path and chosen point.",
-                "Do not call or describe navigation execution, perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
+                "Available navigation tools are resolve_navigation_to_region, navigate_to_waypoint, and relocalize_here.",
+                "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
+                f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
+                "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
+                "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
+                "After each successful waypoint, call relocalize_here before resolving the next waypoint.",
+                "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
+                "If navigation fails but distance_remaining_m is small enough for the task, say that clearly; otherwise report the failure and stop.",
+                "Do not call or describe perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
                 "Do not infer a navigation target yourself from a region shape.",
-                "Return a concise final summary of the resolved region target and whether a preview point was found.",
+                "Return a concise final summary of the navigation status, final/current pose, and any relocalization correction.",
+                "",
+                "Example navigation loop for `go to kitchen`:",
+                "1. Call resolve_navigation_to_region(target_label='kitchen', constraints_json='{}').",
+                "2. If the result has status succeeded or low_clearance and includes next_waypoint, call navigate_to_waypoint with that exact waypoint and constraints_json='{}'.",
+                "3. If the waypoint succeeded, call relocalize_here.",
+                "4. If the waypoint succeeded and was not final, repeat from step 1.",
+                "5. If the waypoint succeeded and was final, summarize that the region was reached.",
+                "6. If the waypoint failed, summarize status, reason, distance_remaining_m, and current_pose.",
+                "",
+                "Example custom horizon: resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"waypoint_horizon_m\": 1.5}').",
                 "",
                 "Long-term home memory context:",
                 json.dumps(context, indent=2, sort_keys=True),
@@ -538,6 +658,8 @@ class HomeTaskAgent:
                 api_key=self.config.model.api_key or "not-needed",
             )
             return OpenAIChatCompletionsModel(model=self.config.model.model, openai_client=client)
+        if provider == "openai" and self.config.model.api_key and not os.getenv("OPENAI_API_KEY"):
+            os.environ["OPENAI_API_KEY"] = self.config.model.api_key
         return self.config.model.model
 
     def _target_from_command(self, command: str, memory: dict[str, Any]) -> dict[str, Any] | None:
@@ -838,6 +960,12 @@ def config_from_env() -> HomeAgentConfig:
         require_skill_approval=_env_bool("ROBOT42_AGENT_REQUIRE_SKILL_APPROVAL", True),
         host=os.getenv("ROBOT42_AGENT_HOST", "127.0.0.1"),
         port=int(os.getenv("ROBOT42_AGENT_PORT", "8765")),
+        max_turns=int(os.getenv("ROBOT42_AGENT_MAX_TURNS", "18")),
+        exploration_backend_url=os.getenv("ROBOT42_EXPLORATION_BACKEND_URL", "http://127.0.0.1:8770"),
+        navigation_waypoint_horizon_m=float(
+            os.getenv("ROBOT42_NAVIGATION_WAYPOINT_HORIZON_M", str(DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M))
+        ),
+        backend_request_timeout_s=float(os.getenv("ROBOT42_AGENT_BACKEND_REQUEST_TIMEOUT_S", "120")),
     )
 
 
@@ -911,6 +1039,151 @@ def _loads_object(payload: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _post_exploration_backend(config: HomeAgentConfig, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    base_url = str(config.exploration_backend_url or "").rstrip("/")
+    url = f"{base_url}{path}"
+    body = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(float(config.backend_request_timeout_s), 1.0)) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            raw_error = exc.read().decode("utf-8")
+        except Exception:
+            raw_error = str(exc)
+        return {
+            "status": "failed",
+            "reason": f"Exploration backend returned HTTP {exc.code}: {raw_error[:400]}",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"Exploration backend is unavailable at {url}: {exc}",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {
+            "status": "failed",
+            "reason": f"Exploration backend returned non-JSON response from {url}.",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    return parsed if isinstance(parsed, dict) else {"status": "failed", "reason": "Exploration backend response was not an object."}
+
+
+def _navigation_tool_result(
+    response: dict[str, Any],
+    *,
+    waypoint_id: str,
+    requested_pose: dict[str, float],
+    backend_url: str | None,
+) -> dict[str, Any]:
+    nav2 = response.get("nav2_result") if isinstance(response.get("nav2_result"), dict) else {}
+    plan = nav2.get("plan") if isinstance(nav2.get("plan"), dict) else {}
+    status = str(response.get("status") or nav2.get("status") or "failed")
+    current_pose = _pose_from_backend_response(response)
+    distance_remaining_m = _remaining_distance_m(nav2)
+    if distance_remaining_m is None and status == "succeeded":
+        distance_remaining_m = 0.0
+    if distance_remaining_m is None and current_pose is not None:
+        distance_remaining_m = round(_pose_distance_m(current_pose, requested_pose), 3)
+    return {
+        "tool": "navigate_to_waypoint",
+        "status": status,
+        "waypoint_id": waypoint_id,
+        "requested_pose": requested_pose,
+        "current_pose": current_pose,
+        "normalized_pose": _json_pose(response["normalized_pose"]) if isinstance(response.get("normalized_pose"), dict) else None,
+        "distance_remaining_m": distance_remaining_m,
+        "reason": response.get("reason") or nav2.get("reason") or response.get("message") or "",
+        "backend_url": backend_url,
+        "nav2": {
+            "status": nav2.get("status"),
+            "reason": nav2.get("reason"),
+            "travelled_distance_m": nav2.get("travelled_distance_m"),
+            "reached_pose": _json_pose(nav2["reached_pose"]) if isinstance(nav2.get("reached_pose"), dict) else None,
+            "plan_status": plan.get("status"),
+            "plan_reason": plan.get("reason"),
+            "path_length_m": plan.get("path_length_m"),
+        },
+    }
+
+
+def _relocalization_tool_result(response: dict[str, Any], *, backend_url: str | None) -> dict[str, Any]:
+    match = response.get("match") if isinstance(response.get("match"), dict) else {}
+    correction = response.get("correction") if isinstance(response.get("correction"), dict) else {}
+    current_pose = _pose_from_backend_response(response)
+    corrected_pose = _json_pose(match["corrected_pose"]) if isinstance(match.get("corrected_pose"), dict) else None
+    if current_pose is None and corrected_pose is not None:
+        current_pose = corrected_pose
+    return {
+        "tool": "relocalize_here",
+        "status": str(response.get("status") or "failed"),
+        "message": response.get("message"),
+        "reason": response.get("reason"),
+        "backend_url": backend_url,
+        "current_pose": current_pose,
+        "match": {
+            "status": match.get("status"),
+            "confidence": match.get("confidence"),
+            "delta": match.get("delta"),
+            "corrected_pose": corrected_pose,
+            "reason": match.get("reason"),
+        },
+        "correction": {
+            "status": correction.get("status"),
+            "reason": correction.get("reason"),
+        },
+    }
+
+
+def _pose_from_backend_response(response: dict[str, Any]) -> dict[str, float] | None:
+    nav2 = response.get("nav2_result") if isinstance(response.get("nav2_result"), dict) else {}
+    for candidate in (
+        nav2.get("reached_pose"),
+        (response.get("map") or {}).get("robot_pose") if isinstance(response.get("map"), dict) else None,
+    ):
+        if isinstance(candidate, dict):
+            return _json_pose(candidate)
+    return None
+
+
+def _remaining_distance_m(nav2: dict[str, Any]) -> float | None:
+    samples = nav2.get("feedback_samples")
+    if not isinstance(samples, list) or not samples:
+        return None
+    last = samples[-1]
+    if not isinstance(last, dict):
+        return None
+    value = last.get("remaining_distance_m") or last.get("distance_remaining_m")
+    if value is None:
+        return None
+    try:
+        return round(float(value), 3)
+    except Exception:
+        return None
+
+
+def _pose_distance_m(a: dict[str, Any], b: dict[str, Any]) -> float:
+    return round(
+        ((float(a.get("x", 0.0) or 0.0) - float(b.get("x", 0.0) or 0.0)) ** 2
+         + (float(a.get("y", 0.0) or 0.0) - float(b.get("y", 0.0) or 0.0)) ** 2)
+        ** 0.5,
+        3,
+    )
 
 
 def _known_region_labels(memory: dict[str, Any]) -> list[str]:

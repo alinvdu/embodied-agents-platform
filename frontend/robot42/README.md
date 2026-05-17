@@ -39,7 +39,7 @@ python -m xlerobot_playground.real_agentic_exploration \
 
 `examples/xlerobot_exploration_review.py` is only a review-only helper for already-saved maps. The normal robot mapping flow is `python -m xlerobot_playground.real_agentic_exploration`.
 
-If memory already exists and you only want to use the agent, do not start exploration. Start only `robot42_agent_backend.py` and the React UI. Start `real_agentic_exploration` only when you need `Configure Environment` to create, load, edit, or re-approve an environment map.
+If memory already exists and you only want the agent to reason over memory or produce navigation previews, do not start exploration. Start only `robot42_agent_backend.py` and the React UI. Start `real_agentic_exploration` when you need `Configure Environment` to create, load, edit, or re-approve an environment map, or when you want the agent to execute live Nav2 waypoint navigation/relocalization.
 
 To load a saved environment in the configuration UI:
 
@@ -50,6 +50,13 @@ To load a saved environment in the configuration UI:
 5. Click `Start Nav Session` when you want live ROS/Nav2 manual waypoint testing on that saved map.
 
 `Start Nav Session` uses the loaded `environment_map.json`, applies the saved dock/start pose as the initial robot pose, and enables the existing `Preview` / `Go` controls without starting frontier exploration.
+
+Agent navigation uses the same exploration backend calls as the UI:
+
+- `navigate_to_waypoint` posts to `/api/nav/waypoint`
+- `relocalize_here` posts to `/api/nav/relocalize`
+
+Keep `real_agentic_exploration` running with a loaded environment and an active nav session when you want those agent tools to move the robot.
 
 Default backend targets:
 
