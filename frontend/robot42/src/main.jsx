@@ -173,7 +173,7 @@ function AgentChat({ onConfigure }) {
         {error ? <div className="error-line">{error}</div> : null}
         </div>
       </div>
-      <AgentMapPreview memory={homeMemory} preview={navigationPreview} />
+      <AgentMapPreview memory={homeMemory} liveMap={explorationState?.current_map || null} preview={navigationPreview} />
       <div className="agent-actions">
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/pause", {}).then(refresh)}><Pause size={16} /> Pause</button>
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/resume", {}).then(refresh)}><Play size={16} /> Resume</button>
@@ -249,23 +249,28 @@ function EnvironmentCard({
   );
 }
 
-function AgentMapPreview({ memory, preview }) {
-  const hasMap = Boolean(memory?.occupancy?.cells?.length || memory?.regions?.length);
-  const bounds = useMemo(() => agentPreviewBounds(memory, preview), [memory, preview]);
+function AgentMapPreview({ memory, liveMap, preview }) {
+  const displayMap = liveMap?.occupancy?.cells?.length || liveMap?.regions?.length ? liveMap : memory;
+  const hasMap = Boolean(displayMap?.occupancy?.cells?.length || displayMap?.regions?.length);
+  const bounds = useMemo(() => agentPreviewBounds(displayMap, preview), [displayMap, preview]);
   const project = useMemo(() => makeProjector(bounds, { height: AGENT_VIEW_H, pad: AGENT_PAD }), [bounds]);
   if (!hasMap && !preview) return null;
-  const cells = (memory?.occupancy?.cells || []).map((cell, index) => {
-    const resolution = memory?.occupancy?.resolution || 0.25;
+  const cells = (displayMap?.occupancy?.cells || []).map((cell, index) => {
+    const resolution = displayMap?.occupancy?.resolution || 0.25;
     const p1 = project({ x: cell.x, y: cell.y });
     const p2 = project({ x: Number(cell.x || 0) + resolution, y: Number(cell.y || 0) + resolution });
-    const fill = cell.state === "occupied"
-      ? "rgba(31, 41, 55, 0.52)"
-      : cell.state === "free"
-        ? "rgba(134, 148, 166, 0.20)"
-        : "rgba(134, 148, 166, 0.10)";
+    const fill = cell.manual_override === "blocked"
+      ? "#1f2937"
+      : cell.manual_override === "cleared"
+        ? "rgba(134, 148, 166, 0.22)"
+        : cell.state === "occupied"
+          ? "rgba(31, 41, 55, 0.52)"
+          : cell.state === "free"
+            ? "rgba(134, 148, 166, 0.20)"
+            : "rgba(134, 148, 166, 0.10)";
     return <rect key={index} x={p1.x} y={p2.y} width={Math.max(1.5, p2.x - p1.x)} height={Math.max(1.5, p1.y - p2.y)} fill={fill} />;
   });
-  const regions = (memory?.regions || []).map((region, index) => {
+  const regions = (displayMap?.regions || []).map((region, index) => {
     const points = (region.polygon_2d || []).map((point) => {
       const p = project({ x: point[0], y: point[1] });
       return `${p.x},${p.y}`;
@@ -286,7 +291,14 @@ function AgentMapPreview({ memory, preview }) {
   }).join(" ");
   const goal = preview?.goal_pose ? project(preview.goal_pose) : null;
   const nextWaypoint = preview?.next_waypoint ? project(preview.next_waypoint) : null;
-  const startPose = memory?.start_pose?.pose || memory?.start_pose;
+  const robotPose = displayMap?.robot_pose || (displayMap?.trajectory || []).slice(-1)[0] || null;
+  const robot = robotPose ? project(robotPose) : null;
+  const headingLength = Math.max(displayMap?.occupancy?.resolution || 0.25, 0.25) * 3.5;
+  const robotHeading = robotPose ? project({
+    x: Number(robotPose.x || 0) + Math.cos(Number(robotPose.yaw || 0)) * headingLength,
+    y: Number(robotPose.y || 0) + Math.sin(Number(robotPose.yaw || 0)) * headingLength,
+  }) : null;
+  const startPose = displayMap?.start_pose?.pose || displayMap?.start_pose;
   const start = startPose ? project(startPose) : null;
   const subtitle = preview?.goal_pose
     ? `${preview.target_label || "target"} -> next (${round3(preview.next_waypoint?.x ?? preview.goal_pose.x)}, ${round3(preview.next_waypoint?.y ?? preview.goal_pose.y)})`
@@ -310,6 +322,10 @@ function AgentMapPreview({ memory, preview }) {
         {goal ? <circle cx={goal.x} cy={goal.y} r="12" fill="#b42318" /> : null}
         {goal ? <circle cx={goal.x} cy={goal.y} r="21" fill="none" stroke="#b42318" strokeWidth="3" opacity="0.22" /> : null}
         {goal ? <text x={goal.x + 14} y={goal.y - 13} className="agent-map-goal-label">goal</text> : null}
+        {robot ? <circle cx={robot.x} cy={robot.y} r="11" fill="#b42318" /> : null}
+        {robot && robotHeading ? <line x1={robot.x} y1={robot.y} x2={robotHeading.x} y2={robotHeading.y} className="robot-heading" /> : null}
+        {robot && robotHeading ? <circle cx={robotHeading.x} cy={robotHeading.y} r="4" fill="#6d0f0a" /> : null}
+        {robot ? <text x={robot.x + 12} y={robot.y - 12} className="robot-label">robot</text> : null}
       </svg>
     </section>
   );
@@ -985,6 +1001,8 @@ function agentPreviewBounds(memory, preview) {
   if (preview?.goal_pose) points.push([preview.goal_pose.x, preview.goal_pose.y]);
   const startPose = memory?.start_pose?.pose || memory?.start_pose;
   if (startPose) points.push([startPose.x, startPose.y]);
+  const robotPose = memory?.robot_pose || (memory?.trajectory || []).slice(-1)[0];
+  if (robotPose) points.push([robotPose.x, robotPose.y]);
   if (!points.length) return mapBounds(memory);
   const minX = Math.min(...points.map((point) => Number(point[0] || 0)));
   const maxX = Math.max(...points.map((point) => Number(point[0] || 0)));
