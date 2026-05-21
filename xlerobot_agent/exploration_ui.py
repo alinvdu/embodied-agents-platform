@@ -49,6 +49,7 @@ class ExplorationUIController(Protocol):
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -101,6 +102,12 @@ class ExplorationUIController(Protocol):
     def relocalize_here(self) -> dict[str, Any]:
         ...
 
+    def execute_local_motion(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
     def __init__(
@@ -111,6 +118,8 @@ class LocalExplorationUIController:
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
         relocalizer: Callable[[], dict[str, Any]] | None = None,
+        local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -119,6 +128,8 @@ class LocalExplorationUIController:
         self.waypoint_previewer = waypoint_previewer
         self.scan_performer = scan_performer
         self.relocalizer = relocalizer
+        self.local_motion_executor = local_motion_executor
+        self.rgb_capturer = rgb_capturer
         self.navigation_session_starter = navigation_session_starter
         self.navigation_session_stopper = navigation_session_stopper
 
@@ -164,12 +175,14 @@ class LocalExplorationUIController:
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         return self.backend.update_region(
             region_id,
             label=label,
+            purpose=purpose,
             polygon_2d=polygon_2d,
             default_waypoints=default_waypoints,
         )
@@ -235,6 +248,16 @@ class LocalExplorationUIController:
             return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
         return self.relocalizer()
 
+    def execute_local_motion(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.local_motion_executor is None:
+            return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
+        return self.local_motion_executor(payload)
+
+    def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.rgb_capturer is None:
+            return {"status": "unavailable", "reason": "No live RGB camera stream is attached to the review UI."}
+        return self.rgb_capturer(payload)
+
 
 class RemoteExplorationUIController:
     def __init__(self, client: OffloadClient) -> None:
@@ -279,12 +302,14 @@ class RemoteExplorationUIController:
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
         return self.client.update_mapping_region(
             region_id,
             label=label,
+            purpose=purpose,
             polygon_2d=polygon_2d,
             default_waypoints=default_waypoints,
         )
@@ -335,6 +360,12 @@ class RemoteExplorationUIController:
 
     def relocalize_here(self) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote relocalization is not implemented yet."}
+
+    def execute_local_motion(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote local motion is not implemented yet."}
+
+    def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote RGB capture is not implemented yet."}
 
 
 HTML_PAGE = """<!doctype html>
@@ -1400,6 +1431,7 @@ class ExplorationReviewServer:
                     response = controller.update_region(
                         str(payload.get("region_id")),
                         label=payload.get("label"),
+                        purpose=payload.get("purpose"),
                         polygon_2d=payload.get("polygon_2d"),
                         default_waypoints=payload.get("default_waypoints"),
                     )
@@ -1469,6 +1501,42 @@ class ExplorationReviewServer:
                     return
                 if self.path == "/api/nav/relocalize":
                     self._send_json(controller.relocalize_here())
+                    return
+                if self.path == "/api/nav/local_motion":
+                    self._send_json(controller.execute_local_motion(payload=payload))
+                    return
+                if self.path == "/api/nav/capture_rgb":
+                    self._send_json(controller.capture_rgb_snapshot(payload=payload))
+                    return
+                if self.path == "/api/nav/local/rotate":
+                    self._send_json(
+                        controller.execute_local_motion(
+                            payload={
+                                **payload,
+                                "primitive": "rotate_by",
+                            }
+                        )
+                    )
+                    return
+                if self.path == "/api/nav/local/rotate_towards":
+                    self._send_json(
+                        controller.execute_local_motion(
+                            payload={
+                                **payload,
+                                "primitive": "rotate_towards_point",
+                            }
+                        )
+                    )
+                    return
+                if self.path == "/api/nav/local/micro_adjust":
+                    self._send_json(
+                        controller.execute_local_motion(
+                            payload={
+                                **payload,
+                                "primitive": "micro_adjust_to_pose",
+                            }
+                        )
+                    )
                     return
                 if self.path == "/api/approve":
                     self._send_json(controller.approve_map() or {"status": "missing"})

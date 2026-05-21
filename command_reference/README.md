@@ -378,7 +378,13 @@ And run the Robot42 agent backend:
 
 ```bash
 python examples/robot42_agent_backend.py \
-  --memory-root ./artifacts/memories
+  --memory-root ./artifacts/memories \
+  --provider openai \
+  --model gpt-5.5 \
+  --exploration-backend-url http://127.0.0.1:8770 \
+  --navigation-waypoint-horizon-m 2.0 \
+  --navigation-auto-rotate-threshold-deg 45 \
+  --agent-artifacts-root ./artifacts/agent_runs
 ```
 
 What gets saved after `Approve + Save Memory`:
@@ -390,12 +396,23 @@ artifacts/memories/<memory_id>/
   home_memory.json
 ```
 
+What gets saved after an agent visual-search run:
+
+```text
+artifacts/agent_runs/<run_id>/vision_report/
+  manifest.json
+  shots/
+    <region>_<stop>_<shot>.png
+    <region>_<stop>_<shot>.json
+```
+
 Notes:
 - `python -m xlerobot_playground.real_agentic_exploration` is the normal real robot mapping/configuration entrypoint.
 - You do not need this command for agent-only runs when a memory already exists.
 - To reopen an existing saved environment, start this backend, open `Configure Environment`, choose a memory, and click `Load`.
 - The editable snapshot path is internal/default during normal runs; only override it when debugging storage.
 - `--memory-root` is the folder of saved long-term environments.
+- Agent visual-search commands such as `scan the kitchen for a coke can` save RGB debug shots and show them in the React Agent UI under `What Robot Saw`.
 - `examples/xlerobot_exploration_review.py` is only a review-only helper for already-saved maps; it is not the normal robot exploration entrypoint.
 
 ## Exploration Review

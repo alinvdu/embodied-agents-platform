@@ -166,7 +166,7 @@ def _enrich_annotations_with_rgbd(
     metadata: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     if np is None:
-        return [dict(item) for item in annotations]
+        return _enrich_annotations_with_rgbd_python(annotations, metadata)
     depth_image = _resolve_depth_image(metadata)
     intrinsics = _resolve_intrinsics(metadata)
     if depth_image is None or intrinsics is None:
@@ -204,6 +204,154 @@ def _enrich_annotations_with_rgbd(
         annotation.setdefault("source", "rgbd_projection")
         enriched.append(annotation)
     return enriched
+
+
+def _enrich_annotations_with_rgbd_python(
+    annotations: Sequence[dict[str, Any]],
+    metadata: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    depth_image, intrinsics, pose_mat = _resolve_depth_payload_python(metadata)
+    if depth_image is None or intrinsics is None:
+        return [dict(item) for item in annotations]
+    height = len(depth_image)
+    width = len(depth_image[0]) if height else 0
+    if height <= 0 or width <= 0:
+        return [dict(item) for item in annotations]
+
+    enriched: list[dict[str, Any]] = []
+    for item in annotations:
+        annotation = dict(item)
+        if annotation.get("centroid_3d") and annotation.get("depth_m") is not None:
+            enriched.append(annotation)
+            continue
+        bbox = _mapping_value(annotation, "bbox_2d")
+        if not bbox:
+            enriched.append(annotation)
+            continue
+        centroid = _centroid_from_depth_bbox_python(bbox, depth_image, intrinsics, pose_mat)
+        if centroid is None:
+            enriched.append(annotation)
+            continue
+        annotation["centroid_3d"] = centroid["centroid"]
+        annotation["depth_m"] = centroid["depth_m"]
+        annotation.setdefault(
+            "waypoint_hint",
+            {
+                "frame": centroid["centroid"]["frame"],
+                "x": centroid["centroid"]["x"] - 0.8,
+                "y": centroid["centroid"]["y"],
+                "yaw": centroid["centroid"].get("yaw", 0.0),
+                "approach_distance_m": 0.8,
+            },
+        )
+        annotation.setdefault("source", "rgbd_projection")
+        enriched.append(annotation)
+    return enriched
+
+
+def _resolve_depth_payload_python(
+    metadata: Mapping[str, Any],
+) -> tuple[list[list[float]] | None, list[list[float]] | None, list[list[float]] | None]:
+    sensors = _mapping_value(metadata, "sensors")
+    for key in ("depth", "rgbd", "orbbec_depth"):
+        payload = _mapping_value(sensors, key)
+        data = payload.get("data")
+        intrinsics = payload.get("intrinsics")
+        if not isinstance(data, Sequence) or not isinstance(intrinsics, Sequence):
+            continue
+        depth = _float_matrix(data)
+        camera = _float_matrix(intrinsics)
+        if depth and camera and len(camera) >= 3 and all(len(row) >= 3 for row in camera[:3]):
+            pose = _float_matrix(payload.get("pose_mat"))
+            return depth, camera, pose
+    return None, None, None
+
+
+def _centroid_from_depth_bbox_python(
+    bbox: Mapping[str, Any],
+    depth_image: list[list[float]],
+    intrinsics: list[list[float]],
+    pose_mat: list[list[float]] | None,
+) -> dict[str, Any] | None:
+    height = len(depth_image)
+    width = len(depth_image[0]) if height else 0
+    x0 = int(bbox.get("x", bbox.get("x1", 0)))
+    y0 = int(bbox.get("y", bbox.get("y1", 0)))
+    if "w" in bbox and "h" in bbox:
+        x1 = x0 + int(bbox.get("w", 0))
+        y1 = y0 + int(bbox.get("h", 0))
+    else:
+        x1 = int(bbox.get("x2", x0))
+        y1 = int(bbox.get("y2", y0))
+    x0 = max(0, min(width - 1, x0))
+    y0 = max(0, min(height - 1, y0))
+    x1 = max(x0 + 1, min(width, x1))
+    y1 = max(y0 + 1, min(height, y1))
+
+    fx = float(intrinsics[0][0])
+    fy = float(intrinsics[1][1])
+    cx = float(intrinsics[0][2])
+    cy = float(intrinsics[1][2])
+    points: list[tuple[float, float, float]] = []
+    depths: list[float] = []
+    for py in range(y0, y1):
+        for px in range(x0, x1):
+            try:
+                z = float(depth_image[py][px])
+            except Exception:
+                continue
+            if z <= 0.0:
+                continue
+            x = ((float(px) - cx) * z) / max(fx, 1e-6)
+            y = ((float(py) - cy) * z) / max(fy, 1e-6)
+            points.append((x, y, z))
+            depths.append(z)
+    if not points:
+        return None
+    x = sum(point[0] for point in points) / len(points)
+    y = sum(point[1] for point in points) / len(points)
+    z = sum(point[2] for point in points) / len(points)
+    frame = "camera"
+    if pose_mat and len(pose_mat) >= 4 and all(len(row) >= 4 for row in pose_mat[:4]):
+        x, y, z = _transform_point_python((x, y, z), pose_mat)
+        frame = "map"
+    return {
+        "centroid": {"frame": frame, "x": x, "y": y, "z": z, "yaw": 0.0},
+        "depth_m": _median_python(depths),
+    }
+
+
+def _float_matrix(value: Any) -> list[list[float]] | None:
+    if not isinstance(value, Sequence):
+        return None
+    matrix: list[list[float]] = []
+    for row in value:
+        if not isinstance(row, Sequence):
+            return None
+        try:
+            matrix.append([float(item) for item in row])
+        except Exception:
+            return None
+    return matrix if matrix else None
+
+
+def _transform_point_python(point: tuple[float, float, float], pose_mat: list[list[float]]) -> tuple[float, float, float]:
+    x, y, z = point
+    return (
+        pose_mat[0][0] * x + pose_mat[0][1] * y + pose_mat[0][2] * z + pose_mat[0][3],
+        pose_mat[1][0] * x + pose_mat[1][1] * y + pose_mat[1][2] * z + pose_mat[1][3],
+        pose_mat[2][0] * x + pose_mat[2][1] * y + pose_mat[2][2] * z + pose_mat[2][3],
+    )
+
+
+def _median_python(values: Sequence[float]) -> float:
+    sorted_values = sorted(float(value) for value in values)
+    if not sorted_values:
+        return 0.0
+    middle = len(sorted_values) // 2
+    if len(sorted_values) % 2:
+        return sorted_values[middle]
+    return (sorted_values[middle - 1] + sorted_values[middle]) / 2.0
 
 
 def _resolve_depth_image(metadata: Mapping[str, Any]) -> Any | None:

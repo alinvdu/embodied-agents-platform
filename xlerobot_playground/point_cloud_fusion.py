@@ -4,7 +4,10 @@ from dataclasses import dataclass
 import math
 from typing import Any, Callable, Sequence
 
-import numpy as np
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - numpy is expected on ROS hosts.
+    np = None  # type: ignore[assignment]
 
 from xlerobot_playground.map_editing import OccupancyFusionConfig, merge_occupancy_observation
 
@@ -66,6 +69,9 @@ def integrate_transformed_point_cloud_observation(
     visited_cells: set[Any] | None = None,
     config: PointCloudFusionConfig = PointCloudFusionConfig(),
 ) -> PointCloudIntegrationSummary:
+    if np is None:
+        raw_count = len(points_xyz_map) if isinstance(points_xyz_map, Sequence) else 0
+        return PointCloudIntegrationSummary(raw_count, 0, 0, 0, 0, 0, 0, raw_count, 0)
     points = np.asarray(points_xyz_map, dtype=np.float32)
     if points.ndim != 2 or points.shape[1] < 3:
         points = np.empty((0, 3), dtype=np.float32)

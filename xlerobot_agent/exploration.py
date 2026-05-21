@@ -548,6 +548,7 @@ class ExplorationBackend:
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -557,6 +558,12 @@ class ExplorationBackend:
                 return None
             if label is not None:
                 region["label"] = str(label)
+            if purpose is not None:
+                purpose_value = str(purpose).strip()
+                if purpose_value:
+                    region["purpose"] = purpose_value
+                else:
+                    region.pop("purpose", None)
             if polygon_2d is not None:
                 region["polygon_2d"] = [[float(x), float(y)] for x, y in polygon_2d]
                 region["centroid"] = _polygon_centroid(region["polygon_2d"])

@@ -18,6 +18,7 @@ from xlerobot_agent.home_memory import (
     DEFAULT_NAVIGATION_CLEARANCE_M,
     DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
     home_memory_agent_context,
+    plan_region_exploration,
     resolve_home_memory_target,
     resolve_region_navigation_goal,
 )
@@ -63,6 +64,46 @@ def sample_memory() -> dict:
             }
         ],
     }
+
+
+def visual_sweep_memory() -> dict:
+    memory = sample_memory()
+    memory["regions"][0]["default_waypoints"] = []
+    memory["regions"][0]["polygon_2d"] = [[0.75, 1.0], [5.25, 1.0], [5.25, 4.0], [0.75, 4.0]]
+    memory["regions"][0]["exploration"] = {"max_stops": 3, "shots_per_stop": 2, "fov_deg": 65}
+    memory["occupancy"] = {
+        "resolution": 0.25,
+        "bounds": {"min_x": 0.0, "min_y": 0.0},
+        "cells": [
+            {
+                "x": x * 0.25,
+                "y": y * 0.25,
+                "state": "occupied" if y in {3, 17} and 2 <= x <= 22 else "free",
+            }
+            for x in range(25)
+            for y in range(21)
+        ],
+    }
+    return memory
+
+
+def direct_fallback_memory() -> dict:
+    memory = sample_memory()
+    memory["occupancy"] = {
+        "resolution": 0.25,
+        "bounds": {"min_x": 0.0, "min_y": 0.0},
+        "cells": [
+            {
+                "x": x * 0.25,
+                "y": y * 0.25,
+                "state": "occupied" if x in {0, 11} or y in {0, 11} else "free",
+            }
+            for x in range(12)
+            for y in range(12)
+        ],
+    }
+    memory["start_pose"] = {"name": "dock", "pose": {"x": 1.0, "y": 1.0, "yaw": 0.0}}
+    return memory
 
 
 class FakeHTTPResponse:
@@ -199,6 +240,54 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertFalse(waypoint["is_final_waypoint"])
         self.assertNotEqual((waypoint["x"], waypoint["y"]), (result["goal_pose"]["x"], result["goal_pose"]["y"]))
 
+    def test_region_exploration_plan_generates_stops_and_fov_shots(self) -> None:
+        result = plan_region_exploration(visual_sweep_memory(), "kitchen", min_clearance_m=0.2)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["strategy"], "occupancy_boundary_visual_sweep")
+        self.assertEqual(len(result["stops"]), 3)
+        self.assertGreater(result["coverage"]["covered_boundary_cell_count"], 0)
+        self.assertGreater(result["coverage"]["coverage_ratio"], 0.4)
+        stop_xs = [stop["pose"]["x"] for stop in result["stops"]]
+        self.assertGreater(max(stop_xs) - min(stop_xs), 2.0)
+        for stop in result["stops"]:
+            self.assertGreater(len(stop["shots"]), 0)
+            self.assertLessEqual(len(stop["shots"]), 2)
+            for shot in stop["shots"]:
+                self.assertEqual(shot["fov_deg"], 65.0)
+                self.assertIn("cone", shot)
+
+    def test_region_exploration_plan_uses_region_effort_annotation(self) -> None:
+        memory = visual_sweep_memory()
+        memory["regions"][0]["exploration"] = {"max_stops": 1, "shots_per_stop": 1, "fov_deg": 70}
+        result = plan_region_exploration(memory, "kitchen", min_clearance_m=0.2)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["fov_deg"], 70.0)
+        self.assertEqual(len(result["stops"]), 1)
+        self.assertEqual(len(result["stops"][0]["shots"]), 1)
+
+    def test_region_exploration_plan_prunes_duplicate_stops(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[0.0, 0.0], [1.2, 0.0], [1.2, 1.2], [0.0, 1.2]]
+        memory["regions"][0]["exploration"] = {"max_stops": 3, "shots_per_stop": 2}
+        free_cells = {(2, 2), (2, 3), (3, 2), (3, 3)}
+        memory["occupancy"] = {
+            "resolution": 0.1,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.1,
+                    "y": y * 0.1,
+                    "state": "free" if (x, y) in free_cells else "occupied",
+                }
+                for x in range(12)
+                for y in range(12)
+            ],
+        }
+        result = plan_region_exploration(memory, "kitchen", min_clearance_m=0.05)
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(len(result["stops"]), 1)
+
 
 class HomeTaskAgentTests(unittest.TestCase):
     def test_mock_agent_resolves_navigation_to_known_region(self) -> None:
@@ -250,6 +339,20 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(record.status, "completed")
         self.assertTrue(any(action.get("tool") == "resolve_region_navigation_goal" for action in record.actions))
         self.assertFalse(any(action.get("tool") == "preview_path_to_pose" for action in record.actions))
+
+    def test_mock_agent_plans_region_exploration_for_search_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_path = Path(tmpdir) / "house.home_memory.json"
+            memory_path.write_text(json.dumps(visual_sweep_memory()))
+            record = HomeTaskAgent(
+                HomeAgentConfig(
+                    home_memory_path=str(memory_path),
+                    model=HomeAgentModelConfig(provider="mock", model="mock"),
+                )
+            ).run("find a coke can in the kitchen")
+        self.assertEqual(record.status, "completed")
+        self.assertTrue(any(action.get("tool") == "plan_region_exploration" for action in record.actions))
+        self.assertFalse(any(action.get("tool") == "resolve_region_navigation_goal" for action in record.actions))
 
     def test_agent_auto_discovers_latest_home_memory(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -372,6 +475,8 @@ class HomeTaskAgentTests(unittest.TestCase):
                 "reason": "Nav2 reached the requested goal pose",
                 "reached_pose": {"x": 1.2, "y": 0.4, "yaw": 0.1},
                 "travelled_distance_m": 1.1,
+                "actual_pose_delta_m": 1.1,
+                "actual_yaw_delta_deg": 5.0,
                 "plan": {"status": "succeeded", "path_length_m": 1.1},
                 "feedback_samples": [{"remaining_distance_m": 0.0}],
             },
@@ -384,9 +489,280 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["current_pose"], {"x": 1.2, "y": 0.4, "yaw": 0.1})
         self.assertEqual(runtime.current_pose, {"x": 1.2, "y": 0.4, "yaw": 0.1})
         self.assertEqual(result["distance_remaining_m"], 0.0)
+        self.assertEqual(result["actual_pose_delta_m"], 1.1)
+        self.assertEqual(result["nav2"]["feedback_summary"]["sample_count"], 1)
         request = mocked.call_args.args[0]
         self.assertEqual(request.full_url, "http://explore.local/api/nav/waypoint")
         self.assertTrue(any(event["details"].get("tool") == "navigate_to_waypoint" for event in events))
+
+    def test_runtime_navigate_to_waypoint_uses_direct_fallback_after_nav2_failure(self) -> None:
+        events = []
+        runtime = HomeAgentToolRuntime(
+            memory=direct_fallback_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda kind, title, summary, details=None: events.append(
+                {"kind": kind, "title": title, "summary": summary, "details": details or {}}
+            ),
+        )
+        nav2_payload = {
+            "status": "failed",
+            "reason": "Nav2 failed to make progress",
+            "nav2_result": {
+                "status": "failed",
+                "reason": "Failed to make progress",
+                "actual_pose_delta_m": 0.0,
+                "plan": {"status": "succeeded", "path_length_m": 0.5},
+                "feedback_samples": [{"remaining_distance_m": 0.5, "current_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0}}],
+            },
+            "map": {"robot_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0}},
+        }
+        fallback_payload = {
+            "status": "succeeded",
+            "reason": "micro adjustment reached pose",
+            "local_motion": {
+                "primitive": "micro_adjust_to_pose",
+                "status": "succeeded",
+                "reason": "target_pose_reached",
+                "start_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                "end_pose": {"x": 1.5, "y": 1.0, "yaw": 0.0},
+                "actual_pose_delta_m": 0.5,
+                "distance_remaining_m": 0.0,
+            },
+            "map": {"robot_pose": {"x": 1.5, "y": 1.0, "yaw": 0.0}},
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/waypoint"):
+                return FakeHTTPResponse(nav2_payload)
+            if request.full_url.endswith("/api/nav/local_motion"):
+                return FakeHTTPResponse(fallback_payload)
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen) as mocked:
+            result = runtime.navigate_to_waypoint(waypoint_id="short_step", x=1.5, y=1.0, yaw=0.0)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["nav2_status_before_fallback"], "failed")
+        self.assertEqual(result["direct_fallback_plan"]["status"], "succeeded")
+        self.assertEqual(result["fallback_navigation"]["status"], "succeeded")
+        self.assertEqual(runtime.current_pose, {"x": 1.5, "y": 1.0, "yaw": 0.0})
+        self.assertEqual([call.args[0].full_url for call in mocked.call_args_list], [
+            "http://explore.local/api/nav/waypoint",
+            "http://explore.local/api/nav/local_motion",
+        ])
+        self.assertTrue(any(event["details"].get("tool") == "navigate_to_waypoint" for event in events))
+
+    def test_runtime_navigate_to_waypoint_auto_rotates_before_nav2_when_threshold_exceeded(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=direct_fallback_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                navigation_auto_rotate_threshold_deg=45.0,
+            ),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        rotate_payload = {
+            "status": "succeeded",
+            "reason": "rotated toward point",
+            "local_motion": {
+                "primitive": "rotate_towards_point",
+                "status": "succeeded",
+                "reason": "target_yaw_reached",
+                "start_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                "end_pose": {"x": 1.0, "y": 1.0, "yaw": 1.57},
+            },
+            "map": {"robot_pose": {"x": 1.0, "y": 1.0, "yaw": 1.57}},
+        }
+        nav2_payload = {
+            "status": "succeeded",
+            "reason": "Nav2 reached the requested goal pose",
+            "nav2_result": {
+                "status": "succeeded",
+                "reason": "Nav2 reached the requested goal pose",
+                "reached_pose": {"x": 1.0, "y": 1.5, "yaw": 1.57},
+                "plan": {"status": "succeeded", "path_length_m": 0.5},
+                "feedback_samples": [{"remaining_distance_m": 0.0}],
+            },
+            "map": {"robot_pose": {"x": 1.0, "y": 1.5, "yaw": 1.57}},
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/local_motion"):
+                return FakeHTTPResponse(rotate_payload)
+            if request.full_url.endswith("/api/nav/waypoint"):
+                return FakeHTTPResponse(nav2_payload)
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen) as mocked:
+            result = runtime.navigate_to_waypoint(waypoint_id="side_step", x=1.0, y=1.5, yaw=1.57)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["pre_nav_auto_rotation"]["status"], "succeeded")
+        self.assertEqual(result["pre_nav_auto_rotation"]["threshold_deg"], 45.0)
+        self.assertGreater(result["pre_nav_auto_rotation"]["bearing_error_deg"], 45.0)
+        self.assertEqual(runtime.current_pose, {"x": 1.0, "y": 1.5, "yaw": 1.57})
+        self.assertEqual([call.args[0].full_url for call in mocked.call_args_list], [
+            "http://explore.local/api/nav/local_motion",
+            "http://explore.local/api/nav/waypoint",
+        ])
+
+    def test_runtime_execute_region_exploration_plan_navigates_stops_and_aligns_shots(self) -> None:
+        events = []
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+            ),
+            emit=lambda kind, title, summary, details=None: events.append(
+                {"kind": kind, "title": title, "summary": summary, "details": details or {}}
+            ),
+            run_id="test_run",
+        )
+        current_pose = dict(runtime.current_pose)
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            calls.append((request.full_url, body))
+            if request.full_url.endswith("/api/nav/waypoint"):
+                pose = body["pose"]
+                current_pose.update({"x": pose["x"], "y": pose["y"], "yaw": 0.0})
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "Nav2 reached the requested goal pose",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "Nav2 reached the requested goal pose",
+                            "reached_pose": pose,
+                            "plan": {"status": "succeeded", "path_length_m": 0.5},
+                            "feedback_samples": [{"remaining_distance_m": 0.0}],
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                primitive = body.get("primitive")
+                if primitive == "rotate_by":
+                    current_pose["yaw"] = round(
+                        current_pose.get("yaw", 0.0) + float(body.get("delta_yaw_deg", 0.0)) * 3.141592653589793 / 180.0,
+                        3,
+                    )
+                elif primitive == "rotate_towards_point":
+                    current_pose["yaw"] = 0.0
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "local motion succeeded",
+                        "local_motion": {
+                            "primitive": primitive,
+                            "status": "succeeded",
+                            "reason": "target_reached",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                            "actual_pose_delta_m": 0.0,
+                            "actual_yaw_delta_deg": abs(float(body.get("delta_yaw_deg", 0.0) or 0.0)),
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": "data:image/png;base64,cG5n",
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.execute_region_exploration_plan(
+                region_label="kitchen",
+                object_label="coke can",
+                constraints={"max_stops": 1, "shots_per_stop": 1, "allow_auto_rotate": False},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["visited_stop_count"], 1)
+        self.assertEqual(result["captured_shot_count"], 1)
+        self.assertEqual(result["saved_rgb_count"], 1)
+        self.assertEqual(result["detection_status"], "not_configured")
+        self.assertEqual(result["stops"][0]["navigation"]["status"], "succeeded")
+        self.assertEqual(result["stops"][0]["shots"][0]["capture"]["status"], "succeeded")
+        self.assertEqual(result["stops"][0]["shots"][0]["detection"]["object_label"], "coke can")
+        self.assertTrue(any(url.endswith("/api/nav/waypoint") for url, _body in calls))
+        self.assertTrue(any(url.endswith("/api/nav/capture_rgb") for url, _body in calls))
+        image_path = Path(result["stops"][0]["shots"][0]["capture"]["image_path"])
+        manifest_path = Path(result["stops"][0]["shots"][0]["capture"]["manifest_path"])
+        self.assertTrue(image_path.exists())
+        self.assertTrue(manifest_path.exists())
+        self.assertTrue(any(event["details"].get("tool") == "plan_region_exploration" for event in events))
+        self.assertTrue(any(event["details"].get("tool") == "execute_region_exploration_plan" for event in events))
+
+    def test_runtime_execute_region_exploration_plan_skips_capture_when_alignment_fails(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        current_pose = dict(runtime.current_pose)
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            calls.append((request.full_url, body))
+            if request.full_url.endswith("/api/nav/waypoint"):
+                pose = body["pose"]
+                current_pose.update({"x": pose["x"], "y": pose["y"], "yaw": 0.0})
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "Nav2 reached the requested goal pose",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "Nav2 reached the requested goal pose",
+                            "reached_pose": dict(current_pose),
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "failed",
+                        "reason": "rotation did not complete",
+                        "local_motion": {
+                            "primitive": body.get("primitive"),
+                            "status": "failed",
+                            "reason": "rotation did not complete",
+                            "start_pose": dict(current_pose),
+                            "end_pose": dict(current_pose),
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                raise AssertionError("capture should not run after failed shot alignment")
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.execute_region_exploration_plan(
+                region_label="kitchen",
+                object_label="coke can",
+                constraints={"max_stops": 1, "shots_per_stop": 1, "allow_auto_rotate": False},
+            )
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["captured_shot_count"], 0)
+        self.assertEqual(result["saved_rgb_count"], 0)
+        self.assertEqual(result["stops"][0]["shots"][0]["capture"]["status"], "skipped")
+        self.assertFalse(any(url.endswith("/api/nav/capture_rgb") for url, _body in calls))
 
     def test_runtime_navigate_does_not_treat_normalized_goal_as_current_pose(self) -> None:
         runtime = HomeAgentToolRuntime(
@@ -413,6 +789,41 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["current_pose"], {"x": 0.8, "y": 0.1, "yaw": 0.0})
         self.assertEqual(result["normalized_pose"], {"x": 3.0, "y": 0.0, "yaw": 0.0})
         self.assertEqual(runtime.current_pose, {"x": 0.8, "y": 0.1, "yaw": 0.0})
+
+    def test_runtime_local_motion_calls_exploration_backend(self) -> None:
+        events = []
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda kind, title, summary, details=None: events.append(
+                {"kind": kind, "title": title, "summary": summary, "details": details or {}}
+            ),
+        )
+        payload = {
+            "status": "succeeded",
+            "reason": "rotate toward target point",
+            "local_motion": {
+                "primitive": "rotate_towards_point",
+                "status": "succeeded",
+                "reason": "target_yaw_reached",
+                "start_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+                "end_pose": {"x": 0.0, "y": 0.0, "yaw": 1.57},
+                "actual_pose_delta_m": 0.0,
+                "actual_yaw_delta_deg": 90.0,
+            },
+            "map": {"robot_pose": {"x": 0.0, "y": 0.0, "yaw": 1.57}},
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(payload)) as mocked:
+            result = runtime.rotate_towards_point(x=2.0, y=0.0, reason="face waypoint before Nav2")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["tool"], "rotate_towards_point")
+        self.assertEqual(runtime.current_pose, {"x": 0.0, "y": 0.0, "yaw": 1.57})
+        request = mocked.call_args.args[0]
+        self.assertEqual(request.full_url, "http://explore.local/api/nav/local_motion")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(body["primitive"], "rotate_towards_point")
+        self.assertTrue(any(event["details"].get("tool") == "rotate_towards_point" for event in events))
 
     def test_runtime_relocalize_here_reuses_exploration_backend(self) -> None:
         runtime = HomeAgentToolRuntime(
@@ -544,6 +955,11 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("Example navigation loop", instructions)
         self.assertIn("navigate_to_waypoint", instructions)
         self.assertIn("relocalize_here", instructions)
+        self.assertIn("rotate_towards_point", instructions)
+        self.assertIn("micro_adjust_to_pose", instructions)
+        self.assertIn("execute_region_exploration_plan", instructions)
+        self.assertIn("saves RGB debug shots", instructions)
+        self.assertIn("Nav2 can sometimes fail to find paths", instructions)
         self.assertIn("constraints_json='{}'", instructions)
         self.assertIn("After each successful waypoint", instructions)
 

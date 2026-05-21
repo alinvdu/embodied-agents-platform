@@ -394,6 +394,7 @@ class _OffloadRouter:
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any] | None:
@@ -401,6 +402,7 @@ class _OffloadRouter:
         return self._exploration_backend(record).update_region(
             region_id,
             label=label,
+            purpose=purpose,
             polygon_2d=polygon_2d,
             default_waypoints=default_waypoints,
         )
@@ -927,12 +929,14 @@ class OffloadClient:
         region_id: str,
         *,
         label: str | None = None,
+        purpose: str | None = None,
         polygon_2d: list[list[float]] | None = None,
         default_waypoints: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         registration = self.ensure_registered()
         payload = {
             "label": label,
+            "purpose": purpose,
             "polygon_2d": polygon_2d,
             "default_waypoints": default_waypoints,
         }
@@ -1086,6 +1090,7 @@ class OffloadServer:
                             brain_id,
                             parts[6],
                             label=payload.get("label"),
+                            purpose=payload.get("purpose"),
                             polygon_2d=payload.get("polygon_2d"),
                             default_waypoints=payload.get("default_waypoints"),
                         )

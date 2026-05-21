@@ -77,8 +77,8 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(snapshot["active_task"]["state"], "succeeded")
             self.assertEqual(snapshot["current_map"]["map_id"], "house_v1")
             named_places = {item["name"] for item in snapshot["current_map"]["named_places"]}
-            self.assertIn("kitchen_entry", named_places)
-            self.assertIn("kitchen_center", named_places)
+            self.assertNotIn("kitchen_entry", named_places)
+            self.assertNotIn("kitchen_center", named_places)
 
     def test_manual_occupancy_edits_respect_shifted_map_origin(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -296,7 +296,8 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(memory["schema_version"], "home_memory.v1")
             self.assertEqual(memory["memory_id"], "house_v1")
             self.assertTrue(memory["approved"])
-            self.assertEqual(memory["start_pose"]["name"], "dock")
+            self.assertEqual(memory["start_pose"]["name"], "start")
+            self.assertEqual(memory["start_pose"]["source"], "default_map_origin")
             self.assertEqual(memory["regions"][0]["label"], "kitchen")
             self.assertEqual(memory["manual_occupancy_edits"]["blocked_cells"][0]["cell_x"], 2)
             self.assertIn("fridge", {item["label"] for item in memory["objects"]})
@@ -377,7 +378,7 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(memory["start_pose"]["pose"], {"x": 0.5, "y": 0.75, "yaw": 1.57})
             self.assertEqual(memory["start_pose"]["source"], "operator_dock_pose")
 
-    def test_home_memory_does_not_infer_start_pose_without_dock(self) -> None:
+    def test_home_memory_defaults_start_pose_to_map_origin_without_dock(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             persist_path = Path(tmpdir) / "map.json"
             backend = ExplorationBackend(
@@ -418,7 +419,9 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             assert approved is not None
             memory_path = persist_path.parent / "memories" / "house_v1" / "home_memory.json"
             memory = json.loads(memory_path.read_text())
-            self.assertIsNone(memory["start_pose"])
+            self.assertEqual(memory["start_pose"]["name"], "start")
+            self.assertEqual(memory["start_pose"]["pose"], {"x": 0.0, "y": 0.0, "yaw": 0.0})
+            self.assertEqual(memory["start_pose"]["source"], "default_map_origin")
 
     def test_create_region_adds_manual_polygon_and_derived_waypoint(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -469,10 +472,10 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertTrue(region["region_id"].startswith("region_kitchen_zone_"))
             self.assertEqual(region["label"], "Kitchen Zone")
             self.assertEqual(region["centroid"], {"x": 1.0, "y": 0.5})
-            self.assertEqual(region["default_waypoints"][0]["name"], "kitchen_zone_center")
+            self.assertEqual(region["default_waypoints"], [])
             snapshot = backend.snapshot()
             self.assertEqual(snapshot["current_map"]["regions"][0]["purpose"], "food prep")
-            self.assertIn("Kitchen_Zone_entry", {place["name"] for place in snapshot["current_map"]["named_places"]})
+            self.assertEqual(snapshot["current_map"]["named_places"], [])
 
 
 if __name__ == "__main__":

@@ -21,6 +21,13 @@ DEFAULT_ROBOT_FOOTPRINT_RADIUS_M = math.hypot(
 )
 DEFAULT_NAVIGATION_CLEARANCE_M = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M + DEFAULT_NAVIGATION_SAFETY_GAP_M
 DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M = 2.0
+DEFAULT_REGION_EXPLORATION_FOV_DEG = 65.0
+DEFAULT_REGION_EXPLORATION_SHOTS_PER_STOP = 2
+DEFAULT_REGION_EXPLORATION_BOUNDARY_MARGIN_M = 0.65
+DEFAULT_REGION_EXPLORATION_MAX_RANGE_M = 3.0
+DEFAULT_REGION_EXPLORATION_MIN_RANGE_M = 0.20
+DEFAULT_REGION_EXPLORATION_MIN_STOP_SEPARATION_M = 0.45
+DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M = 1.0
 
 
 @dataclass(frozen=True)
@@ -142,6 +149,7 @@ def home_memory_agent_context(memory: dict[str, Any]) -> dict[str, Any]:
                     for waypoint in region.get("default_waypoints", [])
                     if isinstance(waypoint, dict) and not _is_auto_center_waypoint(region, waypoint)
                 ],
+                "exploration": _json_clone(region.get("exploration") or {}),
                 "adjacent_region_ids": list(region.get("adjacent_region_ids") or []),
             }
             for region in memory.get("regions", [])
@@ -199,6 +207,7 @@ def home_memory_preview_map(memory: dict[str, Any]) -> dict[str, Any]:
                 "region_id": region.get("region_id"),
                 "label": region.get("label"),
                 "polygon_2d": _json_clone(region.get("polygon_2d") or []),
+                "exploration": _json_clone(region.get("exploration") or {}),
             }
             for region in memory.get("regions", [])
             if isinstance(region, dict)
@@ -453,6 +462,273 @@ def resolve_region_navigation_goal(
     }
 
 
+def plan_region_exploration(
+    memory: dict[str, Any],
+    region_label: str,
+    *,
+    fov_deg: float | None = None,
+    max_stops: int | None = None,
+    shots_per_stop: int | None = None,
+    min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
+    boundary_margin_m: float = DEFAULT_REGION_EXPLORATION_BOUNDARY_MARGIN_M,
+    min_range_m: float = DEFAULT_REGION_EXPLORATION_MIN_RANGE_M,
+    max_range_m: float = DEFAULT_REGION_EXPLORATION_MAX_RANGE_M,
+    min_stop_separation_m: float | None = None,
+) -> dict[str, Any]:
+    """Generate simple visual-search stops and 65-degree shots for a known region."""
+    region = _best_region_match(memory, region_label)
+    if region is None:
+        return {
+            "tool": "plan_region_exploration",
+            "status": "not_found",
+            "target_label": region_label,
+            "reason": "No matching region label was found in home memory.",
+        }
+    polygon = region.get("polygon_2d")
+    if not isinstance(polygon, list) or len(polygon) < 3:
+        return {
+            "tool": "plan_region_exploration",
+            "status": "blocked",
+            "target_label": region.get("label") or region_label,
+            "region_id": region.get("region_id"),
+            "reason": "The matched region has no polygon for visual sweep planning.",
+        }
+
+    grid = _memory_occupancy_grid(memory)
+    if not grid["free"]:
+        return {
+            "tool": "plan_region_exploration",
+            "status": "blocked",
+            "target_label": region.get("label") or region_label,
+            "region_id": region.get("region_id"),
+            "reason": "Home memory has no known-free occupancy cells.",
+        }
+
+    config = region.get("exploration") if isinstance(region.get("exploration"), dict) else {}
+    fov_deg = _bounded_float(
+        fov_deg if fov_deg is not None else config.get("fov_deg"),
+        DEFAULT_REGION_EXPLORATION_FOV_DEG,
+        minimum=20.0,
+        maximum=160.0,
+    )
+    shots_per_stop = _bounded_int(
+        shots_per_stop if shots_per_stop is not None else config.get("shots_per_stop"),
+        DEFAULT_REGION_EXPLORATION_SHOTS_PER_STOP,
+        minimum=1,
+        maximum=8,
+    )
+    max_stops = _bounded_int(
+        max_stops if max_stops is not None else config.get("max_stops"),
+        _default_region_exploration_stop_count(polygon),
+        minimum=1,
+        maximum=8,
+    )
+    min_stop_separation_m = _bounded_float(
+        min_stop_separation_m if min_stop_separation_m is not None else config.get("min_stop_separation_m"),
+        DEFAULT_REGION_EXPLORATION_MIN_STOP_SEPARATION_M,
+        minimum=0.0,
+        maximum=2.0,
+    )
+
+    resolution = float(grid["resolution"])
+    region_free_cells = [
+        cell
+        for cell in grid["free"]
+        if _point_in_polygon(
+            grid["origin_x"] + (cell[0] + 0.5) * resolution,
+            grid["origin_y"] + (cell[1] + 0.5) * resolution,
+            polygon,
+        )
+    ]
+    if not region_free_cells:
+        return {
+            "tool": "plan_region_exploration",
+            "status": "blocked",
+            "target_label": region.get("label") or region_label,
+            "region_id": region.get("region_id"),
+            "reason": "No known-free occupancy cells were found inside the region.",
+        }
+
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    stop_candidates = [cell for cell in region_free_cells if cell in footprint_safe_cells]
+    if not stop_candidates:
+        stop_candidates = list(region_free_cells)
+    boundary_cells = _region_exploration_boundary_cells(
+        grid,
+        polygon,
+        margin_m=float(boundary_margin_m),
+    )
+    axes = _polygon_axes(polygon)
+    stop_cells = _select_region_exploration_stops(
+        grid,
+        stop_candidates,
+        axes,
+        max_stops=max_stops,
+        min_stop_separation_m=min_stop_separation_m,
+    )
+
+    region_area_cells = set(region_free_cells)
+    covered_boundary_cells: set[tuple[int, int]] = set()
+    covered_area_cells: set[tuple[int, int]] = set()
+    stops: list[dict[str, Any]] = []
+    for index, cell in enumerate(stop_cells, start=1):
+        pose = _cell_center_pose(cell, grid)
+        shot_plans, stop_boundary_covered, stop_area_covered = _region_exploration_shots_for_stop(
+            grid,
+            cell,
+            boundary_cells,
+            region_area_cells,
+            already_covered_boundary_cells=covered_boundary_cells,
+            already_covered_area_cells=covered_area_cells,
+            fov_deg=fov_deg,
+            shots_per_stop=shots_per_stop,
+            min_range_m=float(min_range_m),
+            max_range_m=float(max_range_m),
+        )
+        if shot_plans:
+            pose["yaw"] = shot_plans[0]["yaw"]
+        covered_boundary_cells.update(stop_boundary_covered)
+        covered_area_cells.update(stop_area_covered)
+        stops.append(
+            {
+                "stop_id": f"{_slug(str(region.get('label') or region_label))}_stop_{index}",
+                "name": f"stop_{index}",
+                "pose": pose,
+                "clearance_m": round(_cell_clearance_m(cell, grid), 3),
+                "shots": shot_plans,
+            }
+        )
+
+    boundary_count = len(boundary_cells)
+    covered_boundary_count = len(covered_boundary_cells)
+    boundary_coverage_ratio = covered_boundary_count / boundary_count if boundary_count else 0.0
+    area_count = len(region_area_cells)
+    covered_area_count = len(covered_area_cells)
+    area_coverage_ratio = covered_area_count / area_count if area_count else 0.0
+    return {
+        "tool": "plan_region_exploration",
+        "status": "succeeded",
+        "target_label": region.get("label") or region_label,
+        "target_type": "region",
+        "region_id": region.get("region_id"),
+        "strategy": "occupancy_boundary_visual_sweep",
+        "fov_deg": round(float(fov_deg), 3),
+        "max_stops": int(max_stops),
+        "shots_per_stop": int(shots_per_stop),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "min_stop_separation_m": round(float(min_stop_separation_m), 3),
+        "boundary_margin_m": round(float(boundary_margin_m), 3),
+        "range_m": {
+            "min": round(float(min_range_m), 3),
+            "max": round(float(max_range_m), 3),
+        },
+        "coverage": {
+            "boundary_cell_count": boundary_count,
+            "covered_boundary_cell_count": covered_boundary_count,
+            "coverage_ratio": round(boundary_coverage_ratio, 3),
+            "region_area_cell_count": area_count,
+            "covered_region_area_cell_count": covered_area_count,
+            "region_area_coverage_ratio": round(area_coverage_ratio, 3),
+        },
+        "stops": stops,
+    }
+
+
+def resolve_direct_navigation_fallback(
+    memory: dict[str, Any],
+    start_pose: dict[str, Any] | None,
+    goal_pose: dict[str, Any],
+    *,
+    min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
+    max_distance_m: float = DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M,
+) -> dict[str, Any]:
+    """Check whether a short direct local motion is safe in the saved occupancy map."""
+    start = _json_pose(start_pose or {})
+    goal = _json_pose(goal_pose)
+    distance_m = _pose_distance_m(start, goal)
+    max_distance_m = max(float(max_distance_m), 0.0)
+    if distance_m <= 1e-6:
+        return {
+            "tool": "resolve_direct_navigation_fallback",
+            "status": "succeeded",
+            "reason": "Already at the requested waypoint.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "distance_m": 0.0,
+            "max_distance_m": round(max_distance_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+            "path": [start],
+        }
+    if distance_m > max_distance_m:
+        return {
+            "tool": "resolve_direct_navigation_fallback",
+            "status": "too_far",
+            "reason": "Direct primitive fallback is only allowed for short local moves.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "distance_m": round(distance_m, 3),
+            "max_distance_m": round(max_distance_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
+    grid = _memory_occupancy_grid(memory)
+    if not grid["free"]:
+        return {
+            "tool": "resolve_direct_navigation_fallback",
+            "status": "blocked",
+            "reason": "Home memory has no known-free occupancy cells.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "distance_m": round(distance_m, 3),
+            "max_distance_m": round(max_distance_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
+    start_cell = _cell_for_pose(start, grid)
+    goal_cell = _cell_for_pose(goal, grid)
+    if start_cell is None or goal_cell is None:
+        return {
+            "tool": "resolve_direct_navigation_fallback",
+            "status": "blocked",
+            "reason": "Could not project start or goal pose into the occupancy grid.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "distance_m": round(distance_m, 3),
+            "max_distance_m": round(max_distance_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+        }
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    line_cells = _bresenham_cells(start_cell, goal_cell)
+    unsafe_cells = [cell for cell in line_cells if cell not in footprint_safe_cells]
+    if unsafe_cells:
+        return {
+            "tool": "resolve_direct_navigation_fallback",
+            "status": "blocked",
+            "reason": "Direct line is not footprint-clear in the saved occupancy map.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "distance_m": round(distance_m, 3),
+            "max_distance_m": round(max_distance_m, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+            "checked_cell_count": len(line_cells),
+            "unsafe_cell_count": len(unsafe_cells),
+            "first_unsafe_cell": {"cell_x": unsafe_cells[0][0], "cell_y": unsafe_cells[0][1]},
+            "path": _path_payload(line_cells, grid),
+        }
+    clearances = [_cell_clearance_m(cell, grid) for cell in line_cells]
+    return {
+        "tool": "resolve_direct_navigation_fallback",
+        "status": "succeeded",
+        "reason": "Short direct line is footprint-clear in the saved occupancy map.",
+        "start_pose": start,
+        "goal_pose": goal,
+        "distance_m": round(distance_m, 3),
+        "max_distance_m": round(max_distance_m, 3),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "checked_cell_count": len(line_cells),
+        "path_clearance_m": round(min(clearances), 3) if clearances else None,
+        "path": _path_payload(line_cells, grid),
+    }
+
+
 def known_home_memory_labels(memory: dict[str, Any]) -> list[str]:
     context = home_memory_agent_context(memory)
     labels: list[str] = []
@@ -508,6 +784,7 @@ def _memory_region(region: dict[str, Any]) -> dict[str, Any]:
         "entry_waypoints": _json_clone(region.get("entry_waypoints") or []),
         "scan_waypoints": _json_clone(region.get("scan_waypoints") or []),
         "default_waypoints": default_waypoints,
+        "exploration": _json_clone(region.get("exploration") or {}),
         "adjacent_region_ids": list(region.get("adjacency") or region.get("adjacent_region_ids") or []),
         "evidence": _json_clone(region.get("evidence") or []),
     }
@@ -942,6 +1219,460 @@ def _point_in_polygon(point_x: float, point_y: float, polygon: list[Any]) -> boo
             inside = not inside
         previous = current
     return inside
+
+
+def _bounded_float(value: Any, fallback: float, *, minimum: float, maximum: float) -> float:
+    try:
+        result = float(value)
+    except Exception:
+        result = float(fallback)
+    return min(max(result, minimum), maximum)
+
+
+def _bounded_int(value: Any, fallback: int, *, minimum: int, maximum: int) -> int:
+    try:
+        result = int(value)
+    except Exception:
+        result = int(fallback)
+    return min(max(result, minimum), maximum)
+
+
+def _default_region_exploration_stop_count(polygon: list[Any]) -> int:
+    axes = _polygon_axes(polygon)
+    major_length = float(axes["major_length"])
+    area = abs(_polygon_area(polygon))
+    if area <= 0.90:
+        return 1
+    if major_length >= 2.25:
+        return 3
+    if major_length >= 1.20:
+        return 2
+    return 1
+
+
+def _polygon_area(polygon: list[Any]) -> float:
+    area = 0.0
+    points = _valid_polygon_points(polygon)
+    if len(points) < 3:
+        return 0.0
+    for previous, current in zip(points, points[1:] + points[:1]):
+        area += previous[0] * current[1] - current[0] * previous[1]
+    return area / 2.0
+
+
+def _polygon_axes(polygon: list[Any]) -> dict[str, Any]:
+    points = _valid_polygon_points(polygon)
+    if not points:
+        return {
+            "center": (0.0, 0.0),
+            "major": (1.0, 0.0),
+            "minor": (0.0, 1.0),
+            "major_length": 0.0,
+            "minor_length": 0.0,
+        }
+    center_x = sum(point[0] for point in points) / len(points)
+    center_y = sum(point[1] for point in points) / len(points)
+    sxx = sum((point[0] - center_x) ** 2 for point in points) / len(points)
+    syy = sum((point[1] - center_y) ** 2 for point in points) / len(points)
+    sxy = sum((point[0] - center_x) * (point[1] - center_y) for point in points) / len(points)
+    angle = 0.5 * math.atan2(2.0 * sxy, sxx - syy) if abs(sxy) > 1e-9 or abs(sxx - syy) > 1e-9 else 0.0
+    major = (math.cos(angle), math.sin(angle))
+    minor = (-major[1], major[0])
+    major_projections = [_dot(point[0] - center_x, point[1] - center_y, major) for point in points]
+    minor_projections = [_dot(point[0] - center_x, point[1] - center_y, minor) for point in points]
+    return {
+        "center": (center_x, center_y),
+        "major": major,
+        "minor": minor,
+        "major_length": max(major_projections) - min(major_projections) if major_projections else 0.0,
+        "minor_length": max(minor_projections) - min(minor_projections) if minor_projections else 0.0,
+    }
+
+
+def _valid_polygon_points(polygon: list[Any]) -> list[tuple[float, float]]:
+    points: list[tuple[float, float]] = []
+    for point in polygon:
+        try:
+            points.append((float(point[0]), float(point[1])))
+        except Exception:
+            continue
+    return points
+
+
+def _dot(x: float, y: float, axis: tuple[float, float]) -> float:
+    return x * axis[0] + y * axis[1]
+
+
+def _region_exploration_boundary_cells(
+    grid: dict[str, Any],
+    polygon: list[Any],
+    *,
+    margin_m: float,
+) -> set[tuple[int, int]]:
+    resolution = float(grid["resolution"])
+    margin_m = max(float(margin_m), resolution)
+    free = grid["free"]
+    boundary: set[tuple[int, int]] = set()
+    for cell in grid["occupied"]:
+        x, y = _cell_center_xy(cell, grid)
+        if not (_point_in_polygon(x, y, polygon) or _point_to_polygon_distance_m(x, y, polygon) <= margin_m):
+            continue
+        if any(neighbor in free for neighbor in _neighbors8_unchecked(cell)):
+            boundary.add(cell)
+    return boundary
+
+
+def _select_region_exploration_stops(
+    grid: dict[str, Any],
+    candidates: list[tuple[int, int]],
+    axes: dict[str, Any],
+    *,
+    max_stops: int,
+    min_stop_separation_m: float,
+) -> list[tuple[int, int]]:
+    if not candidates:
+        return []
+    if max_stops <= 1:
+        return [max(candidates, key=lambda cell: _cell_clearance_m(cell, grid))]
+
+    center_x, center_y = axes["center"]
+    major = axes["major"]
+    minor = axes["minor"]
+    projections = [
+        (
+            _dot(_cell_center_xy(cell, grid)[0] - center_x, _cell_center_xy(cell, grid)[1] - center_y, major),
+            _dot(_cell_center_xy(cell, grid)[0] - center_x, _cell_center_xy(cell, grid)[1] - center_y, minor),
+            cell,
+        )
+        for cell in candidates
+    ]
+    min_projection = min(item[0] for item in projections)
+    max_projection = max(item[0] for item in projections)
+    span = max(max_projection - min_projection, float(grid["resolution"]))
+    selected: list[tuple[int, int]] = []
+    for index in range(max_stops):
+        target_projection = min_projection + (index + 0.5) * span / max_stops
+        bin_radius = span / max_stops * 0.60
+        eligible = [
+            item
+            for item in projections
+            if item[2] not in selected
+            and all(_cell_distance_m(item[2], selected_cell, grid) >= min_stop_separation_m for selected_cell in selected)
+        ]
+        in_bin = [item for item in eligible if abs(item[0] - target_projection) <= bin_radius]
+        if not in_bin:
+            in_bin = eligible
+        if not in_bin:
+            break
+        _, _, best = max(
+            in_bin,
+            key=lambda item: (
+                _cell_clearance_m(item[2], grid)
+                - abs(item[0] - target_projection) * 0.35
+                - abs(item[1]) * 0.20
+            ),
+        )
+        selected.append(best)
+    return selected
+
+
+def _region_exploration_shots_for_stop(
+    grid: dict[str, Any],
+    stop_cell: tuple[int, int],
+    boundary_cells: set[tuple[int, int]],
+    area_cells: set[tuple[int, int]],
+    *,
+    already_covered_boundary_cells: set[tuple[int, int]],
+    already_covered_area_cells: set[tuple[int, int]],
+    fov_deg: float,
+    shots_per_stop: int,
+    min_range_m: float,
+    max_range_m: float,
+) -> tuple[list[dict[str, Any]], set[tuple[int, int]], set[tuple[int, int]]]:
+    if not boundary_cells and not area_cells:
+        pose = _cell_center_pose(stop_cell, grid)
+        yaw = round(float(pose["yaw"]), 3)
+        return (
+            [
+                _region_exploration_shot_payload(
+                    stop_cell,
+                    grid,
+                    yaw=yaw,
+                    fov_deg=fov_deg,
+                    max_range_m=max_range_m,
+                    covered_boundary_count=0,
+                    covered_area_count=0,
+                )
+            ],
+            set(),
+            set(),
+        )
+
+    angle_step = math.radians(15.0)
+    candidate_yaws = [index * angle_step for index in range(int(round((2.0 * math.pi) / angle_step)))]
+    coverage_by_yaw = [
+        (
+            yaw,
+            _visible_boundary_cells_for_shot(
+                grid,
+                stop_cell,
+                boundary_cells,
+                yaw=yaw,
+                fov_deg=fov_deg,
+                min_range_m=min_range_m,
+                max_range_m=max_range_m,
+            ),
+            _visible_region_area_cells_for_shot(
+                grid,
+                stop_cell,
+                area_cells,
+                yaw=yaw,
+                fov_deg=fov_deg,
+                min_range_m=min_range_m,
+                max_range_m=max_range_m,
+            ),
+        )
+        for yaw in candidate_yaws
+    ]
+    selected: list[tuple[float, set[tuple[int, int]], set[tuple[int, int]]]] = []
+    covered_boundary: set[tuple[int, int]] = set()
+    covered_area: set[tuple[int, int]] = set()
+    for _ in range(shots_per_stop):
+        remaining = [
+            (
+                yaw,
+                boundary,
+                area,
+                len(boundary - covered_boundary - already_covered_boundary_cells),
+                len(boundary - covered_boundary),
+                len(area - covered_area - already_covered_area_cells),
+                len(area - covered_area),
+            )
+            for yaw, boundary, area in coverage_by_yaw
+            if all(_angle_delta_abs(yaw, existing[0]) >= math.radians(25.0) for existing in selected)
+        ]
+        if not remaining:
+            break
+        yaw, boundary, area, new_boundary_gain, local_boundary_gain, new_area_gain, local_area_gain = max(
+            remaining,
+            key=lambda item: (
+                item[3] * 4.0 + item[5] * 0.35 + item[4] * 0.5 + item[6] * 0.05,
+                item[3],
+                item[5],
+                item[4],
+            ),
+        )
+        if new_boundary_gain <= 0 and local_boundary_gain <= 0 and new_area_gain <= 0 and local_area_gain <= 0 and selected:
+            break
+        selected.append((yaw, boundary, area))
+        covered_boundary.update(boundary)
+        covered_area.update(area)
+
+    shots = [
+        _region_exploration_shot_payload(
+            stop_cell,
+            grid,
+            yaw=yaw,
+            fov_deg=fov_deg,
+            max_range_m=max_range_m,
+            covered_boundary_count=len(boundary),
+            covered_area_count=len(area),
+        )
+        for yaw, boundary, area in selected
+    ]
+    return shots, covered_boundary, covered_area
+
+
+def _visible_boundary_cells_for_shot(
+    grid: dict[str, Any],
+    stop_cell: tuple[int, int],
+    boundary_cells: set[tuple[int, int]],
+    *,
+    yaw: float,
+    fov_deg: float,
+    min_range_m: float,
+    max_range_m: float,
+) -> set[tuple[int, int]]:
+    origin_x, origin_y = _cell_center_xy(stop_cell, grid)
+    half_fov = math.radians(float(fov_deg)) / 2.0
+    visible: set[tuple[int, int]] = set()
+    for cell in boundary_cells:
+        target_x, target_y = _cell_center_xy(cell, grid)
+        distance_m = math.hypot(target_x - origin_x, target_y - origin_y)
+        if distance_m < min_range_m or distance_m > max_range_m:
+            continue
+        angle = math.atan2(target_y - origin_y, target_x - origin_x)
+        if _angle_delta_abs(angle, yaw) > half_fov:
+            continue
+        if _line_of_sight_clear(grid, stop_cell, cell):
+            visible.add(cell)
+    return visible
+
+
+def _visible_region_area_cells_for_shot(
+    grid: dict[str, Any],
+    stop_cell: tuple[int, int],
+    area_cells: set[tuple[int, int]],
+    *,
+    yaw: float,
+    fov_deg: float,
+    min_range_m: float,
+    max_range_m: float,
+) -> set[tuple[int, int]]:
+    origin_x, origin_y = _cell_center_xy(stop_cell, grid)
+    half_fov = math.radians(float(fov_deg)) / 2.0
+    visible: set[tuple[int, int]] = set()
+    for cell in area_cells:
+        if cell == stop_cell:
+            continue
+        target_x, target_y = _cell_center_xy(cell, grid)
+        distance_m = math.hypot(target_x - origin_x, target_y - origin_y)
+        if distance_m < min_range_m or distance_m > max_range_m:
+            continue
+        angle = math.atan2(target_y - origin_y, target_x - origin_x)
+        if _angle_delta_abs(angle, yaw) > half_fov:
+            continue
+        if _line_of_sight_clear(grid, stop_cell, cell):
+            visible.add(cell)
+    return visible
+
+
+def _region_exploration_shot_payload(
+    stop_cell: tuple[int, int],
+    grid: dict[str, Any],
+    *,
+    yaw: float,
+    fov_deg: float,
+    max_range_m: float,
+    covered_boundary_count: int,
+    covered_area_count: int,
+) -> dict[str, Any]:
+    origin_x, origin_y = _cell_center_xy(stop_cell, grid)
+    half_fov = math.radians(float(fov_deg)) / 2.0
+    left_yaw = yaw - half_fov
+    right_yaw = yaw + half_fov
+    center = {
+        "x": round(origin_x + math.cos(yaw) * max_range_m, 3),
+        "y": round(origin_y + math.sin(yaw) * max_range_m, 3),
+    }
+    left = {
+        "x": round(origin_x + math.cos(left_yaw) * max_range_m, 3),
+        "y": round(origin_y + math.sin(left_yaw) * max_range_m, 3),
+    }
+    right = {
+        "x": round(origin_x + math.cos(right_yaw) * max_range_m, 3),
+        "y": round(origin_y + math.sin(right_yaw) * max_range_m, 3),
+    }
+    yaw = math.atan2(math.sin(yaw), math.cos(yaw))
+    return {
+        "shot_id": f"yaw_{int(round(math.degrees(yaw)))}",
+        "yaw": round(yaw, 3),
+        "yaw_deg": round(math.degrees(yaw), 1),
+        "fov_deg": round(float(fov_deg), 3),
+        "covered_boundary_cell_count": int(covered_boundary_count),
+        "covered_region_area_cell_count": int(covered_area_count),
+        "cone": {
+            "origin": {"x": round(origin_x, 3), "y": round(origin_y, 3)},
+            "left": left,
+            "center": center,
+            "right": right,
+        },
+    }
+
+
+def _cell_center_xy(cell: tuple[int, int], grid: dict[str, Any]) -> tuple[float, float]:
+    resolution = float(grid["resolution"])
+    return (
+        float(grid["origin_x"]) + (cell[0] + 0.5) * resolution,
+        float(grid["origin_y"]) + (cell[1] + 0.5) * resolution,
+    )
+
+
+def _cell_distance_m(a: tuple[int, int], b: tuple[int, int], grid: dict[str, Any]) -> float:
+    resolution = float(grid["resolution"])
+    return math.hypot(a[0] - b[0], a[1] - b[1]) * resolution
+
+
+def _neighbors8_unchecked(cell: tuple[int, int]) -> tuple[tuple[int, int], ...]:
+    x, y = cell
+    return tuple(
+        (x + dx, y + dy)
+        for dx in (-1, 0, 1)
+        for dy in (-1, 0, 1)
+        if not (dx == 0 and dy == 0)
+    )
+
+
+def _point_to_polygon_distance_m(point_x: float, point_y: float, polygon: list[Any]) -> float:
+    points = _valid_polygon_points(polygon)
+    if not points:
+        return 99.0
+    if _point_in_polygon(point_x, point_y, polygon):
+        return 0.0
+    return min(
+        _point_to_segment_distance_m(point_x, point_y, a[0], a[1], b[0], b[1])
+        for a, b in zip(points, points[1:] + points[:1])
+    )
+
+
+def _point_to_segment_distance_m(
+    point_x: float,
+    point_y: float,
+    start_x: float,
+    start_y: float,
+    end_x: float,
+    end_y: float,
+) -> float:
+    dx = end_x - start_x
+    dy = end_y - start_y
+    segment_length_sq = dx * dx + dy * dy
+    if segment_length_sq <= 1e-12:
+        return math.hypot(point_x - start_x, point_y - start_y)
+    t = ((point_x - start_x) * dx + (point_y - start_y) * dy) / segment_length_sq
+    t = min(max(t, 0.0), 1.0)
+    projection_x = start_x + t * dx
+    projection_y = start_y + t * dy
+    return math.hypot(point_x - projection_x, point_y - projection_y)
+
+
+def _angle_delta_abs(a: float, b: float) -> float:
+    return abs(math.atan2(math.sin(a - b), math.cos(a - b)))
+
+
+def _line_of_sight_clear(
+    grid: dict[str, Any],
+    start: tuple[int, int],
+    target: tuple[int, int],
+) -> bool:
+    cells = _bresenham_cells(start, target)
+    for cell in cells[1:-1]:
+        if cell in grid["occupied"]:
+            return False
+    return True
+
+
+def _bresenham_cells(start: tuple[int, int], target: tuple[int, int]) -> list[tuple[int, int]]:
+    x0, y0 = start
+    x1, y1 = target
+    dx = abs(x1 - x0)
+    dy = -abs(y1 - y0)
+    sx = 1 if x0 < x1 else -1
+    sy = 1 if y0 < y1 else -1
+    error = dx + dy
+    x, y = x0, y0
+    cells = []
+    while True:
+        cells.append((x, y))
+        if x == x1 and y == y1:
+            break
+        error2 = 2 * error
+        if error2 >= dy:
+            error += dy
+            x += sx
+        if error2 <= dx:
+            error += dx
+            y += sy
+    return cells
 
 
 def _memory_place(place: dict[str, Any]) -> dict[str, Any]:

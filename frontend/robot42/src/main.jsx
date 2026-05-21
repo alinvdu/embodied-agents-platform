@@ -110,6 +110,7 @@ function AgentChat({ onConfigure }) {
   const agentMemories = state?.environment_memories || [];
   const environment = environmentStatus(state, explorationState);
   const navigationPreview = latestNavigationPreview(events);
+  const visionShots = latestVisionShots(events);
 
   const selectAgentMemory = async (memoryId) => {
     if (!memoryId) return;
@@ -174,6 +175,7 @@ function AgentChat({ onConfigure }) {
         </div>
       </div>
       <AgentMapPreview memory={homeMemory} liveMap={explorationState?.current_map || null} preview={navigationPreview} />
+      <AgentVisionReport shots={visionShots} />
       <div className="agent-actions">
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/pause", {}).then(refresh)}><Pause size={16} /> Pause</button>
         <button disabled={!agentConnected} onClick={() => apiPost(AGENT_BASE, "/api/resume", {}).then(refresh)}><Play size={16} /> Resume</button>
@@ -205,6 +207,34 @@ function AgentChat({ onConfigure }) {
           </Panel>
         </div>
       ) : null}
+    </section>
+  );
+}
+
+function AgentVisionReport({ shots }) {
+  if (!shots.length) return null;
+  return (
+    <section className="vision-report-card">
+      <div className="section-head">
+        <span><Eye size={17} /> What Robot Saw</span>
+        <small>{shots.length} RGB shot{shots.length === 1 ? "" : "s"}</small>
+      </div>
+      <div className="vision-strip">
+        {shots.map((shot) => {
+          const capture = shot.capture || {};
+          const src = artifactSrc(capture.artifact_url || capture.image_url);
+          return (
+            <div className="vision-shot" key={`${shot.stop_id}-${shot.shot_id}`}>
+              {src ? <img src={src} alt={`${shot.stop_id} ${shot.shot_id}`} /> : <div className="vision-missing">No RGB</div>}
+              <div>
+                <strong>{shot.region_label || "region"}</strong>
+                <span>{shot.stop_id} / {shot.shot_id}</span>
+                <span>{capture.status || "unknown"}</span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
     </section>
   );
 }
@@ -289,6 +319,17 @@ function AgentMapPreview({ memory, liveMap, preview }) {
     const p = project(point);
     return `${p.x},${p.y}`;
   }).join(" ");
+  const explorationStops = preview?.tool === "plan_region_exploration" ? (preview?.stops || []) : [];
+  const explorationCones = explorationStops.flatMap((stop, stopIndex) =>
+    (stop.shots || []).map((shot, shotIndex) => {
+      const origin = project(shot.cone?.origin || stop.pose || {});
+      const left = project(shot.cone?.left || {});
+      const center = project(shot.cone?.center || {});
+      const right = project(shot.cone?.right || {});
+      return { stop, stopIndex, shot, shotIndex, origin, left, center, right };
+    })
+  );
+  const explorationStopPoints = explorationStops.map((stop) => ({ stop, point: project(stop.pose || {}) }));
   const goal = preview?.goal_pose ? project(preview.goal_pose) : null;
   const nextWaypoint = preview?.next_waypoint ? project(preview.next_waypoint) : null;
   const robotPose = displayMap?.robot_pose || (displayMap?.trajectory || []).slice(-1)[0] || null;
@@ -300,7 +341,9 @@ function AgentMapPreview({ memory, liveMap, preview }) {
   }) : null;
   const startPose = displayMap?.start_pose?.pose || displayMap?.start_pose;
   const start = startPose ? project(startPose) : null;
-  const subtitle = preview?.goal_pose
+  const subtitle = preview?.tool === "plan_region_exploration"
+    ? `${preview.target_label || "region"} -> ${explorationStops.length} stops, ${explorationCones.length} shots`
+    : preview?.goal_pose
     ? `${preview.target_label || "target"} -> next (${round3(preview.next_waypoint?.x ?? preview.goal_pose.x)}, ${round3(preview.next_waypoint?.y ?? preview.goal_pose.y)})`
     : "Ask for a region target to see the selected point.";
 
@@ -314,8 +357,25 @@ function AgentMapPreview({ memory, liveMap, preview }) {
         <rect width={VIEW_W} height={AGENT_VIEW_H} fill="#fbfbf8" />
         {cells}
         {regions}
+        {explorationCones.map((item) => (
+          <g key={`${item.stop.stop_id || item.stopIndex}-${item.shot.shot_id || item.shotIndex}`}>
+            <polygon
+              points={`${item.origin.x},${item.origin.y} ${item.left.x},${item.left.y} ${item.right.x},${item.right.y}`}
+              fill="rgba(37, 99, 235, 0.08)"
+              stroke="rgba(37, 99, 235, 0.48)"
+              strokeWidth="2"
+            />
+            <line x1={item.origin.x} y1={item.origin.y} x2={item.center.x} y2={item.center.y} stroke="rgba(37, 99, 235, 0.82)" strokeWidth="3" strokeLinecap="round" />
+          </g>
+        ))}
         {pathPoints ? <polyline points={pathPoints} fill="none" stroke="#0f766e" strokeWidth="4" strokeLinecap="round" strokeLinejoin="round" /> : null}
         {start ? <circle cx={start.x} cy={start.y} r="8" fill="#111827" /> : null}
+        {explorationStopPoints.map((item, index) => (
+          <g key={item.stop.stop_id || index}>
+            <circle cx={item.point.x} cy={item.point.y} r="11" fill="#ef3b24" />
+            <text x={item.point.x + 12} y={item.point.y - 12} className="agent-map-goal-label">{item.stop.name || `stop ${index + 1}`}</text>
+          </g>
+        ))}
         {nextWaypoint ? <circle cx={nextWaypoint.x} cy={nextWaypoint.y} r="10" fill="#d97706" /> : null}
         {nextWaypoint ? <circle cx={nextWaypoint.x} cy={nextWaypoint.y} r="18" fill="none" stroke="#d97706" strokeWidth="3" opacity="0.28" /> : null}
         {nextWaypoint ? <text x={nextWaypoint.x + 13} y={nextWaypoint.y + 20} className="agent-map-waypoint-label">waypoint</text> : null}
@@ -340,6 +400,7 @@ function ExplorationConsole({ onExit }) {
   const [mode, setMode] = useState("block");
   const [selectedRegionId, setSelectedRegionId] = useState("");
   const [regionLabel, setRegionLabel] = useState("");
+  const [regionPurpose, setRegionPurpose] = useState("");
   const [regionPolygon, setRegionPolygon] = useState("[]");
   const [regionWaypoints, setRegionWaypoints] = useState("[]");
   const [placeName, setPlaceName] = useState("kitchen_entry");
@@ -387,6 +448,7 @@ function ExplorationConsole({ onExit }) {
   useEffect(() => {
     if (!selectedRegion) return;
     setRegionLabel(selectedRegion.label || "");
+    setRegionPurpose(selectedRegion.purpose || "");
     setRegionPolygon(JSON.stringify(selectedRegion.polygon_2d || [], null, 2));
     setRegionWaypoints(JSON.stringify(selectedRegion.default_waypoints || [], null, 2));
     if (selectedRegion.centroid) {
@@ -424,6 +486,7 @@ function ExplorationConsole({ onExit }) {
     await post("/api/region/update", {
       region_id: selectedRegionId,
       label: regionLabel,
+      purpose: regionPurpose,
       polygon_2d: JSON.parse(regionPolygon || "[]"),
       default_waypoints: JSON.parse(regionWaypoints || "[]"),
     });
@@ -617,6 +680,8 @@ function ExplorationConsole({ onExit }) {
         <Panel title="Selected Region">
           <label>Label</label>
           <input value={regionLabel} onChange={(event) => setRegionLabel(event.target.value)} />
+          <label>Purpose</label>
+          <textarea value={regionPurpose} onChange={(event) => setRegionPurpose(event.target.value)} />
           <label>Polygon JSON</label>
           <textarea value={regionPolygon} onChange={(event) => setRegionPolygon(event.target.value)} />
           <label>Waypoints JSON</label>
@@ -965,11 +1030,39 @@ function eventText(event) {
 function latestNavigationPreview(events) {
   for (let index = (events || []).length - 1; index >= 0; index -= 1) {
     const details = events[index]?.details || {};
+    if (details.tool === "execute_region_exploration_plan" && details.plan?.stops) {
+      return details.plan;
+    }
+    if (details.tool === "plan_region_exploration" && details.stops) {
+      return details;
+    }
     if (details.tool === "resolve_region_navigation_goal" && details.goal_pose) {
       return details;
     }
   }
   return null;
+}
+
+function latestVisionShots(events) {
+  for (let index = (events || []).length - 1; index >= 0; index -= 1) {
+    const details = events[index]?.details || {};
+    if (details.tool !== "execute_region_exploration_plan" || !Array.isArray(details.stops)) continue;
+    return details.stops.flatMap((stop) =>
+      (stop.shots || []).map((shot) => ({
+        ...shot,
+        stop_id: stop.stop_id,
+        region_label: details.region_label,
+      }))
+    ).filter((shot) => shot.capture);
+  }
+  return [];
+}
+
+function artifactSrc(url) {
+  if (!url) return "";
+  if (url.startsWith("data:") || url.startsWith("http://") || url.startsWith("https://")) return url;
+  if (url.startsWith("/api/")) return `${AGENT_BASE}${url}`;
+  return url;
 }
 
 function round3(value) {
@@ -997,6 +1090,14 @@ function agentPreviewBounds(memory, preview) {
     for (const point of region.polygon_2d || []) points.push(point);
   }
   for (const point of preview?.path || []) points.push([point.x, point.y]);
+  for (const stop of preview?.stops || []) {
+    if (stop?.pose) points.push([stop.pose.x, stop.pose.y]);
+    for (const shot of stop?.shots || []) {
+      for (const point of [shot?.cone?.origin, shot?.cone?.left, shot?.cone?.center, shot?.cone?.right]) {
+        if (point) points.push([point.x, point.y]);
+      }
+    }
+  }
   if (preview?.next_waypoint) points.push([preview.next_waypoint.x, preview.next_waypoint.y]);
   if (preview?.goal_pose) points.push([preview.goal_pose.x, preview.goal_pose.y]);
   const startPose = memory?.start_pose?.pose || memory?.start_pose;

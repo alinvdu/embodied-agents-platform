@@ -16,7 +16,8 @@ Run the agent backend in another terminal:
 
 ```bash
 python examples/robot42_agent_backend.py \
-  --memory-root /Users/alindumitru/Robot42/artifacts/memories
+  --memory-root /Users/alindumitru/Robot42/artifacts/memories \
+  --agent-artifacts-root /Users/alindumitru/Robot42/artifacts/agent_runs
 ```
 
 You can still pass `--home-memory-path` for one exact memory, but the normal Robot42 flow is to let the backend discover environment folders under `artifacts/memories`.
@@ -27,7 +28,8 @@ The backend defaults to `mock`/dry-run mode. To use the OpenAI Agents SDK with a
 python examples/robot42_agent_backend.py \
   --memory-root /Users/alindumitru/Robot42/artifacts/memories \
   --provider openai \
-  --model gpt-5.5
+  --model gpt-5.5 \
+  --agent-artifacts-root /Users/alindumitru/Robot42/artifacts/agent_runs
 ```
 
 Run the real exploration backend when you need to configure or update the environment:
@@ -49,7 +51,9 @@ python examples/robot42_agent_backend.py \
   --provider openai \
   --model gpt-5.5 \
   --exploration-backend-url http://127.0.0.1:8770 \
-  --navigation-waypoint-horizon-m 2.0
+  --navigation-waypoint-horizon-m 2.0 \
+  --navigation-auto-rotate-threshold-deg 45 \
+  --agent-artifacts-root ./artifacts/agent_runs
 ```
 
 Without `--provider openai`, the backend defaults to `mock/mock`; it only resolves previews and will not move the robot or create OpenAI Agent traces.
@@ -68,8 +72,11 @@ Agent navigation uses the same exploration backend calls as the UI:
 
 - `navigate_to_waypoint` posts to `/api/nav/waypoint`
 - `relocalize_here` posts to `/api/nav/relocalize`
+- `execute_region_exploration_plan` posts to `/api/nav/capture_rgb` after each shot alignment and saves RGB frames under `artifacts/agent_runs/<run_id>/vision_report/`
 
 Keep `real_agentic_exploration` running with a loaded environment and an active nav session when you want those agent tools to move the robot.
+
+When a command such as `scan the kitchen for a coke can` runs, the Agent screen shows the saved RGB frames in the `What Robot Saw` panel. Object recognition is still a separate next step; the current report is for debugging what the robot saw.
 
 Default backend targets:
 

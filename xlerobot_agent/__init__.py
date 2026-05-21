@@ -35,6 +35,7 @@ from .home_memory import (
     HomeMemoryStore,
     home_memory_agent_context,
     known_home_memory_labels,
+    plan_region_exploration,
     resolve_home_memory_target,
     summarize_home_memory,
 )
@@ -217,6 +218,7 @@ __all__ = [
     "home_memory_agent_context",
     "known_home_memory_labels",
     "load_skill_catalog",
+    "plan_region_exploration",
     "resolve_home_memory_target",
     "resolve_home_memory_path",
     "serialize_execution_result",

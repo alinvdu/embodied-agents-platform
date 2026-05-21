@@ -303,6 +303,66 @@ label {
   background: #fbfbf8;
 }
 
+.vision-report-card {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  box-shadow: var(--shadow);
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.vision-report-card .section-head small {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.vision-strip {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+  padding: 12px;
+}
+
+.vision-shot {
+  border: 1px solid var(--line);
+  background: #ffffff;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.vision-shot img,
+.vision-missing {
+  width: 100%;
+  aspect-ratio: 4 / 3;
+  display: block;
+  object-fit: cover;
+  background: #f1f2ef;
+}
+
+.vision-missing {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.vision-shot div {
+  display: grid;
+  gap: 2px;
+  padding: 9px;
+}
+
+.vision-shot strong {
+  font-size: 13px;
+}
+
+.vision-shot span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .agent-map-region-label {
   font-size: 13px;
   font-weight: 760;

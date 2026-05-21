@@ -154,8 +154,9 @@ class OffloadTests(unittest.TestCase):
         self.assertEqual(current_map["map_id"], "review_map")
         region_id = current_map["regions"][0]["region_id"]
 
-        updated_region = client.update_mapping_region(region_id, label="custom_kitchen")
+        updated_region = client.update_mapping_region(region_id, label="custom_kitchen", purpose="food and appliances")
         self.assertEqual(updated_region["label"], "custom_kitchen")
+        self.assertEqual(updated_region["purpose"], "food and appliances")
 
         named_place = client.set_named_place(
             name="custom_anchor",

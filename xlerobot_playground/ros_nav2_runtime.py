@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from collections import deque
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -11,7 +12,10 @@ import time
 from typing import Any, Callable, Iterable
 from urllib import error, request
 
-import numpy as np
+try:
+    import numpy as np
+except Exception:  # pragma: no cover - numpy is expected on ROS hosts.
+    np = None  # type: ignore[assignment]
 
 from xlerobot_agent.exploration import Pose2D
 
@@ -31,6 +35,7 @@ try:
     from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, Quaternion, TransformStamped, Twist
     from nav_msgs.msg import OccupancyGrid
     from nav2_msgs.action import ComputePathToPose, NavigateToPose, Spin
+    from rcl_interfaces.msg import Log
     from rclpy.action import ActionClient
     from rclpy.action.graph import get_action_server_names_and_types_by_node
     from rclpy.node import Node
@@ -60,6 +65,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     ComputePathToPose = None
     NavigateToPose = None
     Spin = None
+    Log = None
     ActionClient = None
     Node = object
     DurabilityPolicy = None
@@ -199,6 +205,14 @@ def ros_goal_status_label(status: int | None) -> str:
 def remaining_turn_delta_rad(*, desired_total_yaw_rad: float, achieved_total_yaw_rad: float) -> float:
     remaining = max(abs(float(desired_total_yaw_rad)) - abs(float(achieved_total_yaw_rad)), 0.0)
     return math.copysign(remaining, float(desired_total_yaw_rad) if abs(float(desired_total_yaw_rad)) > 1e-9 else 1.0)
+
+
+def wrapped_yaw_delta_rad(current: float, previous: float) -> float:
+    return math.atan2(math.sin(float(current) - float(previous)), math.cos(float(current) - float(previous)))
+
+
+def clamp(value: float, low: float, high: float) -> float:
+    return min(max(float(value), float(low)), float(high))
 
 
 def compute_turn_command(
@@ -512,6 +526,7 @@ class RosExplorationRuntime(Node):
         self._nav_goal_history: list[dict[str, Any]] = []
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
+        self._nav2_log_events: deque[dict[str, Any]] = deque(maxlen=300)
         self._published_navigation_map: RosOccupancyMap | None = None
         self._map_to_odom = Pose2D(0.0, 0.0, 0.0)
         self._publish_map_to_odom_enabled = True
@@ -559,6 +574,8 @@ class RosExplorationRuntime(Node):
         self.create_subscription(PointCloud2, config.point_cloud_topic, self._on_point_cloud, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
+        if Log is not None:
+            self.create_subscription(Log, "/rosout", self._on_rosout, 50)
         self._publish_timer = self.create_timer(0.2, self._publish_internal_navigation_state)
 
     def _spin_once(self, *, timeout_sec: float) -> None:
@@ -704,6 +721,29 @@ class RosExplorationRuntime(Node):
         if encoded:
             self.latest_image_data_url = encoded
 
+    def _on_rosout(self, message: Any) -> None:
+        node = str(getattr(message, "name", "") or "")
+        text = str(getattr(message, "msg", "") or "")
+        haystack = f"{node} {text}".lower()
+        interesting = (
+            "nav2" in haystack
+            or "controller_server" in haystack
+            or "planner_server" in haystack
+            or "bt_navigator" in haystack
+            or "recover" in haystack
+            or "progress" in haystack
+        )
+        if not interesting:
+            return
+        self._nav2_log_events.append(
+            {
+                "wall_s": round(time.time(), 3),
+                "node": node,
+                "level": int(getattr(message, "level", 0) or 0),
+                "message": text[:500],
+            }
+        )
+
     def _on_imu(self, message: Imu) -> None:
         self.latest_imu_msg = message
         covariance = getattr(message, "orientation_covariance", None)
@@ -725,6 +765,13 @@ class RosExplorationRuntime(Node):
                 math.cos(yaw_rad - self._latest_imu_orientation_yaw_rad),
             )
         self._latest_imu_orientation_yaw_rad = yaw_rad
+
+    def recent_nav2_log_events(self, *, since_wall_s: float, limit: int = 20) -> list[dict[str, Any]]:
+        events = [
+            event for event in list(self._nav2_log_events)
+            if float(event.get("wall_s", 0.0) or 0.0) >= float(since_wall_s)
+        ]
+        return events[-max(int(limit), 1):]
 
     def _current_turn_feedback(self) -> tuple[str, float] | tuple[None, None]:
         if self._latest_imu_orientation_unwrapped_yaw_rad is not None:
@@ -1079,6 +1126,147 @@ class RosExplorationRuntime(Node):
         finally:
             self.set_nav_active(False)
 
+    def rotate_by(
+        self,
+        *,
+        delta_yaw_rad: float,
+        reason: str = "",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        start_pose = self.current_pose()
+        if abs(float(delta_yaw_rad)) > math.pi + 1e-6:
+            return self._local_motion_result(
+                primitive="rotate_by",
+                status="rejected",
+                reason="Local rotate_by is bounded to 180 degrees. Use a smaller rotation or relocalization scan.",
+                start_pose=start_pose,
+                end_pose=start_pose,
+                extra={
+                    "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+                    "request_reason": reason,
+                },
+            )
+        self.set_point_cloud_map_updates_enabled(False)
+        self.set_nav_active(True)
+        try:
+            event = self._spin_by_delta(delta_yaw_rad, should_cancel=should_cancel)
+        finally:
+            self._cmd_vel_pub.publish(Twist())
+            self.set_point_cloud_map_updates_enabled(False)
+            self.set_nav_active(False)
+        end_pose = self.current_pose()
+        stop_reason = str(event.get("spin_stop_reason") or "rotation completed")
+        return self._local_motion_result(
+            primitive="rotate_by",
+            status="succeeded" if bool(event.get("spin_completed", False)) else "failed",
+            reason=stop_reason,
+            start_pose=start_pose,
+            end_pose=end_pose,
+            extra={
+                "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+                "request_reason": reason,
+                "spin": event,
+            },
+        )
+
+    def rotate_towards_point(
+        self,
+        *,
+        x: float,
+        y: float,
+        reason: str = "",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        pose = self.current_pose()
+        if pose is None:
+            return {
+                "primitive": "rotate_towards_point",
+                "status": "failed",
+                "reason": "Current robot pose is unavailable.",
+                "target_point": {"x": float(x), "y": float(y)},
+            }
+        target_bearing = math.atan2(float(y) - pose.y, float(x) - pose.x)
+        delta_yaw = wrapped_yaw_delta_rad(target_bearing, pose.yaw)
+        result = self.rotate_by(delta_yaw_rad=delta_yaw, reason=reason or "rotate toward target point", should_cancel=should_cancel)
+        result["primitive"] = "rotate_towards_point"
+        result["target_point"] = {"x": round(float(x), 3), "y": round(float(y), 3)}
+        result["target_bearing_deg"] = round(math.degrees(target_bearing), 2)
+        result["requested_delta_yaw_deg"] = round(math.degrees(delta_yaw), 2)
+        return result
+
+    def micro_adjust_to_pose(
+        self,
+        *,
+        target_pose: Pose2D,
+        max_distance_m: float = 0.5,
+        reason: str = "",
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
+        start_pose = self.current_pose()
+        if start_pose is None:
+            return {
+                "primitive": "micro_adjust_to_pose",
+                "status": "failed",
+                "reason": "Current robot pose is unavailable.",
+                "target_pose": target_pose.to_dict(),
+            }
+        distance = math.hypot(target_pose.x - start_pose.x, target_pose.y - start_pose.y)
+        max_distance_m = clamp(max_distance_m, 0.05, 1.0)
+        if distance > max_distance_m:
+            return self._local_motion_result(
+                primitive="micro_adjust_to_pose",
+                status="rejected",
+                reason=f"Target is {distance:.2f} m away, beyond max micro-adjust distance {max_distance_m:.2f} m.",
+                start_pose=start_pose,
+                end_pose=start_pose,
+                extra={
+                    "target_pose": target_pose.to_dict(),
+                    "distance_to_target_m": round(distance, 3),
+                    "max_distance_m": round(max_distance_m, 3),
+                },
+            )
+
+        events: list[dict[str, Any]] = []
+        self.set_point_cloud_map_updates_enabled(False)
+        self.set_nav_active(True)
+        try:
+            orient_event = self._rotate_toward_pose_xy(target_pose, should_cancel=should_cancel)
+            if orient_event is not None:
+                events.append({"phase": "face_target", **orient_event})
+            drive_event = self._drive_straight_towards_pose(target_pose, should_cancel=should_cancel)
+            events.append({"phase": "translate", **drive_event})
+            current_pose = self.current_pose()
+            if current_pose is not None:
+                final_delta = wrapped_yaw_delta_rad(target_pose.yaw, current_pose.yaw)
+                if abs(final_delta) > math.radians(3.0):
+                    events.append({"phase": "final_yaw", **self._spin_by_delta(final_delta, should_cancel=should_cancel)})
+        finally:
+            self._cmd_vel_pub.publish(Twist())
+            self.set_point_cloud_map_updates_enabled(False)
+            self.set_nav_active(False)
+
+        end_pose = self.current_pose()
+        remaining = (
+            math.hypot(target_pose.x - end_pose.x, target_pose.y - end_pose.y)
+            if end_pose is not None
+            else None
+        )
+        status = "succeeded" if remaining is not None and remaining <= 0.08 else "partial"
+        return self._local_motion_result(
+            primitive="micro_adjust_to_pose",
+            status=status,
+            reason=reason or ("micro adjustment completed" if status == "succeeded" else "micro adjustment ended before reaching tolerance"),
+            start_pose=start_pose,
+            end_pose=end_pose,
+            extra={
+                "target_pose": target_pose.to_dict(),
+                "distance_to_target_start_m": round(distance, 3),
+                "distance_remaining_m": None if remaining is None else round(remaining, 3),
+                "max_distance_m": round(max_distance_m, 3),
+                "events": events,
+            },
+        )
+
     def perform_turnaround_scan(
         self,
         *,
@@ -1226,7 +1414,8 @@ class RosExplorationRuntime(Node):
                 self._scan_active_heartbeat_enabled = True
                 self._last_scan_active_heartbeat_s = 0.0
             for pan_rad in scan_angles:
-                self._refresh_scan_active_heartbeat()
+                if hasattr(self, "_refresh_scan_active_heartbeat"):
+                    self._refresh_scan_active_heartbeat()
                 if should_cancel is not None and should_cancel():
                     event["scan_stop_reason"] = "canceled"
                     break
@@ -1244,9 +1433,11 @@ class RosExplorationRuntime(Node):
                     point_cloud_start_index,
                     timeout_s=max(pan_compute_s + 2.0, 3.0),
                 )
-                self._refresh_scan_active_heartbeat()
+                if hasattr(self, "_refresh_scan_active_heartbeat"):
+                    self._refresh_scan_active_heartbeat()
                 self.spin_for(pan_compute_s)
-                self._refresh_scan_active_heartbeat()
+                if hasattr(self, "_refresh_scan_active_heartbeat"):
+                    self._refresh_scan_active_heartbeat()
                 map_updated = self.latest_map_stamp_s > map_before_command_s
                 settled_sample_events.append(
                     {
@@ -1651,6 +1842,129 @@ class RosExplorationRuntime(Node):
             "spin_timeout_s": round(timeout_s, 3),
         }
 
+    def _rotate_toward_pose_xy(
+        self,
+        target_pose: Pose2D,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> dict[str, Any] | None:
+        pose = self.current_pose()
+        if pose is None:
+            return None
+        bearing = math.atan2(target_pose.y - pose.y, target_pose.x - pose.x)
+        delta = wrapped_yaw_delta_rad(bearing, pose.yaw)
+        if abs(delta) <= math.radians(4.0):
+            return {
+                "spin_completed": True,
+                "spin_stop_reason": "already_facing_target",
+                "requested_delta_yaw_deg": round(math.degrees(delta), 2),
+            }
+        event = self._spin_by_delta(delta, should_cancel=should_cancel)
+        event["requested_delta_yaw_deg"] = round(math.degrees(delta), 2)
+        return event
+
+    def _drive_straight_towards_pose(
+        self,
+        target_pose: Pose2D,
+        *,
+        should_cancel: Callable[[], bool] | None = None,
+        tolerance_m: float = 0.05,
+    ) -> dict[str, Any]:
+        step_s = 1.0 / max(self.config.manual_spin_publish_hz, 1e-6)
+        max_speed_m_s = 0.08
+        initial_pose = self.current_pose()
+        initial_distance = (
+            math.hypot(target_pose.x - initial_pose.x, target_pose.y - initial_pose.y)
+            if initial_pose is not None
+            else 0.0
+        )
+        timeout_s = max(2.0, min(12.0, initial_distance / max_speed_m_s + 4.0))
+        deadline = time.time() + timeout_s
+        samples: list[dict[str, Any]] = []
+        stop_reason = "timeout"
+        while time.time() < deadline:
+            if should_cancel is not None and should_cancel():
+                stop_reason = "canceled"
+                break
+            pose = self.current_pose()
+            if pose is None:
+                stop_reason = "pose_unavailable"
+                break
+            distance = math.hypot(target_pose.x - pose.x, target_pose.y - pose.y)
+            if distance <= tolerance_m:
+                stop_reason = "target_reached"
+                break
+            bearing = math.atan2(target_pose.y - pose.y, target_pose.x - pose.x)
+            bearing_error = wrapped_yaw_delta_rad(bearing, pose.yaw)
+            if abs(bearing_error) > math.radians(12.0):
+                self._cmd_vel_pub.publish(Twist())
+                correction = self._spin_by_delta(bearing_error, should_cancel=should_cancel)
+                samples.append(
+                    {
+                        "event": "bearing_correction",
+                        "remaining_distance_m": round(distance, 3),
+                        "bearing_error_deg": round(math.degrees(bearing_error), 2),
+                        "spin_stop_reason": correction.get("spin_stop_reason"),
+                    }
+                )
+                continue
+            twist = Twist()
+            twist.linear.x = min(max_speed_m_s, max(0.025, distance * 0.35))
+            self._cmd_vel_pub.publish(twist)
+            self._spin_once(timeout_sec=0.0)
+            if len(samples) < 20:
+                samples.append(
+                    {
+                        "event": "drive",
+                        "remaining_distance_m": round(distance, 3),
+                        "linear_x_m_s": round(float(twist.linear.x), 3),
+                        "bearing_error_deg": round(math.degrees(bearing_error), 2),
+                    }
+                )
+            time.sleep(step_s)
+        self._cmd_vel_pub.publish(Twist())
+        self.hold_stop_until_stable(duration_s=max(step_s * 4.0, 0.25), min_stable_cycles=2)
+        final_pose = self.current_pose()
+        final_distance = (
+            math.hypot(target_pose.x - final_pose.x, target_pose.y - final_pose.y)
+            if final_pose is not None
+            else None
+        )
+        return {
+            "stop_reason": stop_reason,
+            "timeout_s": round(timeout_s, 3),
+            "distance_start_m": round(initial_distance, 3),
+            "distance_remaining_m": None if final_distance is None else round(final_distance, 3),
+            "samples": samples,
+        }
+
+    def _local_motion_result(
+        self,
+        *,
+        primitive: str,
+        status: str,
+        reason: str,
+        start_pose: Pose2D | None,
+        end_pose: Pose2D | None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
+            "primitive": primitive,
+            "status": status,
+            "reason": reason,
+            "start_pose": None if start_pose is None else start_pose.to_dict(),
+            "end_pose": None if end_pose is None else end_pose.to_dict(),
+            "actual_pose_delta_m": (
+                None if start_pose is None or end_pose is None else round(math.hypot(end_pose.x - start_pose.x, end_pose.y - start_pose.y), 3)
+            ),
+            "actual_yaw_delta_deg": (
+                None if start_pose is None or end_pose is None else round(math.degrees(wrapped_yaw_delta_rad(end_pose.yaw, start_pose.yaw)), 2)
+            ),
+        }
+        if extra:
+            payload.update(extra)
+        return payload
+
     def _capture_settled_scan_observation(self, *, settle_s: float | None = None) -> dict[str, Any] | None:
         reference_frame = self.config.odom_frame if self.config.publish_internal_navigation_map else self.config.map_frame
         capture_start = len(self.scan_observations)
@@ -1767,19 +2081,22 @@ class RosExplorationRuntime(Node):
 
 
 def image_message_to_data_url(message: Image) -> str | None:
-    if PILImage is None:
+    if PILImage is None or np is None:
         return None
     if str(message.encoding).lower() not in {"rgb8", "bgr8"}:
         return None
     channels = 3
-    expected_bytes = int(message.height) * int(message.width) * channels
+    height = int(message.height)
+    width = int(message.width)
+    row_bytes = width * channels
+    step = int(getattr(message, "step", 0) or row_bytes)
+    if height <= 0 or width <= 0 or step < row_bytes:
+        return None
+    expected_bytes = height * step
     if len(message.data) < expected_bytes:
         return None
-    array = np.frombuffer(message.data, dtype=np.uint8, count=expected_bytes).reshape(
-        int(message.height),
-        int(message.width),
-        channels,
-    )
+    rows = np.frombuffer(message.data, dtype=np.uint8, count=expected_bytes).reshape(height, step)
+    array = rows[:, :row_bytes].reshape(height, width, channels)
     if str(message.encoding).lower() == "bgr8":
         array = array[..., ::-1]
     image = PILImage.fromarray(array, mode="RGB")

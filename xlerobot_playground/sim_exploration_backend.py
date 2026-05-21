@@ -457,6 +457,11 @@ class Nav2NavigateResult:
     reached_pose: Pose2D | None
     travelled_distance_m: float
     reason: str
+    start_pose: Pose2D | None = None
+    end_pose: Pose2D | None = None
+    actual_pose_delta_m: float | None = None
+    actual_yaw_delta_deg: float | None = None
+    diagnostics: dict[str, Any] = field(default_factory=dict)
     feedback_samples: tuple[dict[str, Any], ...] = tuple()
     recovery_events: tuple[dict[str, Any], ...] = tuple()
 
@@ -467,6 +472,11 @@ class Nav2NavigateResult:
             "plan": self.plan.to_dict(),
             "reached_pose": None if self.reached_pose is None else self.reached_pose.to_dict(),
             "travelled_distance_m": round(self.travelled_distance_m, 3),
+            "start_pose": None if self.start_pose is None else self.start_pose.to_dict(),
+            "end_pose": None if self.end_pose is None else self.end_pose.to_dict(),
+            "actual_pose_delta_m": None if self.actual_pose_delta_m is None else round(self.actual_pose_delta_m, 3),
+            "actual_yaw_delta_deg": None if self.actual_yaw_delta_deg is None else round(self.actual_yaw_delta_deg, 2),
+            "diagnostics": dict(self.diagnostics),
             "reason": self.reason,
             "feedback_samples": list(self.feedback_samples),
             "recovery_events": list(self.recovery_events),
@@ -607,19 +617,50 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
+        start_pose = self._get_current_cell().center_pose(self.scenario.resolution, yaw=self._get_current_yaw())
+
+        def result_with_motion(
+            *,
+            status: str,
+            plan: Nav2PlanResult,
+            reached_pose: Pose2D | None,
+            travelled_distance_m: float,
+            reason: str,
+            feedback_samples: list[dict[str, Any]] | tuple[dict[str, Any], ...] = tuple(),
+            recovery_events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = tuple(),
+        ) -> Nav2NavigateResult:
+            end_pose = reached_pose or self._get_current_cell().center_pose(
+                self.scenario.resolution,
+                yaw=self._get_current_yaw(),
+            )
+            return Nav2NavigateResult(
+                status=status,
+                goal=goal,
+                plan=plan,
+                reached_pose=reached_pose,
+                travelled_distance_m=travelled_distance_m,
+                reason=reason,
+                start_pose=start_pose,
+                end_pose=end_pose,
+                actual_pose_delta_m=_pose_distance_m(start_pose, end_pose),
+                actual_yaw_delta_deg=math.degrees(_wrapped_yaw_delta(end_pose.yaw, start_pose.yaw)),
+                diagnostics={"feedback_summary": _nav_feedback_summary(feedback_samples)},
+                feedback_samples=tuple(feedback_samples),
+                recovery_events=tuple(recovery_events),
+            )
+
         plan = self.compute_path(goal, record=True)
         recovery_events: list[dict[str, Any]] = []
         if plan.status != "succeeded":
             if self.config.nav2_recovery_enabled:
                 recovery_events.append(self.recover(goal, reason=plan.reason))
-            return Nav2NavigateResult(
+            return result_with_motion(
                 status="failed",
-                goal=goal,
                 plan=plan,
                 reached_pose=None,
                 travelled_distance_m=0.0,
                 reason=plan.reason,
-                recovery_events=tuple(recovery_events),
+                recovery_events=recovery_events,
             )
 
         feedback_samples: list[dict[str, Any]] = []
@@ -630,42 +671,39 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
                 reason = "Nav2 execution stopped because the control-step budget was exhausted"
                 if self.config.nav2_recovery_enabled:
                     recovery_events.append(self.recover(goal, reason=reason))
-                return Nav2NavigateResult(
+                return result_with_motion(
                     status="failed",
-                    goal=goal,
                     plan=plan,
                     reached_pose=previous.center_pose(self.scenario.resolution, yaw=self._get_current_yaw()),
                     travelled_distance_m=travelled_distance_m,
                     reason=reason,
-                    feedback_samples=tuple(feedback_samples),
-                    recovery_events=tuple(recovery_events),
+                    feedback_samples=feedback_samples,
+                    recovery_events=recovery_events,
                 )
             if self._should_stop_execution():
                 reason = "Nav2 execution stopped because the task was canceled"
-                return Nav2NavigateResult(
+                return result_with_motion(
                     status="failed",
-                    goal=goal,
                     plan=plan,
                     reached_pose=previous.center_pose(self.scenario.resolution, yaw=self._get_current_yaw()),
                     travelled_distance_m=travelled_distance_m,
                     reason=reason,
-                    feedback_samples=tuple(feedback_samples),
-                    recovery_events=tuple(recovery_events),
+                    feedback_samples=feedback_samples,
+                    recovery_events=recovery_events,
                 )
             if self._is_runtime_blocked(nxt):
                 self._on_runtime_obstacle(nxt)
                 reason = "Nav2 execution encountered a runtime obstacle on the current path"
                 if self.config.nav2_recovery_enabled:
                     recovery_events.append(self.recover(goal, reason=reason))
-                return Nav2NavigateResult(
+                return result_with_motion(
                     status="failed",
-                    goal=goal,
                     plan=plan,
                     reached_pose=previous.center_pose(self.scenario.resolution, yaw=self._get_current_yaw()),
                     travelled_distance_m=travelled_distance_m,
                     reason=reason,
-                    feedback_samples=tuple(feedback_samples),
-                    recovery_events=tuple(recovery_events),
+                    feedback_samples=feedback_samples,
+                    recovery_events=recovery_events,
                 )
             self._on_motion_step(previous, nxt, goal, index, len(path_cells))
             travelled_distance_m += self.scenario.resolution
@@ -681,15 +719,14 @@ class SimulatedNav2NavigationModule(Nav2NavigationModule):
                 feedback_callback(sample)
 
         reached_pose = path_cells[-1].center_pose(self.scenario.resolution, yaw=goal.target_pose.yaw)
-        return Nav2NavigateResult(
+        return result_with_motion(
             status="succeeded",
-            goal=goal,
             plan=plan,
             reached_pose=reached_pose,
             travelled_distance_m=travelled_distance_m,
             reason="Nav2 reached the requested goal pose",
-            feedback_samples=tuple(feedback_samples),
-            recovery_events=tuple(recovery_events),
+            feedback_samples=feedback_samples,
+            recovery_events=recovery_events,
         )
 
     def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
@@ -824,19 +861,65 @@ class RosNav2NavigationModule(Nav2NavigationModule):
         feedback_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> Nav2NavigateResult:
         self._goal_history.append(goal.to_dict())
+        start_pose = self.runtime.current_pose()
+        nav_start_wall_s = time.time()
+
+        def result_with_motion(
+            *,
+            status: str,
+            plan: Nav2PlanResult,
+            reached_pose: Pose2D | None,
+            travelled_distance_m: float,
+            reason: str,
+            feedback_samples: list[dict[str, Any]] | tuple[dict[str, Any], ...] = tuple(),
+            recovery_events: list[dict[str, Any]] | tuple[dict[str, Any], ...] = tuple(),
+        ) -> Nav2NavigateResult:
+            end_pose = reached_pose or self.runtime.current_pose()
+            actual_pose_delta_m = (
+                _pose_distance_m(start_pose, end_pose)
+                if start_pose is not None and end_pose is not None
+                else None
+            )
+            actual_yaw_delta_deg = (
+                math.degrees(_wrapped_yaw_delta(end_pose.yaw, start_pose.yaw))
+                if start_pose is not None and end_pose is not None
+                else None
+            )
+            return Nav2NavigateResult(
+                status=status,
+                goal=goal,
+                plan=plan,
+                reached_pose=reached_pose,
+                travelled_distance_m=travelled_distance_m,
+                reason=reason,
+                start_pose=start_pose,
+                end_pose=end_pose,
+                actual_pose_delta_m=actual_pose_delta_m,
+                actual_yaw_delta_deg=actual_yaw_delta_deg,
+                diagnostics={
+                    "feedback_summary": _nav_feedback_summary(feedback_samples),
+                    "nav2_logs": (
+                        self.runtime.recent_nav2_log_events(since_wall_s=nav_start_wall_s)
+                        if hasattr(self.runtime, "recent_nav2_log_events")
+                        else []
+                    ),
+                },
+                feedback_samples=tuple(feedback_samples),
+                recovery_events=tuple(recovery_events),
+            )
+
         plan = self.compute_path(goal, record=True)
         if plan.status != "succeeded":
             recovery_events: list[dict[str, Any]] = []
             if self.config.nav2_recovery_enabled:
                 recovery_events.append(self.recover(goal, reason=plan.reason))
-            return Nav2NavigateResult(
+            return result_with_motion(
                 status="failed",
-                goal=goal,
                 plan=plan,
                 reached_pose=self.runtime.current_pose(),
                 travelled_distance_m=0.0,
                 reason=plan.reason,
-                recovery_events=tuple(recovery_events),
+                recovery_events=recovery_events,
             )
         validation = self.validate_goal(goal)
         try:
@@ -855,39 +938,36 @@ class RosNav2NavigationModule(Nav2NavigationModule):
             recovery_events: list[dict[str, Any]] = []
             if self.config.nav2_recovery_enabled:
                 recovery_events.append(self.recover(goal, reason=reason))
-            return Nav2NavigateResult(
+            return result_with_motion(
                 status="failed",
-                goal=goal,
                 plan=plan,
                 reached_pose=self.runtime.current_pose(),
                 travelled_distance_m=0.0,
                 reason=reason,
-                recovery_events=tuple(recovery_events),
+                recovery_events=recovery_events,
             )
         status = _goal_status_from_outcome(outcome)
         if status == GoalStatus.STATUS_SUCCEEDED:
-            return Nav2NavigateResult(
+            return result_with_motion(
                 status="succeeded",
-                goal=goal,
                 plan=plan,
                 reached_pose=self.runtime.current_pose(),
                 travelled_distance_m=plan.path_length_m,
                 reason="Nav2 reached the requested goal pose on the live map",
-                feedback_samples=tuple(feedback_samples),
+                feedback_samples=feedback_samples,
             )
         reason = f"Nav2 returned status `{ros_goal_status_label(status)}`"
         recovery_events = []
         if self.config.nav2_recovery_enabled:
             recovery_events.append(self.recover(goal, reason=reason))
-        return Nav2NavigateResult(
+        return result_with_motion(
             status="failed",
-            goal=goal,
             plan=plan,
             reached_pose=self.runtime.current_pose(),
             travelled_distance_m=plan.path_length_m,
             reason=reason,
-            feedback_samples=tuple(feedback_samples),
-            recovery_events=tuple(recovery_events),
+            feedback_samples=feedback_samples,
+            recovery_events=recovery_events,
         )
 
     def recover(self, goal: Nav2GoalRequest, *, reason: str) -> dict[str, Any]:
@@ -3188,6 +3268,12 @@ class _ApartmentExplorationSession:
         self._publish_live_map(f"Runtime obstacle observed at cell ({cell.x}, {cell.y}).")
 
 
+class _LocalMotionHandled(Exception):
+    def __init__(self, result: dict[str, Any]) -> None:
+        super().__init__(str(result.get("reason") or result.get("status") or "local motion handled"))
+        self.result = result
+
+
 class RosExplorationSession:
     def __init__(self, config: SimExplorationConfig, backend: ExplorationBackend, task_id: str) -> None:
         self.config = config
@@ -3969,6 +4055,145 @@ class RosExplorationSession:
                 except Exception:
                     map_payload = None
                 return {"status": "failed", "reason": str(exc), "map": map_payload}
+
+    def execute_local_motion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            self.last_error = None
+            if self._manual_scan_in_progress:
+                return {"status": "busy", "reason": "A scan is already running."}
+            primitive = str(payload.get("primitive") or payload.get("type") or "").strip()
+            self.status = f"local_motion_{primitive or 'unknown'}_active"
+            self._push_progress_update(message=f"Running local motion primitive `{primitive}`.", frontier_id=None)
+            try:
+                if primitive == "rotate_by":
+                    rotate = getattr(self.runtime, "rotate_by", None)
+                    if not callable(rotate):
+                        result = {
+                            "primitive": primitive,
+                            "status": "unavailable",
+                            "reason": "The active ROS runtime does not support local rotate_by primitives.",
+                        }
+                        raise _LocalMotionHandled(result)
+                    if "delta_yaw_rad" in payload:
+                        delta_yaw_rad = float(payload["delta_yaw_rad"])
+                    else:
+                        delta_yaw_rad = math.radians(float(payload.get("delta_yaw_deg", 0.0)))
+                    result = rotate(
+                        delta_yaw_rad=delta_yaw_rad,
+                        reason=str(payload.get("reason") or "agent requested bounded rotation"),
+                    )
+                elif primitive == "rotate_towards_point":
+                    rotate_towards = getattr(self.runtime, "rotate_towards_point", None)
+                    if not callable(rotate_towards):
+                        result = {
+                            "primitive": primitive,
+                            "status": "unavailable",
+                            "reason": "The active ROS runtime does not support local rotate_towards_point primitives.",
+                        }
+                        raise _LocalMotionHandled(result)
+                    result = rotate_towards(
+                        x=float(payload["x"]),
+                        y=float(payload["y"]),
+                        reason=str(payload.get("reason") or "agent requested target-facing rotation"),
+                    )
+                elif primitive == "micro_adjust_to_pose":
+                    micro_adjust = getattr(self.runtime, "micro_adjust_to_pose", None)
+                    if not callable(micro_adjust):
+                        result = {
+                            "primitive": primitive,
+                            "status": "unavailable",
+                            "reason": "The active ROS runtime does not support local micro_adjust_to_pose primitives.",
+                        }
+                        raise _LocalMotionHandled(result)
+                    pose_payload = payload.get("pose") if isinstance(payload.get("pose"), dict) else payload
+                    current_pose = self.runtime.current_pose()
+                    target_pose = Pose2D(
+                        float(pose_payload["x"]),
+                        float(pose_payload["y"]),
+                        float(pose_payload.get("yaw", current_pose.yaw if current_pose is not None else 0.0)),
+                    )
+                    result = micro_adjust(
+                        target_pose=target_pose,
+                        max_distance_m=float(payload.get("max_distance_m", 0.5) or 0.5),
+                        reason=str(payload.get("reason") or "agent requested local final adjustment"),
+                    )
+                else:
+                    result = {
+                        "primitive": primitive,
+                        "status": "rejected",
+                        "reason": f"Unsupported local motion primitive: {primitive!r}.",
+                    }
+            except _LocalMotionHandled as handled:
+                result = handled.result
+            except Exception as exc:
+                result = {
+                    "primitive": primitive,
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            end_pose = _pose_from_map_payload(result.get("end_pose"))
+            if end_pose is None:
+                end_pose = self.runtime.current_pose()
+            if end_pose is not None:
+                self._update_pose_history(end_pose)
+            status = str(result.get("status") or "failed")
+            self.status = f"local_motion_{primitive or 'unknown'}_{status}"
+            self.guardrail_events.append({"type": "local_motion", "result": result})
+            self._push_progress_update(
+                message=f"Local motion `{primitive}` {status}: {result.get('reason') or ''}".strip(),
+                frontier_id=None,
+            )
+            return {
+                "status": status,
+                "reason": result.get("reason"),
+                "local_motion": result,
+                "map": self._build_map_payload(),
+            }
+
+    def capture_rgb_snapshot(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        with self._lock:
+            self.last_error = None
+            try:
+                settle_s = max(0.0, min(float(payload.get("settle_s", 0.08) or 0.08), 1.0))
+            except Exception:
+                settle_s = 0.08
+            try:
+                self.runtime.spin_for(settle_s)
+            except Exception:
+                pass
+            image_data_url = str(getattr(self.runtime, "latest_image_data_url", "") or "")
+            pose = self.runtime.current_pose()
+            if not image_data_url:
+                snapshot = getattr(self.runtime, "snapshot", None)
+                if callable(snapshot):
+                    try:
+                        runtime_snapshot = snapshot()
+                        image_data = runtime_snapshot.get("latest_image_data_url")
+                        if not isinstance(image_data, str):
+                            runtime_state = runtime_snapshot.get("runtime_state")
+                            if isinstance(runtime_state, dict):
+                                image_data = runtime_state.get("latest_image_data_url")
+                        if isinstance(image_data, str):
+                            image_data_url = image_data
+                    except Exception:
+                        image_data_url = ""
+            status = "succeeded" if image_data_url else "unavailable"
+            result = {
+                "status": status,
+                "reason": None if image_data_url else "No latest RGB image is available from the active ROS runtime yet.",
+                "image_data_url": image_data_url,
+                "robot_pose": None if pose is None else pose.to_dict(),
+                "captured_at": time.time(),
+                "request": {
+                    "reason": payload.get("reason"),
+                    "region_label": payload.get("region_label"),
+                    "stop_id": payload.get("stop_id"),
+                    "shot_id": payload.get("shot_id"),
+                },
+            }
+            self.guardrail_events.append({"type": "rgb_capture", "result": {key: value for key, value in result.items() if key != "image_data_url"}})
+            return result
 
     def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
@@ -5341,6 +5566,8 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         waypoint_previewer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         scan_performer: Callable[[], dict[str, Any]] | None = None,
         relocalizer: Callable[[], dict[str, Any]] | None = None,
+        local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -5350,6 +5577,8 @@ class _GatedExplorationUIController(LocalExplorationUIController):
             waypoint_previewer=waypoint_previewer,
             scan_performer=scan_performer,
             relocalizer=relocalizer,
+            local_motion_executor=local_motion_executor,
+            rgb_capturer=rgb_capturer,
             navigation_session_starter=navigation_session_starter,
             navigation_session_stopper=navigation_session_stopper,
         )
@@ -5500,6 +5729,32 @@ class ExplorationRunner:
         if not callable(relocalize):
             return {"status": "unavailable", "reason": "The active session does not support relocalization."}
         return relocalize()
+
+    def execute_local_motion(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        execute = getattr(session, "execute_local_motion", None)
+        if not callable(execute):
+            return {"status": "unavailable", "reason": "The active session does not support local motion primitives."}
+        return execute(payload)
+
+    def capture_rgb_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        capture = getattr(session, "capture_rgb_snapshot", None)
+        if not callable(capture):
+            return {"status": "unavailable", "reason": "The active session does not support RGB capture."}
+        return capture(payload)
 
     def perform_manual_scan(self) -> dict[str, Any]:
         with self._active_session_lock:
@@ -5868,6 +6123,8 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
                 relocalizer=runner.relocalize_here,
+                local_motion_executor=runner.execute_local_motion,
+                rgb_capturer=runner.capture_rgb_snapshot,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )
@@ -5878,6 +6135,8 @@ def main(argv: list[str] | None = None) -> int:
                 waypoint_previewer=runner.preview_waypoint,
                 scan_performer=runner.perform_manual_scan,
                 relocalizer=runner.relocalize_here,
+                local_motion_executor=runner.execute_local_motion,
+                rgb_capturer=runner.capture_rgb_snapshot,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )
@@ -6364,6 +6623,47 @@ def _select_turnaround_scan_observations(
 
 def _pose_distance_m(a: Pose2D, b: Pose2D) -> float:
     return math.hypot(a.x - b.x, a.y - b.y)
+
+
+def _wrapped_yaw_delta(current: float, previous: float) -> float:
+    return math.atan2(math.sin(float(current) - float(previous)), math.cos(float(current) - float(previous)))
+
+
+def _nav_feedback_summary(samples: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    items = list(samples)
+    if not items:
+        return {"sample_count": 0}
+    last = items[-1] if isinstance(items[-1], dict) else {}
+    remaining = last.get("remaining_distance_m", last.get("distance_remaining_m"))
+    try:
+        remaining_value = None if remaining is None else round(float(remaining), 3)
+    except Exception:
+        remaining_value = None
+    return {
+        "sample_count": len(items),
+        "last_distance_remaining_m": remaining_value,
+        "feedback_path_distance_m": _feedback_path_distance_m(items),
+        "number_of_recoveries": last.get("number_of_recoveries"),
+        "last_status": last.get("status"),
+    }
+
+
+def _feedback_path_distance_m(samples: list[dict[str, Any]]) -> float | None:
+    poses: list[tuple[float, float]] = []
+    for sample in samples:
+        pose = sample.get("current_pose") if isinstance(sample, dict) else None
+        if not isinstance(pose, dict):
+            continue
+        try:
+            poses.append((float(pose.get("x", 0.0) or 0.0), float(pose.get("y", 0.0) or 0.0)))
+        except Exception:
+            continue
+    if len(poses) < 2:
+        return None
+    distance = 0.0
+    for previous, current in zip(poses, poses[1:]):
+        distance += math.hypot(current[0] - previous[0], current[1] - previous[1])
+    return round(distance, 3)
 
 
 def _goal_status_from_outcome(value: Any) -> int:

@@ -34,7 +34,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--exploration-backend-url", default=None)
     parser.add_argument("--navigation-waypoint-horizon-m", type=float, default=None)
+    parser.add_argument("--navigation-auto-rotate-threshold-deg", type=float, default=None)
     parser.add_argument("--backend-request-timeout-s", type=float, default=None)
+    parser.add_argument("--agent-artifacts-root", default=None)
     parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
     parser.add_argument("--specialist-model", default=None)
     parser.add_argument("--specialist-base-url", default=None)
@@ -59,8 +61,13 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Main model: {config.model.provider}/{config.model.model}")
     if config.specialist_model:
         print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
-    print("Exposed tools: resolve_navigation_to_region, navigate_to_waypoint, relocalize_here")
+    print(
+        "Exposed tools: resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, "
+        "navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose"
+    )
     print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
+    print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
+    print(f"Agent artifacts: {config.agent_artifacts_root}")
     if config.model.provider == "mock":
         print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")
     else:
@@ -106,11 +113,17 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             if args.navigation_waypoint_horizon_m is not None
             else config.navigation_waypoint_horizon_m
         ),
+        navigation_auto_rotate_threshold_deg=(
+            args.navigation_auto_rotate_threshold_deg
+            if args.navigation_auto_rotate_threshold_deg is not None
+            else config.navigation_auto_rotate_threshold_deg
+        ),
         backend_request_timeout_s=(
             args.backend_request_timeout_s
             if args.backend_request_timeout_s is not None
             else config.backend_request_timeout_s
         ),
+        agent_artifacts_root=args.agent_artifacts_root or config.agent_artifacts_root,
     )
 
 

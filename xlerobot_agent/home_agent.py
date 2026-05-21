@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
+import mimetypes
 import os
 from pathlib import Path
 import threading
@@ -14,11 +17,14 @@ import urllib.request
 import uuid
 
 from .home_memory import (
+    DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M,
     DEFAULT_NAVIGATION_CLEARANCE_M,
     DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
     HomeMemoryStore,
     home_memory_preview_map,
     home_memory_agent_context,
+    plan_region_exploration as plan_home_region_exploration,
+    resolve_direct_navigation_fallback,
     resolve_region_navigation_goal,
     summarize_home_memory,
 )
@@ -56,7 +62,9 @@ class HomeAgentConfig:
     max_turns: int = 18
     exploration_backend_url: str | None = "http://127.0.0.1:8770"
     navigation_waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M
+    navigation_auto_rotate_threshold_deg: float = 45.0
     backend_request_timeout_s: float = 120.0
+    agent_artifacts_root: str = "artifacts/agent_runs"
 
 
 @dataclass
@@ -90,10 +98,12 @@ class HomeAgentToolRuntime:
         memory: dict[str, Any] | None,
         config: HomeAgentConfig,
         emit: EventSink,
+        run_id: str | None = None,
     ) -> None:
         self.memory = memory or {}
         self.config = config
         self.emit = emit
+        self.run_id = run_id or f"manual_{int(time.time())}"
         self.current_pose = self._initial_pose()
         self.stopped = False
 
@@ -139,6 +149,10 @@ class HomeAgentToolRuntime:
                 or self.config.navigation_waypoint_horizon_m
             ),
         )
+        waypoint = result.get("next_waypoint") if isinstance(result.get("next_waypoint"), dict) else None
+        if waypoint is not None and isinstance(self.current_pose, dict):
+            result["current_pose"] = _json_pose(self.current_pose)
+            result["next_waypoint_bearing_error_deg"] = _bearing_error_deg(self.current_pose, waypoint)
         self.emit(
             "tool_executed" if result.get("status") in {"succeeded", "low_clearance"} else "tool_blocked",
             "Region Navigation Resolver",
@@ -151,6 +165,303 @@ class HomeAgentToolRuntime:
         )
         return result
 
+    def plan_region_exploration(
+        self,
+        *,
+        region_label: str,
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        constraints = constraints or {}
+        result = plan_home_region_exploration(
+            self.memory,
+            region_label,
+            fov_deg=constraints.get("fov_deg"),
+            max_stops=constraints.get("max_stops"),
+            shots_per_stop=constraints.get("shots_per_stop"),
+            min_clearance_m=float(
+                constraints.get("min_clearance_m", DEFAULT_NAVIGATION_CLEARANCE_M)
+                or DEFAULT_NAVIGATION_CLEARANCE_M
+            ),
+            boundary_margin_m=float(
+                constraints.get("boundary_margin_m", 0.65)
+                or 0.65
+            ),
+            min_stop_separation_m=constraints.get("min_stop_separation_m"),
+        )
+        self.emit(
+            "tool_executed" if result.get("status") == "succeeded" else "tool_blocked",
+            "Region Exploration Plan",
+            (
+                f"Planned visual exploration for `{region_label}`."
+                if result.get("status") == "succeeded"
+                else f"Could not plan visual exploration for `{region_label}`."
+            ),
+            result,
+        )
+        return result
+
+    def execute_region_exploration_plan(
+        self,
+        *,
+        region_label: str,
+        object_label: str = "",
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        constraints = constraints or {}
+        plan = self.plan_region_exploration(region_label=region_label, constraints=constraints)
+        if plan.get("status") != "succeeded":
+            result = {
+                "tool": "execute_region_exploration_plan",
+                "status": "blocked",
+                "region_label": region_label,
+                "object_label": object_label,
+                "reason": plan.get("reason") or "Region exploration plan failed.",
+                "plan": plan,
+            }
+            self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+            return result
+        if not self.config.exploration_backend_url:
+            result = {
+                "tool": "execute_region_exploration_plan",
+                "status": "unavailable",
+                "region_label": region_label,
+                "object_label": object_label,
+                "reason": "No exploration backend URL is configured for region exploration execution.",
+                "plan": plan,
+            }
+            self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+            return result
+
+        navigation_constraints = _region_exploration_navigation_constraints(constraints)
+        shot_yaw_tolerance_deg = _bounded_float(
+            constraints.get("shot_yaw_tolerance_deg", 5.0),
+            5.0,
+            minimum=0.0,
+            maximum=45.0,
+        )
+        executed_stops: list[dict[str, Any]] = []
+        captured_shot_count = 0
+        saved_rgb_count = 0
+        for stop_index, stop in enumerate(plan.get("stops", []), start=1):
+            if not isinstance(stop, dict) or not isinstance(stop.get("pose"), dict):
+                continue
+            stop_id = str(stop.get("stop_id") or f"{region_label}_stop_{stop_index}")
+            pose = _json_pose(stop["pose"])
+            navigation = self.navigate_to_waypoint(
+                waypoint_id=stop_id,
+                x=pose["x"],
+                y=pose["y"],
+                yaw=pose["yaw"],
+                constraints=navigation_constraints,
+            )
+            stop_execution: dict[str, Any] = {
+                "stop_id": stop_id,
+                "pose": pose,
+                "navigation": navigation,
+                "shots": [],
+            }
+            executed_stops.append(stop_execution)
+            if navigation.get("status") != "succeeded":
+                result = {
+                    "tool": "execute_region_exploration_plan",
+                    "status": "blocked",
+                    "region_label": region_label,
+                    "object_label": object_label,
+                    "reason": f"Navigation to exploration stop `{stop_id}` returned `{navigation.get('status')}`.",
+                    "plan": plan,
+                    "stops": executed_stops,
+                    "visited_stop_count": len(executed_stops) - 1,
+                    "captured_shot_count": captured_shot_count,
+                    "saved_rgb_count": saved_rgb_count,
+                    "detection_status": "not_configured",
+                }
+                self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+                return result
+
+            for shot_index, shot in enumerate(stop.get("shots", []), start=1):
+                if not isinstance(shot, dict):
+                    continue
+                shot_id = str(shot.get("shot_id") or f"{stop_id}_shot_{shot_index}")
+                alignment = self._align_to_region_exploration_shot(
+                    stop_id=stop_id,
+                    shot=shot,
+                    tolerance_deg=shot_yaw_tolerance_deg,
+                )
+                shot_execution = {
+                    "shot_id": shot_id,
+                    "yaw": shot.get("yaw"),
+                    "yaw_deg": shot.get("yaw_deg"),
+                    "alignment": alignment,
+                    "capture": {
+                        "status": "skipped",
+                        "reason": "Shot capture waits until yaw alignment succeeds.",
+                    },
+                    "detection": {
+                        "status": "not_configured",
+                        "object_label": object_label,
+                    },
+                }
+                stop_execution["shots"].append(shot_execution)
+                if alignment.get("status") not in {"succeeded", "partial", "skipped"}:
+                    result = {
+                        "tool": "execute_region_exploration_plan",
+                        "status": "blocked",
+                        "region_label": region_label,
+                        "object_label": object_label,
+                        "reason": (
+                            f"Could not align to shot `{shot_execution['shot_id']}`: "
+                            f"{alignment.get('reason') or alignment.get('status')}"
+                        ),
+                        "plan": plan,
+                        "stops": executed_stops,
+                        "visited_stop_count": len(executed_stops),
+                        "captured_shot_count": captured_shot_count,
+                        "saved_rgb_count": saved_rgb_count,
+                        "detection_status": "not_configured",
+                    }
+                    self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+                    return result
+                capture = self._capture_rgb_region_exploration_shot(
+                    region_label=region_label,
+                    object_label=object_label,
+                    stop_id=stop_id,
+                    stop_pose=pose,
+                    shot=shot,
+                )
+                shot_execution["capture"] = capture
+                if capture.get("status") == "succeeded":
+                    saved_rgb_count += 1
+                captured_shot_count += 1
+
+        result = {
+            "tool": "execute_region_exploration_plan",
+            "status": "succeeded",
+            "region_label": region_label,
+            "object_label": object_label,
+            "plan": plan,
+            "stops": executed_stops,
+            "visited_stop_count": len(executed_stops),
+            "captured_shot_count": captured_shot_count,
+            "saved_rgb_count": saved_rgb_count,
+            "detection_status": "not_configured",
+            "reason": "Region exploration motion completed; object detection is not wired yet.",
+        }
+        self.emit(
+            "tool_executed",
+            "Region Exploration",
+            (
+                f"Executed region exploration for `{region_label}` with "
+                f"{len(executed_stops)} stops and {captured_shot_count} shot alignments."
+            ),
+            result,
+        )
+        return result
+
+    def _align_to_region_exploration_shot(
+        self,
+        *,
+        stop_id: str,
+        shot: dict[str, Any],
+        tolerance_deg: float,
+    ) -> dict[str, Any]:
+        target_yaw = _bounded_float(shot.get("yaw"), float(self.current_pose.get("yaw", 0.0) or 0.0), minimum=-math.pi, maximum=math.pi)
+        delta_yaw_deg = _yaw_delta_deg(float(self.current_pose.get("yaw", 0.0) or 0.0), target_yaw)
+        if abs(delta_yaw_deg) <= tolerance_deg:
+            return {
+                "tool": "rotate_by",
+                "status": "skipped",
+                "reason": "Current yaw is already inside shot tolerance.",
+                "stop_id": stop_id,
+                "target_yaw": round(target_yaw, 3),
+                "delta_yaw_deg": delta_yaw_deg,
+                "tolerance_deg": tolerance_deg,
+                "current_pose": _json_pose(self.current_pose),
+            }
+        result = self.rotate_by(
+            delta_yaw_deg=delta_yaw_deg,
+            reason=f"Align to region exploration shot `{shot.get('shot_id') or stop_id}`.",
+        )
+        result["target_yaw"] = round(target_yaw, 3)
+        result["delta_yaw_deg_requested"] = delta_yaw_deg
+        result["tolerance_deg"] = tolerance_deg
+        return result
+
+    def _capture_rgb_region_exploration_shot(
+        self,
+        *,
+        region_label: str,
+        object_label: str,
+        stop_id: str,
+        stop_pose: dict[str, Any],
+        shot: dict[str, Any],
+    ) -> dict[str, Any]:
+        shot_id = str(shot.get("shot_id") or f"{stop_id}_shot")
+        response = _post_exploration_backend(
+            self.config,
+            "/api/nav/capture_rgb",
+            {
+                "reason": "region_exploration_shot",
+                "region_label": region_label,
+                "object_label": object_label,
+                "stop_id": stop_id,
+                "shot_id": shot_id,
+                "stop_pose": stop_pose,
+                "shot": {
+                    "yaw": shot.get("yaw"),
+                    "yaw_deg": shot.get("yaw_deg"),
+                    "fov_deg": shot.get("fov_deg"),
+                },
+            },
+        )
+        data_url = response.get("image_data_url")
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+            return {
+                "status": str(response.get("status") or "unavailable"),
+                "reason": response.get("reason") or "Exploration backend did not return an RGB image.",
+                "backend_url": self.config.exploration_backend_url,
+                "captured_at": response.get("captured_at"),
+                "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+            }
+        metadata = {
+            "run_id": self.run_id,
+            "region_label": region_label,
+            "object_label": object_label,
+            "stop_id": stop_id,
+            "stop_pose": stop_pose,
+            "shot_id": shot_id,
+            "shot": {
+                "yaw": shot.get("yaw"),
+                "yaw_deg": shot.get("yaw_deg"),
+                "fov_deg": shot.get("fov_deg"),
+            },
+            "current_pose": _json_pose(self.current_pose),
+            "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+            "captured_at": response.get("captured_at") or time.time(),
+            "backend_url": self.config.exploration_backend_url,
+        }
+        try:
+            saved = _save_rgb_capture_artifact(
+                config=self.config,
+                run_id=self.run_id,
+                file_stem=_safe_artifact_name(f"{region_label}_{stop_id}_{shot_id}"),
+                data_url=data_url,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": f"RGB image was received but could not be saved: {exc}",
+                "backend_url": self.config.exploration_backend_url,
+                "captured_at": metadata.get("captured_at"),
+                "robot_pose": metadata.get("robot_pose"),
+            }
+        return {
+            "status": "succeeded",
+            "reason": "RGB shot saved.",
+            "backend_url": self.config.exploration_backend_url,
+            **saved,
+        }
+
     def navigate_to_waypoint(
         self,
         *,
@@ -160,6 +471,7 @@ class HomeAgentToolRuntime:
         yaw: float = 0.0,
         constraints: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        constraints = constraints or {}
         pose = _json_pose({"x": x, "y": y, "yaw": yaw})
         if not self.config.exploration_backend_url:
             result = {
@@ -172,10 +484,15 @@ class HomeAgentToolRuntime:
             self.emit("tool_blocked", "Waypoint Navigation", result["reason"], result)
             return result
 
+        pre_nav_auto_rotation = self._maybe_auto_rotate_before_waypoint(
+            waypoint_id=waypoint_id,
+            pose=pose,
+            constraints=constraints,
+        )
         response = _post_exploration_backend(
             self.config,
             "/api/nav/waypoint",
-            {"pose": pose, "waypoint_id": waypoint_id, "constraints": constraints or {}},
+            {"pose": pose, "waypoint_id": waypoint_id, "constraints": constraints},
         )
         result = _navigation_tool_result(
             response,
@@ -183,22 +500,145 @@ class HomeAgentToolRuntime:
             requested_pose=pose,
             backend_url=self.config.exploration_backend_url,
         )
-        current_pose = result.get("current_pose")
-        if isinstance(current_pose, dict):
-            self.current_pose = _json_pose(current_pose)
-        elif result.get("status") == "succeeded":
-            self.current_pose = pose
-            result["current_pose"] = dict(pose)
+        if pre_nav_auto_rotation is not None:
+            result["pre_nav_auto_rotation"] = pre_nav_auto_rotation
+        self._update_current_pose_after_navigation_result(result, pose)
+        if result.get("status") != "succeeded" and _constraint_bool(constraints, "allow_direct_fallback", True):
+            result = self._maybe_apply_direct_waypoint_fallback(
+                result,
+                waypoint_id=waypoint_id,
+                pose=pose,
+                constraints=constraints,
+            )
         self.emit(
             "tool_executed" if result.get("status") == "succeeded" else "tool_blocked",
             "Waypoint Navigation",
             (
-                f"Nav2 reached waypoint `{waypoint_id}`."
+                (
+                    f"Nav2 fallback reached waypoint `{waypoint_id}`."
+                    if result.get("fallback_navigation")
+                    else f"Nav2 reached waypoint `{waypoint_id}`."
+                )
                 if result.get("status") == "succeeded"
                 else f"Nav2 waypoint `{waypoint_id}` returned `{result.get('status')}`."
             ),
             result,
         )
+        return result
+
+    def _maybe_auto_rotate_before_waypoint(
+        self,
+        *,
+        waypoint_id: str,
+        pose: dict[str, Any],
+        constraints: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if not _constraint_bool(constraints, "allow_auto_rotate", True):
+            return None
+        threshold_deg = _bounded_float(
+            constraints.get("auto_rotate_threshold_deg", self.config.navigation_auto_rotate_threshold_deg),
+            self.config.navigation_auto_rotate_threshold_deg,
+            minimum=0.0,
+            maximum=181.0,
+        )
+        if threshold_deg > 180.0:
+            return {
+                "status": "skipped",
+                "reason": "Auto-rotate threshold is above 180 degrees.",
+                "threshold_deg": threshold_deg,
+            }
+        bearing_error_deg = _bearing_error_deg(self.current_pose, pose)
+        if abs(bearing_error_deg) <= threshold_deg:
+            return {
+                "status": "skipped",
+                "reason": "Bearing error is below the auto-rotate threshold.",
+                "threshold_deg": threshold_deg,
+                "bearing_error_deg": bearing_error_deg,
+            }
+        rotation = self._local_motion(
+            title="Pre-Nav Auto Rotate",
+            payload={
+                "primitive": "rotate_towards_point",
+                "x": pose["x"],
+                "y": pose["y"],
+                "reason": (
+                    f"Auto-rotate before Nav2 waypoint `{waypoint_id}` because bearing error "
+                    f"{bearing_error_deg:.1f} deg exceeds threshold {threshold_deg:.1f} deg."
+                ),
+            },
+        )
+        rotation["threshold_deg"] = threshold_deg
+        rotation["bearing_error_deg"] = bearing_error_deg
+        return rotation
+
+    def _update_current_pose_after_navigation_result(self, result: dict[str, Any], requested_pose: dict[str, Any]) -> None:
+        current_pose = result.get("current_pose")
+        if isinstance(current_pose, dict):
+            self.current_pose = _json_pose(current_pose)
+        elif result.get("status") == "succeeded":
+            self.current_pose = requested_pose
+            result["current_pose"] = dict(requested_pose)
+
+    def _maybe_apply_direct_waypoint_fallback(
+        self,
+        result: dict[str, Any],
+        *,
+        waypoint_id: str,
+        pose: dict[str, Any],
+        constraints: dict[str, Any],
+    ) -> dict[str, Any]:
+        original_status = str(result.get("status") or "failed")
+        original_reason = str(result.get("reason") or "")
+        start_pose = result.get("current_pose") if isinstance(result.get("current_pose"), dict) else self.current_pose
+        requested_max_distance_m = float(
+            constraints.get("direct_fallback_max_distance_m", DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M)
+            or DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M
+        )
+        max_distance_m = min(max(requested_max_distance_m, 0.0), DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M)
+        min_clearance_m = float(
+            constraints.get("direct_fallback_min_clearance_m", DEFAULT_NAVIGATION_CLEARANCE_M)
+            or DEFAULT_NAVIGATION_CLEARANCE_M
+        )
+        fallback_plan = resolve_direct_navigation_fallback(
+            self.memory,
+            start_pose,
+            pose,
+            min_clearance_m=min_clearance_m,
+            max_distance_m=max_distance_m,
+        )
+        result["direct_fallback_plan"] = fallback_plan
+        if fallback_plan.get("status") != "succeeded":
+            result["fallback_navigation"] = {
+                "status": "skipped",
+                "reason": fallback_plan.get("reason"),
+            }
+            return result
+
+        fallback_result = self._local_motion(
+            title="Direct Waypoint Fallback",
+            payload={
+                "primitive": "micro_adjust_to_pose",
+                "pose": pose,
+                "max_distance_m": max_distance_m,
+                "reason": f"Nav2 `{original_status}` for `{waypoint_id}`; direct line is footprint-clear.",
+            },
+        )
+        result["fallback_navigation"] = fallback_result
+        result["nav2_status_before_fallback"] = original_status
+        result["nav2_reason_before_fallback"] = original_reason
+        if fallback_result.get("status") == "succeeded":
+            result["status"] = "succeeded"
+            result["reason"] = "Nav2 failed, but direct footprint-clear local fallback succeeded."
+            result["current_pose"] = fallback_result.get("current_pose") or pose
+            if not isinstance(fallback_result.get("current_pose"), dict):
+                self.current_pose = pose
+            result["distance_remaining_m"] = fallback_result.get("distance_remaining_m")
+            result["failure_hint"] = None
+        else:
+            result["reason"] = (
+                f"{original_reason} Direct fallback was attempted but returned "
+                f"`{fallback_result.get('status')}`: {fallback_result.get('reason') or ''}"
+            ).strip()
         return result
 
     def relocalize_here(self) -> dict[str, Any]:
@@ -220,6 +660,72 @@ class HomeAgentToolRuntime:
             "tool_executed" if result.get("status") in {"corrected", "skipped"} else "tool_blocked",
             "Relocalization",
             str(result.get("message") or result.get("reason") or f"Relocalization {result.get('status')}."),
+            result,
+        )
+        return result
+
+    def rotate_by(self, *, delta_yaw_deg: float, reason: str = "") -> dict[str, Any]:
+        return self._local_motion(
+            title="Local Rotate",
+            payload={
+                "primitive": "rotate_by",
+                "delta_yaw_deg": float(delta_yaw_deg),
+                "reason": reason,
+            },
+        )
+
+    def rotate_towards_point(self, *, x: float, y: float, reason: str = "") -> dict[str, Any]:
+        return self._local_motion(
+            title="Local Rotate Toward Point",
+            payload={
+                "primitive": "rotate_towards_point",
+                "x": float(x),
+                "y": float(y),
+                "reason": reason,
+            },
+        )
+
+    def micro_adjust_to_pose(
+        self,
+        *,
+        x: float,
+        y: float,
+        yaw: float = 0.0,
+        max_distance_m: float = 0.5,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        return self._local_motion(
+            title="Local Micro Adjust",
+            payload={
+                "primitive": "micro_adjust_to_pose",
+                "pose": _json_pose({"x": x, "y": y, "yaw": yaw}),
+                "max_distance_m": float(max_distance_m),
+                "reason": reason,
+            },
+        )
+
+    def _local_motion(self, *, title: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if not self.config.exploration_backend_url:
+            result = {
+                "tool": str(payload.get("primitive") or "local_motion"),
+                "status": "unavailable",
+                "reason": "No exploration backend URL is configured for local motion.",
+            }
+            self.emit("tool_blocked", title, result["reason"], result)
+            return result
+        response = _post_exploration_backend(self.config, "/api/nav/local_motion", payload)
+        result = _local_motion_tool_result(
+            response,
+            primitive=str(payload.get("primitive") or "local_motion"),
+            backend_url=self.config.exploration_backend_url,
+        )
+        current_pose = result.get("current_pose")
+        if isinstance(current_pose, dict):
+            self.current_pose = _json_pose(current_pose)
+        self.emit(
+            "tool_executed" if result.get("status") in {"succeeded", "partial"} else "tool_blocked",
+            title,
+            f"{result.get('tool')} returned `{result.get('status')}`: {result.get('reason') or ''}".strip(),
             result,
         )
         return result
@@ -484,7 +990,12 @@ class HomeTaskAgent:
             memory_summary=summarize_home_memory(memory) if memory else "No home memory loaded.",
         )
         self.emit("session_started", "Run Started", f"Started HomeTaskAgent for `{command}`.", record.to_dict())
-        runtime = HomeAgentToolRuntime(memory=memory, config=self.config, emit=self._recording_emit(record))
+        runtime = HomeAgentToolRuntime(
+            memory=memory,
+            config=self.config,
+            emit=self._recording_emit(record),
+            run_id=record.run_id,
+        )
         try:
             if self.config.model.provider == "mock":
                 self._run_deterministic(command, memory, runtime, record)
@@ -541,6 +1052,19 @@ class HomeTaskAgent:
             return
 
         self.emit("memory_resolved", "Memory Target", f"Resolved `{target['label']}` from home memory.", target)
+        lower_command = command.lower()
+        if any(token in lower_command for token in ("find", "search", "scan", "explore")):
+            result = runtime.plan_region_exploration(region_label=target["label"], constraints={})
+            if result.get("status") == "succeeded":
+                record.summary = (
+                    f"Planned region exploration for `{target['label']}` with "
+                    f"{len(result.get('stops', []))} stops."
+                )
+            else:
+                record.status = "blocked"
+                record.summary = f"Could not plan region exploration for `{target['label']}`."
+            return
+
         result = self._navigation_call(runtime, target)
         if result.get("goal_pose"):
             record.summary = f"Resolved `{target['label']}` to a concrete navigation preview point."
@@ -571,6 +1095,31 @@ class HomeTaskAgent:
             )
 
         @function_tool
+        def plan_region_exploration(region_label: str, constraints_json: str = "{}") -> str:
+            """Plan inspection stops and 65-degree visual-search shots for a semantic region."""
+            return json.dumps(
+                runtime.plan_region_exploration(
+                    region_label=region_label,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def execute_region_exploration_plan(
+            region_label: str,
+            object_label: str = "",
+            constraints_json: str = "{}",
+        ) -> str:
+            """Navigate visual-search stops and align the robot to each planned shot cone."""
+            return json.dumps(
+                runtime.execute_region_exploration_plan(
+                    region_label=region_label,
+                    object_label=object_label,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
         def navigate_to_waypoint(waypoint_id: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
             """Send a resolved waypoint to the live exploration/Nav2 backend and wait for the result."""
             return json.dumps(
@@ -588,6 +1137,29 @@ class HomeTaskAgent:
             """Run the existing exploration backend relocalization scan and odometry correction."""
             return json.dumps(runtime.relocalize_here())
 
+        @function_tool
+        def rotate_by(delta_yaw_deg: float, reason: str = "") -> str:
+            """Run a bounded backend-controlled in-place rotation, in degrees."""
+            return json.dumps(runtime.rotate_by(delta_yaw_deg=delta_yaw_deg, reason=reason))
+
+        @function_tool
+        def rotate_towards_point(x: float, y: float, reason: str = "") -> str:
+            """Rotate the robot toward a target point before using Nav2 or as recovery."""
+            return json.dumps(runtime.rotate_towards_point(x=x, y=y, reason=reason))
+
+        @function_tool
+        def micro_adjust_to_pose(x: float, y: float, yaw: float = 0.0, max_distance_m: float = 0.5, reason: str = "") -> str:
+            """Use bounded backend-controlled local motion for close final pose adjustment."""
+            return json.dumps(
+                runtime.micro_adjust_to_pose(
+                    x=x,
+                    y=y,
+                    yaw=yaw,
+                    max_distance_m=max_distance_m,
+                    reason=reason,
+                )
+            )
+
         agent = Agent(
             name="NavigationAgent",
             instructions=self._agent_instructions(memory),
@@ -595,8 +1167,13 @@ class HomeTaskAgent:
             model_settings=self._sdk_model_settings(ModelSettings),
             tools=[
                 resolve_navigation_to_region,
+                plan_region_exploration,
+                execute_region_exploration_plan,
                 navigate_to_waypoint,
                 relocalize_here,
+                rotate_by,
+                rotate_towards_point,
+                micro_adjust_to_pose,
             ],
         )
         result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
@@ -609,27 +1186,39 @@ class HomeTaskAgent:
                 "You are Robot42's HomeTaskAgent.",
                 "For navigation commands, act as the NavigationAgent delegated by HomeTaskAgent.",
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
-                "Available navigation tools are resolve_navigation_to_region, navigate_to_waypoint, and relocalize_here.",
+                "Available navigation tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, and micro_adjust_to_pose.",
+                "Navigation model:",
+                "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
+                f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
+                "- If Nav2 fails, navigate_to_waypoint can automatically use a short direct primitive fallback only when the saved occupancy map proves the straight corridor is footprint-clear.",
+                "- Nav2 can sometimes fail to find paths toward objects or places, even when a route may exist.",
+                "- Nav2 can be noisy for pure rotations, 180-degree turns, very close targets, and recovery after failed to make progress.",
+                "- Local motion tools are bounded backend-controlled motions. Use them for orientation, tiny final corrections, or recovery, not for long navigation.",
+                "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
+                "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, and saves RGB debug shots. Object detection is not wired yet, so never claim an object was found from it.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
+                "For object-search commands such as `find Coke in the kitchen`, call execute_region_exploration_plan for that region and object label. Summarize the stops/shots executed and clearly say detection is not configured yet.",
                 f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
                 "After each successful waypoint, call relocalize_here before resolving the next waypoint.",
                 "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
-                "If navigation fails but distance_remaining_m is small enough for the task, say that clearly; otherwise report the failure and stop.",
+                "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
+                "If the target is within 0.5m and only a small final correction remains, use micro_adjust_to_pose.",
                 "Do not call or describe perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
                 "Do not infer a navigation target yourself from a region shape.",
                 "Return a concise final summary of the navigation status, final/current pose, and any relocalization correction.",
                 "",
                 "Example navigation loop for `go to kitchen`:",
                 "1. Call resolve_navigation_to_region(target_label='kitchen', constraints_json='{}').",
-                "2. If the result has status succeeded or low_clearance and includes next_waypoint, call navigate_to_waypoint with that exact waypoint and constraints_json='{}'.",
+                "2. Call navigate_to_waypoint with that exact waypoint and constraints_json='{}'. The tool handles pre-Nav2 auto-rotation and direct fallback internally.",
                 "3. If the waypoint succeeded, call relocalize_here.",
                 "4. If the waypoint succeeded and was not final, repeat from step 1.",
                 "5. If the waypoint succeeded and was final, summarize that the region was reached.",
-                "6. If the waypoint failed, summarize status, reason, distance_remaining_m, and current_pose.",
+                "6. If the waypoint failed, summarize status, reason, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "",
                 "Example custom horizon: resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"waypoint_horizon_m\": 1.5}').",
+                "Example object-search motion: execute_region_exploration_plan(region_label='kitchen', object_label='coke can', constraints_json='{\"max_stops\": 3, \"shots_per_stop\": 2}').",
                 "",
                 "Long-term home memory context:",
                 json.dumps(context, indent=2, sort_keys=True),
@@ -873,6 +1462,9 @@ class HomeAgentServer:
                 if self.path == "/api/memories":
                     self._send_json({"memories": controller.list_environment_memories()})
                     return
+                if self.path.startswith("/api/artifacts/"):
+                    self._send_artifact(self.path[len("/api/artifacts/") :])
+                    return
                 if self.path == "/" or self.path == "/index.html":
                     self._send_json({"service": "Robot42 HomeAgent", "state": "/api/state"})
                     return
@@ -935,6 +1527,24 @@ class HomeAgentServer:
                 self.end_headers()
                 self.wfile.write(encoded)
 
+            def _send_artifact(self, relpath: str) -> None:
+                root = _agent_artifacts_root(controller.config).resolve()
+                target = (root / relpath).resolve()
+                if root != target and root not in target.parents:
+                    self.send_error(HTTPStatus.FORBIDDEN, "artifact path escapes artifact root")
+                    return
+                if not target.is_file():
+                    self.send_error(HTTPStatus.NOT_FOUND, "artifact not found")
+                    return
+                content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+                data = target.read_bytes()
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
         self._server = ThreadingHTTPServer((self.host, self.port), Handler)
         self._server.serve_forever()
 
@@ -980,7 +1590,9 @@ def config_from_env() -> HomeAgentConfig:
         navigation_waypoint_horizon_m=float(
             os.getenv("ROBOT42_NAVIGATION_WAYPOINT_HORIZON_M", str(DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M))
         ),
+        navigation_auto_rotate_threshold_deg=float(os.getenv("ROBOT42_NAVIGATION_AUTO_ROTATE_THRESHOLD_DEG", "45")),
         backend_request_timeout_s=float(os.getenv("ROBOT42_AGENT_BACKEND_REQUEST_TIMEOUT_S", "120")),
+        agent_artifacts_root=os.getenv("ROBOT42_AGENT_ARTIFACTS_ROOT", "artifacts/agent_runs"),
     )
 
 
@@ -1108,6 +1720,7 @@ def _navigation_tool_result(
 ) -> dict[str, Any]:
     nav2 = response.get("nav2_result") if isinstance(response.get("nav2_result"), dict) else {}
     plan = nav2.get("plan") if isinstance(nav2.get("plan"), dict) else {}
+    diagnostics = nav2.get("diagnostics") if isinstance(nav2.get("diagnostics"), dict) else {}
     status = str(response.get("status") or nav2.get("status") or "failed")
     current_pose = _pose_from_backend_response(response)
     distance_remaining_m = _remaining_distance_m(nav2)
@@ -1115,6 +1728,19 @@ def _navigation_tool_result(
         distance_remaining_m = 0.0
     if distance_remaining_m is None and current_pose is not None:
         distance_remaining_m = round(_pose_distance_m(current_pose, requested_pose), 3)
+    feedback_summary = (
+        diagnostics.get("feedback_summary")
+        if isinstance(diagnostics.get("feedback_summary"), dict)
+        else _feedback_summary(nav2)
+    )
+    failure_hint = _navigation_failure_hint(
+        status=status,
+        reason=response.get("reason") or nav2.get("reason") or response.get("message") or "",
+        distance_remaining_m=distance_remaining_m,
+        actual_pose_delta_m=nav2.get("actual_pose_delta_m"),
+        feedback_summary=feedback_summary,
+        nav2_logs=diagnostics.get("nav2_logs", []),
+    )
     return {
         "tool": "navigate_to_waypoint",
         "status": status,
@@ -1123,18 +1749,123 @@ def _navigation_tool_result(
         "current_pose": current_pose,
         "normalized_pose": _json_pose(response["normalized_pose"]) if isinstance(response.get("normalized_pose"), dict) else None,
         "distance_remaining_m": distance_remaining_m,
+        "actual_pose_delta_m": nav2.get("actual_pose_delta_m"),
+        "actual_yaw_delta_deg": nav2.get("actual_yaw_delta_deg"),
+        "estimated_feedback_path_m": feedback_summary.get("feedback_path_distance_m"),
         "reason": response.get("reason") or nav2.get("reason") or response.get("message") or "",
+        "failure_hint": failure_hint,
         "backend_url": backend_url,
         "nav2": {
             "status": nav2.get("status"),
             "reason": nav2.get("reason"),
             "travelled_distance_m": nav2.get("travelled_distance_m"),
+            "start_pose": _json_pose(nav2["start_pose"]) if isinstance(nav2.get("start_pose"), dict) else None,
+            "end_pose": _json_pose(nav2["end_pose"]) if isinstance(nav2.get("end_pose"), dict) else None,
             "reached_pose": _json_pose(nav2["reached_pose"]) if isinstance(nav2.get("reached_pose"), dict) else None,
+            "actual_pose_delta_m": nav2.get("actual_pose_delta_m"),
+            "actual_yaw_delta_deg": nav2.get("actual_yaw_delta_deg"),
+            "feedback_summary": feedback_summary,
+            "nav2_logs": diagnostics.get("nav2_logs", []),
             "plan_status": plan.get("status"),
             "plan_reason": plan.get("reason"),
             "path_length_m": plan.get("path_length_m"),
         },
     }
+
+
+def _local_motion_tool_result(response: dict[str, Any], *, primitive: str, backend_url: str | None) -> dict[str, Any]:
+    motion = response.get("local_motion") if isinstance(response.get("local_motion"), dict) else {}
+    current_pose = _pose_from_backend_response(response)
+    if current_pose is None and isinstance(motion.get("end_pose"), dict):
+        current_pose = _json_pose(motion["end_pose"])
+    return {
+        "tool": primitive,
+        "status": str(response.get("status") or motion.get("status") or "failed"),
+        "reason": response.get("reason") or motion.get("reason") or "",
+        "backend_url": backend_url,
+        "current_pose": current_pose,
+        "start_pose": _json_pose(motion["start_pose"]) if isinstance(motion.get("start_pose"), dict) else None,
+        "end_pose": _json_pose(motion["end_pose"]) if isinstance(motion.get("end_pose"), dict) else None,
+        "actual_pose_delta_m": motion.get("actual_pose_delta_m"),
+        "actual_yaw_delta_deg": motion.get("actual_yaw_delta_deg"),
+        "distance_remaining_m": motion.get("distance_remaining_m"),
+        "local_motion": motion,
+    }
+
+
+def _feedback_summary(nav2: dict[str, Any]) -> dict[str, Any]:
+    samples = nav2.get("feedback_samples")
+    if not isinstance(samples, list) or not samples:
+        return {"sample_count": 0}
+    last = samples[-1] if isinstance(samples[-1], dict) else {}
+    remaining = last.get("remaining_distance_m", last.get("distance_remaining_m"))
+    return {
+        "sample_count": len(samples),
+        "last_distance_remaining_m": _round_optional(remaining),
+        "last_navigation_time_s": _round_optional(last.get("navigation_time_s")),
+        "last_estimated_time_remaining_s": _round_optional(last.get("estimated_time_remaining_s")),
+        "feedback_path_distance_m": _feedback_path_distance_m(samples),
+        "number_of_recoveries": last.get("number_of_recoveries"),
+        "last_pose": _json_pose(last["current_pose"]) if isinstance(last.get("current_pose"), dict) else None,
+    }
+
+
+def _feedback_path_distance_m(samples: list[Any]) -> float | None:
+    poses: list[tuple[float, float]] = []
+    for sample in samples:
+        pose = sample.get("current_pose") if isinstance(sample, dict) else None
+        if not isinstance(pose, dict):
+            continue
+        try:
+            poses.append((float(pose.get("x", 0.0) or 0.0), float(pose.get("y", 0.0) or 0.0)))
+        except Exception:
+            continue
+    if len(poses) < 2:
+        return None
+    distance = 0.0
+    for previous, current in zip(poses, poses[1:]):
+        distance += ((current[0] - previous[0]) ** 2 + (current[1] - previous[1]) ** 2) ** 0.5
+    return round(distance, 3)
+
+
+def _navigation_failure_hint(
+    *,
+    status: str,
+    reason: str,
+    distance_remaining_m: float | None,
+    actual_pose_delta_m: Any,
+    feedback_summary: dict[str, Any],
+    nav2_logs: Any = None,
+) -> str | None:
+    if status == "succeeded":
+        return None
+    log_text = " ".join(
+        str(event.get("message", ""))
+        for event in (nav2_logs if isinstance(nav2_logs, list) else [])
+        if isinstance(event, dict)
+    )
+    reason_lower = f"{reason or ''} {log_text}".lower()
+    moved = _round_optional(actual_pose_delta_m)
+    if "failed to make progress" in reason_lower or "aborted" in reason_lower:
+        if moved is not None and moved < 0.05:
+            return "Nav2 did not make useful physical progress; rotate toward the waypoint or use local recovery before retrying."
+        return "Nav2 aborted after some execution; inspect current pose and retry only after changing orientation, waypoint, or localization."
+    if "planner" in reason_lower or "path" in reason_lower:
+        return "Nav2 could not compute a path; resolve a shorter waypoint or pick a different target."
+    if distance_remaining_m is not None and distance_remaining_m < 0.25:
+        return "The robot is close to the target; micro_adjust_to_pose may be more appropriate than another Nav2 goal."
+    if int(feedback_summary.get("sample_count") or 0) == 0:
+        return "Nav2 produced no feedback samples; check whether the goal was accepted and whether the navigation session is active."
+    return None
+
+
+def _round_optional(value: Any, digits: int = 3) -> float | None:
+    if value is None:
+        return None
+    try:
+        return round(float(value), digits)
+    except Exception:
+        return None
 
 
 def _relocalization_tool_result(response: dict[str, Any], *, backend_url: str | None) -> dict[str, Any]:
@@ -1199,6 +1930,149 @@ def _pose_distance_m(a: dict[str, Any], b: dict[str, Any]) -> float:
         ** 0.5,
         3,
     )
+
+
+def _bearing_error_deg(current_pose: dict[str, Any], target_pose: dict[str, Any]) -> float:
+    bearing = math.atan2(
+        float(target_pose.get("y", 0.0) or 0.0) - float(current_pose.get("y", 0.0) or 0.0),
+        float(target_pose.get("x", 0.0) or 0.0) - float(current_pose.get("x", 0.0) or 0.0),
+    )
+    yaw = float(current_pose.get("yaw", 0.0) or 0.0)
+    delta = math.atan2(math.sin(bearing - yaw), math.cos(bearing - yaw))
+    return round(math.degrees(delta), 2)
+
+
+def _yaw_delta_deg(current_yaw: float, target_yaw: float) -> float:
+    delta = math.atan2(math.sin(target_yaw - current_yaw), math.cos(target_yaw - current_yaw))
+    return round(math.degrees(delta), 2)
+
+
+def _constraint_bool(constraints: dict[str, Any], key: str, default: bool) -> bool:
+    value = constraints.get(key, default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off"}
+    return bool(value)
+
+
+def _bounded_float(value: Any, fallback: float, *, minimum: float, maximum: float) -> float:
+    try:
+        result = float(value)
+    except Exception:
+        result = float(fallback)
+    return min(max(result, minimum), maximum)
+
+
+def _agent_artifacts_root(config: HomeAgentConfig) -> Path:
+    return Path(config.agent_artifacts_root).expanduser()
+
+
+def _save_rgb_capture_artifact(
+    *,
+    config: HomeAgentConfig,
+    run_id: str,
+    file_stem: str,
+    data_url: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    mime_type, image_bytes = _decode_image_data_url(data_url)
+    extension = _image_extension_for_mime(mime_type)
+    report_dir = _agent_artifacts_root(config) / run_id / "vision_report"
+    shots_dir = report_dir / "shots"
+    shots_dir.mkdir(parents=True, exist_ok=True)
+    image_path = shots_dir / f"{file_stem}{extension}"
+    metadata_path = shots_dir / f"{file_stem}.json"
+    image_path.write_bytes(image_bytes)
+    metadata = {
+        **metadata,
+        "mime_type": mime_type,
+        "image_filename": image_path.name,
+        "metadata_filename": metadata_path.name,
+    }
+    metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    manifest_path = report_dir / "manifest.json"
+    manifest = _load_json_file(manifest_path)
+    if not isinstance(manifest, dict):
+        manifest = {}
+    captures = manifest.get("captures")
+    if not isinstance(captures, list):
+        captures = []
+    artifact_relpath = f"{run_id}/vision_report/shots/{image_path.name}"
+    metadata_relpath = f"{run_id}/vision_report/shots/{metadata_path.name}"
+    manifest_capture = {
+        **metadata,
+        "image_path": str(image_path),
+        "metadata_path": str(metadata_path),
+        "artifact_relpath": artifact_relpath,
+        "metadata_relpath": metadata_relpath,
+        "artifact_url": f"/api/artifacts/{artifact_relpath}",
+    }
+    captures.append(manifest_capture)
+    manifest = {
+        "run_id": run_id,
+        "updated_at": time.time(),
+        "capture_count": len(captures),
+        "captures": captures,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "mime_type": mime_type,
+        "image_path": str(image_path),
+        "metadata_path": str(metadata_path),
+        "manifest_path": str(manifest_path),
+        "artifact_relpath": artifact_relpath,
+        "metadata_relpath": metadata_relpath,
+        "artifact_url": f"/api/artifacts/{artifact_relpath}",
+        "metadata_url": f"/api/artifacts/{metadata_relpath}",
+        "vision_report_url": f"/api/artifacts/{run_id}/vision_report/manifest.json",
+        "captured_at": metadata.get("captured_at"),
+        "robot_pose": metadata.get("robot_pose"),
+        "current_pose": metadata.get("current_pose"),
+    }
+
+
+def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
+    header, encoded = data_url.split(",", 1)
+    mime_type = header.removeprefix("data:").split(";", 1)[0] or "image/png"
+    return mime_type, base64.b64decode(encoded)
+
+
+def _image_extension_for_mime(mime_type: str) -> str:
+    if mime_type == "image/jpeg":
+        return ".jpg"
+    if mime_type == "image/webp":
+        return ".webp"
+    if mime_type == "image/gif":
+        return ".gif"
+    return ".png"
+
+
+def _safe_artifact_name(value: str) -> str:
+    normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip().lower())
+    normalized = "_".join(part for part in normalized.split("_") if part)
+    return normalized[:120] or f"capture_{int(time.time())}"
+
+
+def _load_json_file(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _region_exploration_navigation_constraints(constraints: dict[str, Any]) -> dict[str, Any]:
+    nested = constraints.get("navigation") or constraints.get("navigation_constraints")
+    if isinstance(nested, dict):
+        return dict(nested)
+    allowed = {
+        "allow_auto_rotate",
+        "auto_rotate_threshold_deg",
+        "allow_direct_fallback",
+        "direct_fallback_max_distance_m",
+        "direct_fallback_min_clearance_m",
+    }
+    return {key: constraints[key] for key in allowed if key in constraints}
 
 
 def _known_region_labels(memory: dict[str, Any]) -> list[str]:
