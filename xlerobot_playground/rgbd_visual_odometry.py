@@ -77,9 +77,11 @@ class RgbdVoConfig:
     camera_pan_topic: str = "/camera/head/pan_rad"
     scan_active_topic: str = "/xlerobot/scan_active"
     nav_active_topic: str = "/xlerobot/nav_active"
+    local_rotation_active_topic: str = "/xlerobot/local_rotation_active"
     scan_active_stale_timeout_s: float = 10.0
     freeze_odom_during_scan: bool = True
     freeze_orientation_during_scan: bool = True
+    freeze_translation_during_local_rotation: bool = True
     odom_requires_nav_active: bool = True
     publish_rate_hz: float = 30.0
     min_depth_m: float = 0.15
@@ -403,6 +405,7 @@ class RgbdVisualOdometryNode(Node):
         self._scan_orientation_frozen = False
         self._scan_active_last_true_s: float | None = None
         self._nav_active = False
+        self._local_rotation_active = False
         self.previous_frame: VisualOdomFrame | None = None
         self.pose = PlanarPose(0.0, 0.0, 0.0)
         self.planar_velocity_x_m_s = 0.0
@@ -436,6 +439,12 @@ class RgbdVisualOdometryNode(Node):
         self.create_subscription(Float32, config.camera_pan_topic, self._on_camera_pan, 10)
         self.create_subscription(Bool, config.scan_active_topic, self._on_scan_active, scan_active_qos_profile())
         self.create_subscription(Bool, config.nav_active_topic, self._on_nav_active, scan_active_qos_profile())
+        self.create_subscription(
+            Bool,
+            config.local_rotation_active_topic,
+            self._on_local_rotation_active,
+            scan_active_qos_profile(),
+        )
         self.create_subscription(Imu, config.imu_topic, self._on_imu, 50)
         self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
@@ -443,8 +452,10 @@ class RgbdVisualOdometryNode(Node):
             f"rgb={config.rgb_topic} depth={config.depth_topic} camera_info={config.camera_info_topic} "
             f"camera_pitch={config.camera_pitch_topic} camera_pan={config.camera_pan_topic} "
             f"scan_active={config.scan_active_topic} nav_active={config.nav_active_topic} "
+            f"local_rotation_active={config.local_rotation_active_topic} "
             f"freeze_odom_during_scan={config.freeze_odom_during_scan} "
             f"freeze_orientation_during_scan={config.freeze_orientation_during_scan} "
+            f"freeze_translation_during_local_rotation={config.freeze_translation_during_local_rotation} "
             f"odom_requires_nav_active={config.odom_requires_nav_active} "
             f"imu={config.imu_topic} odom={config.odom_topic} odom_reset={config.odom_reset_topic}"
         )
@@ -630,6 +641,17 @@ class RgbdVisualOdometryNode(Node):
         else:
             self.get_logger().info("Holding odom pose while nav_active is false; RGB-D translation and IMU yaw updates are ignored.")
 
+    def _on_local_rotation_active(self, message: Any) -> None:
+        active = bool(message.data)
+        if active == self._local_rotation_active:
+            return
+        self._local_rotation_active = active
+        self.previous_frame = None
+        if active:
+            self.get_logger().info("Freezing RGB-D translation during local rotation; IMU yaw remains active.")
+        else:
+            self.get_logger().info("Resuming RGB-D translation after local rotation; reset VO keyframe.")
+
     def _on_odom_reset_pose(self, message: Any) -> None:
         pose = message.pose.pose
         yaw = yaw_from_quaternion_xyzw(
@@ -778,6 +800,10 @@ class RgbdVisualOdometryNode(Node):
         return bool(
             self._nav_inactive_freeze_active()
             or (self.config.freeze_odom_during_scan and self._scan_freeze_active())
+            or (
+                bool(getattr(self.config, "freeze_translation_during_local_rotation", True))
+                and bool(getattr(self, "_local_rotation_active", False))
+            )
         )
 
     def _nav_inactive_freeze_active(self) -> bool:
@@ -879,6 +905,13 @@ class RgbdVisualOdometryNode(Node):
                         self.previous_frame = frame
                         self.planar_velocity_x_m_s = 0.0
                         self.planar_velocity_y_m_s = 0.0
+                        if not orientation_frozen and abs(imu_yaw_rad) > 1e-6:
+                            self.pose = compose_planar_local(
+                                self.pose,
+                                delta_x_m=0.0,
+                                delta_y_m=0.0,
+                                delta_yaw_rad=imu_yaw_rad,
+                            )
                         imu_yaw_applied = True
                     else:
                         estimate = self.estimator.estimate(self.previous_frame, frame)
@@ -1005,6 +1038,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bool topic that is true only while intentional Nav2 waypoint execution is active.",
     )
     parser.add_argument(
+        "--local-rotation-active-topic",
+        default="/xlerobot/local_rotation_active",
+        help="Bool topic that is true only while a bounded local rotation primitive is active.",
+    )
+    parser.add_argument(
         "--scan-active-stale-timeout-s",
         type=float,
         default=10.0,
@@ -1035,6 +1073,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Freeze both RGB-D translation and odom yaw while --scan-active-topic publishes true. "
             "The exploration runtime keeps scan_active true briefly after scans to provide a settle buffer."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-translation-during-local-rotation",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Freeze RGB-D XY translation while --local-rotation-active-topic is true, but keep IMU yaw active. "
+            "Disable only if the physical rotation arc is more trustworthy than visual-odometry rotation parallax."
         ),
     )
     parser.add_argument(
@@ -1139,6 +1186,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
         camera_pan_topic=args.camera_pan_topic,
         scan_active_topic=args.scan_active_topic,
         nav_active_topic=args.nav_active_topic,
+        local_rotation_active_topic=args.local_rotation_active_topic,
         scan_active_stale_timeout_s=args.scan_active_stale_timeout_s,
         freeze_odom_during_scan=args.freeze_odom_during_scan,
         freeze_orientation_during_scan=(
@@ -1146,6 +1194,7 @@ def config_from_args(args: argparse.Namespace) -> RgbdVoConfig:
             if args.freeze_orientation_during_scan is None
             else bool(args.freeze_orientation_during_scan)
         ),
+        freeze_translation_during_local_rotation=args.freeze_translation_during_local_rotation,
         odom_requires_nav_active=args.odom_requires_nav_active,
         publish_rate_hz=args.publish_rate_hz,
         min_depth_m=args.min_depth_m,

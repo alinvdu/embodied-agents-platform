@@ -21,6 +21,7 @@ from xlerobot_playground.ros_nav2_runtime import (
 class RosNav2RuntimeTests(unittest.TestCase):
     def test_local_spin_uses_nav2_yaw_sign_by_default(self) -> None:
         self.assertEqual(RosRuntimeConfig().manual_spin_direction_sign, 1.0)
+        self.assertEqual(RosRuntimeConfig().local_rotation_active_topic, "/xlerobot/local_rotation_active")
 
     def test_compute_turn_command_stops_at_target(self) -> None:
         command, done = compute_turn_command(

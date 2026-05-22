@@ -315,6 +315,7 @@ class RosRuntimeConfig:
     point_cloud_update_map_enabled_topic: str = "/camera/head/points/update_map_enabled"
     scan_active_topic: str = "/xlerobot/scan_active"
     nav_active_topic: str = "/xlerobot/nav_active"
+    local_rotation_active_topic: str = "/xlerobot/local_rotation_active"
     scan_active_release_delay_s: float = 3.0
     rgb_topic: str = "/camera/head/image_raw"
     imu_topic: str = "/imu/filtered_yaw"
@@ -541,10 +542,16 @@ class RosExplorationRuntime(Node):
         )
         self._scan_active_pub = self.create_publisher(Bool, config.scan_active_topic, scan_active_qos_profile())
         self._nav_active_pub = self.create_publisher(Bool, config.nav_active_topic, scan_active_qos_profile())
+        self._local_rotation_active_pub = self.create_publisher(
+            Bool,
+            config.local_rotation_active_topic,
+            scan_active_qos_profile(),
+        )
         self._scan_active_heartbeat_enabled = False
         self._last_scan_active_heartbeat_s = 0.0
         self.set_scan_active(False)
         self.set_nav_active(False)
+        self.set_local_rotation_active(False)
         map_qos = QoSProfile(depth=1)
         map_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
         map_qos.reliability = ReliabilityPolicy.RELIABLE
@@ -996,6 +1003,12 @@ class RosExplorationRuntime(Node):
         self._nav_active_pub.publish(message)
         self._spin_once(timeout_sec=0.0)
 
+    def set_local_rotation_active(self, active: bool) -> None:
+        message = Bool()
+        message.data = bool(active)
+        self._local_rotation_active_pub.publish(message)
+        self._spin_once(timeout_sec=0.0)
+
     def _set_scan_active_if_available(self, active: bool) -> None:
         self.set_scan_active(active)
 
@@ -1148,10 +1161,12 @@ class RosExplorationRuntime(Node):
             )
         self.set_point_cloud_map_updates_enabled(False)
         self.set_nav_active(True)
+        self.set_local_rotation_active(True)
         try:
             event = self._spin_by_delta(delta_yaw_rad, should_cancel=should_cancel)
         finally:
             self._cmd_vel_pub.publish(Twist())
+            self.set_local_rotation_active(False)
             self.set_point_cloud_map_updates_enabled(False)
             self.set_nav_active(False)
         end_pose = self.current_pose()
@@ -1230,7 +1245,11 @@ class RosExplorationRuntime(Node):
         self.set_point_cloud_map_updates_enabled(False)
         self.set_nav_active(True)
         try:
-            orient_event = self._rotate_toward_pose_xy(target_pose, should_cancel=should_cancel)
+            self.set_local_rotation_active(True)
+            try:
+                orient_event = self._rotate_toward_pose_xy(target_pose, should_cancel=should_cancel)
+            finally:
+                self.set_local_rotation_active(False)
             if orient_event is not None:
                 events.append({"phase": "face_target", **orient_event})
             drive_event = self._drive_straight_towards_pose(target_pose, should_cancel=should_cancel)
@@ -1239,9 +1258,14 @@ class RosExplorationRuntime(Node):
             if current_pose is not None:
                 final_delta = wrapped_yaw_delta_rad(target_pose.yaw, current_pose.yaw)
                 if abs(final_delta) > math.radians(3.0):
-                    events.append({"phase": "final_yaw", **self._spin_by_delta(final_delta, should_cancel=should_cancel)})
+                    self.set_local_rotation_active(True)
+                    try:
+                        events.append({"phase": "final_yaw", **self._spin_by_delta(final_delta, should_cancel=should_cancel)})
+                    finally:
+                        self.set_local_rotation_active(False)
         finally:
             self._cmd_vel_pub.publish(Twist())
+            self.set_local_rotation_active(False)
             self.set_point_cloud_map_updates_enabled(False)
             self.set_nav_active(False)
 
@@ -1722,6 +1746,7 @@ class RosExplorationRuntime(Node):
             self._scan_active_heartbeat_enabled = False
             self.set_scan_active(False)
             self.set_nav_active(False)
+            self.set_local_rotation_active(False)
         except Exception:
             pass
         self.destroy_node()

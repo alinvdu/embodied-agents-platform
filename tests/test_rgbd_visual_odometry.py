@@ -63,9 +63,12 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
                     "/scan/is_active",
                     "--nav-active-topic",
                     "/nav/is_active",
+                    "--local-rotation-active-topic",
+                    "/motion/local_rotation",
                     "--scan-active-stale-timeout-s",
                     "6.5",
                     "--no-freeze-orientation-during-scan",
+                    "--no-freeze-translation-during-local-rotation",
                     "--no-odom-requires-nav-active",
                 ]
             )
@@ -73,9 +76,11 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         self.assertEqual(config.scan_active_topic, "/scan/is_active")
         self.assertEqual(config.nav_active_topic, "/nav/is_active")
+        self.assertEqual(config.local_rotation_active_topic, "/motion/local_rotation")
         self.assertEqual(config.scan_active_stale_timeout_s, 6.5)
         self.assertTrue(config.freeze_odom_during_scan)
         self.assertFalse(config.freeze_orientation_during_scan)
+        self.assertFalse(config.freeze_translation_during_local_rotation)
         self.assertFalse(config.odom_requires_nav_active)
 
     def test_compat_freeze_flag_maps_to_scan_orientation_freeze(self) -> None:
@@ -93,6 +98,41 @@ class RgbdVisualOdometryHelperTests(unittest.TestCase):
 
         node._scan_orientation_frozen = True
         self.assertTrue(node._translation_freeze_active())
+
+    def test_local_rotation_freezes_translation_but_not_orientation(self) -> None:
+        node = object.__new__(RgbdVisualOdometryNode)
+        node.config = type(
+            "Config",
+            (),
+            {
+                "freeze_odom_during_scan": False,
+                "freeze_orientation_during_scan": False,
+                "scan_active_stale_timeout_s": 0.0,
+                "odom_requires_nav_active": False,
+                "freeze_translation_during_local_rotation": True,
+            },
+        )()
+        node._scan_orientation_frozen = False
+        node._scan_active_last_true_s = None
+        node._nav_active = True
+        node._local_rotation_active = True
+
+        self.assertTrue(node._translation_freeze_active())
+        self.assertFalse(node._orientation_freeze_active())
+
+        node.config = type(
+            "Config",
+            (),
+            {
+                "freeze_odom_during_scan": False,
+                "freeze_orientation_during_scan": False,
+                "scan_active_stale_timeout_s": 0.0,
+                "odom_requires_nav_active": False,
+                "freeze_translation_during_local_rotation": False,
+            },
+        )()
+
+        self.assertFalse(node._translation_freeze_active())
 
     def test_odom_freezes_when_nav_inactive_is_required(self) -> None:
         node = object.__new__(RgbdVisualOdometryNode)
