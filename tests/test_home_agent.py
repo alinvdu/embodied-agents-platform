@@ -164,6 +164,66 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertLessEqual(result["next_waypoint"]["distance_from_start_m"], DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M)
         self.assertIn("waypoint_id", result["next_waypoint"])
 
+    def test_region_navigation_goal_uses_inside_edge_approach_for_shallow_regions(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["label"] = "TV Area"
+        memory["regions"][0]["default_waypoints"] = []
+        memory["regions"][0]["polygon_2d"] = [[2.0, 1.0], [4.0, 1.0], [4.0, 1.5], [2.0, 1.5]]
+        memory["regions"][0]["centroid"] = {"x": 3.0, "y": 1.25, "yaw": 0.0}
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "occupied" if x in {0, 25} or y in {0, 19} else "free",
+                }
+                for x in range(26)
+                for y in range(20)
+            ],
+        }
+        result = resolve_region_navigation_goal(
+            memory,
+            "go to TV Area",
+            current_pose={"x": 3.0, "y": 3.0, "yaw": 0.0},
+        )
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["goal_selection"], "inside_region_edge_approach")
+        self.assertEqual(result["source"], "home_memory.occupancy_region_inside_edge_approach")
+        self.assertGreater(result["goal_pose"]["y"], 1.2)
+        self.assertLess(result["goal_pose"]["y"], 1.5)
+        self.assertAlmostEqual(result["goal_pose"]["x"], 3.0, delta=0.35)
+        self.assertGreater(result["approach_goal_candidate_count"], 0)
+
+    def test_region_navigation_goal_ignores_generated_center_waypoint_after_region_edit(self) -> None:
+        memory = sample_memory()
+        memory["regions"][0]["label"] = "TV Area"
+        memory["regions"][0]["centroid"] = {"x": 3.0, "y": 1.25, "yaw": 0.0}
+        memory["regions"][0]["default_waypoints"] = [{"name": "tv_area_center", "x": 3.0, "y": 1.10, "yaw": 0.0}]
+        memory["regions"][0]["polygon_2d"] = [[2.0, 1.0], [4.0, 1.0], [4.0, 1.5], [2.0, 1.5]]
+        memory["occupancy"] = {
+            "resolution": 0.25,
+            "bounds": {"min_x": 0.0, "min_y": 0.0},
+            "cells": [
+                {
+                    "x": x * 0.25,
+                    "y": y * 0.25,
+                    "state": "occupied" if x in {0, 25} or y in {0, 19} else "free",
+                }
+                for x in range(26)
+                for y in range(20)
+            ],
+        }
+        result = resolve_region_navigation_goal(
+            memory,
+            "go to TV Area",
+            current_pose={"x": 3.0, "y": 3.0, "yaw": 0.0},
+        )
+        self.assertEqual(result["source"], "home_memory.occupancy_region_inside_edge_approach")
+        self.assertGreater(result["goal_pose"]["y"], 1.2)
+        self.assertLess(result["goal_pose"]["y"], 1.5)
+
     def test_region_navigation_goal_blocks_footprint_unsafe_corridor(self) -> None:
         memory = sample_memory()
         memory["regions"][0]["default_waypoints"] = []

@@ -382,6 +382,25 @@ def resolve_region_navigation_goal(
     candidates = [cell for cell in region_free_cells if cell in reachable]
     if not candidates and start_cell is None:
         candidates = [cell for cell in region_free_cells if cell in footprint_safe_cells]
+
+    inside_goal_candidate_count = len(candidates)
+    approach_candidates: list[tuple[int, int]] = []
+    goal_selection = "inside_region_clearance"
+    if _should_use_inside_edge_region_approach_goal(
+        polygon,
+        region_free_cell_count=len(region_free_cells),
+        footprint_safe_candidate_count=inside_goal_candidate_count,
+    ):
+        approach_candidates = _inside_edge_region_approach_cells(
+            grid,
+            polygon,
+            inside_candidates=candidates,
+            min_clearance_m=min_clearance_m,
+        )
+        if approach_candidates:
+            candidates = approach_candidates
+            goal_selection = "inside_region_edge_approach"
+
     if not candidates and start_cell is not None:
         return {
             "tool": "resolve_region_navigation_goal",
@@ -410,17 +429,36 @@ def resolve_region_navigation_goal(
             "safety_gap_m": round(safety_gap_m, 3),
             "min_clearance_m": round(float(min_clearance_m), 3),
         }
-    scored = [
-        (
-            _cell_clearance_m(cell, grid),
-            -float(_path_distance_cells(start_cell, cell, reachable) if start_cell is not None and cell in reachable else 0)
-            * float(grid["resolution"]),
-            cell,
+
+    polygon_axes = _polygon_axes(polygon) if goal_selection == "inside_region_edge_approach" else None
+    scored = []
+    for cell in candidates:
+        clearance_m = _cell_clearance_m(cell, grid)
+        path_distance_m = (
+            float(_path_distance_cells(start_cell, cell, reachable)) * float(grid["resolution"])
+            if start_cell is not None and cell in reachable
+            else 0.0
         )
-        for cell in candidates
-    ]
+        if goal_selection == "inside_region_edge_approach":
+            point_x, point_y = _cell_center_xy(cell, grid)
+            edge_distance_m = _point_to_polygon_edge_distance_m(point_x, point_y, polygon)
+            ideal_standoff_m = max(0.20, min(float(min_clearance_m) * 0.70, 0.32))
+            standoff_error_m = abs(edge_distance_m - ideal_standoff_m)
+            center_x, center_y = polygon_axes["center"] if polygon_axes else (point_x, point_y)
+            major_axis = polygon_axes["major"] if polygon_axes else (1.0, 0.0)
+            major_center_error_m = abs(_dot(point_x - center_x, point_y - center_y, major_axis))
+            score = (
+                clearance_m * 0.45
+                - path_distance_m * 0.30
+                - standoff_error_m * 1.25
+                - major_center_error_m * 0.50
+            )
+            scored.append((score, clearance_m, -path_distance_m, -standoff_error_m, cell))
+        else:
+            scored.append((clearance_m, clearance_m, -path_distance_m, 0.0, cell))
+
     scored.sort(reverse=True)
-    best_clearance, _, best = scored[0]
+    _, best_clearance, _, _, best = scored[0]
     path_cells = _centered_path_cells(grid, start_cell, best, footprint_safe_cells) if start_cell is not None and best in reachable else []
     path_clearance = min((_cell_clearance_m(cell, grid) for cell in path_cells), default=best_clearance)
     goal_pose = {
@@ -447,7 +485,11 @@ def resolve_region_navigation_goal(
         "region_id": region.get("region_id"),
         "goal_pose": goal_pose,
         "next_waypoint": next_waypoint,
-        "source": "home_memory.occupancy_region_free_space",
+        "source": (
+            "home_memory.occupancy_region_inside_edge_approach"
+            if goal_selection == "inside_region_edge_approach"
+            else "home_memory.occupancy_region_free_space"
+        ),
         "candidate_count": len(region_free_cells),
         "reachable_candidate_count": len([cell for cell in region_free_cells if cell in reachable]),
         "footprint_safe_candidate_count": len([cell for cell in region_free_cells if cell in footprint_safe_cells]),
@@ -457,6 +499,9 @@ def resolve_region_navigation_goal(
         "robot_footprint_radius_m": round(footprint_radius_m, 3),
         "safety_gap_m": round(safety_gap_m, 3),
         "path_strategy": "footprint_eroded_centerline_weighted_grid",
+        "goal_selection": goal_selection,
+        "inside_goal_candidate_count": inside_goal_candidate_count,
+        "approach_goal_candidate_count": len(approach_candidates),
         "path_length_m": round(path_length_m, 3),
         "path": _path_payload(path_cells, grid),
     }
@@ -792,17 +837,28 @@ def _memory_region(region: dict[str, Any]) -> dict[str, Any]:
 
 def _is_auto_center_waypoint(region: dict[str, Any], waypoint: dict[str, Any]) -> bool:
     name = str(waypoint.get("name") or "").lower().replace(" ", "_")
-    if not (name.endswith("_center") or name.endswith("_entry") or name == "center"):
-        return False
-    centroid = region.get("centroid")
-    if not isinstance(centroid, dict):
+    label_center = f"{_slug(str(region.get('label') or region.get('region_id') or 'region'))}_center"
+    if not (name.endswith("_center") or name.endswith("_entry") or name == "center" or name == label_center):
         return False
     try:
-        dx = float(waypoint.get("x", 0.0) or 0.0) - float(centroid.get("x", 0.0) or 0.0)
-        dy = float(waypoint.get("y", 0.0) or 0.0) - float(centroid.get("y", 0.0) or 0.0)
+        waypoint_x = float(waypoint.get("x", 0.0) or 0.0)
+        waypoint_y = float(waypoint.get("y", 0.0) or 0.0)
     except Exception:
         return False
-    return (dx * dx + dy * dy) ** 0.5 <= 0.10
+
+    centers: list[tuple[float, float]] = []
+    centroid = region.get("centroid")
+    if isinstance(centroid, dict):
+        try:
+            centers.append((float(centroid.get("x", 0.0) or 0.0), float(centroid.get("y", 0.0) or 0.0)))
+        except Exception:
+            pass
+    polygon = region.get("polygon_2d")
+    if isinstance(polygon, list) and len(polygon) >= 3:
+        axes = _polygon_axes(polygon)
+        centers.append(axes["center"])
+
+    return any(math.hypot(waypoint_x - center_x, waypoint_y - center_y) <= 0.20 for center_x, center_y in centers)
 
 
 def _best_region_match(memory: dict[str, Any], name_or_label: str) -> dict[str, Any] | None:
@@ -1289,6 +1345,40 @@ def _polygon_axes(polygon: list[Any]) -> dict[str, Any]:
     }
 
 
+def _should_use_inside_edge_region_approach_goal(
+    polygon: list[Any],
+    *,
+    region_free_cell_count: int,
+    footprint_safe_candidate_count: int,
+) -> bool:
+    if region_free_cell_count <= 0:
+        return False
+    axes = _polygon_axes(polygon)
+    area_m2 = abs(_polygon_area(polygon))
+    minor_length_m = float(axes["minor_length"])
+    safe_ratio = float(footprint_safe_candidate_count) / float(region_free_cell_count)
+    shallow_fixture_region = area_m2 <= 2.0 and minor_length_m <= 0.95
+    mostly_unsafe_small_region = area_m2 <= 2.25 and safe_ratio <= 0.12
+    return shallow_fixture_region or mostly_unsafe_small_region
+
+
+def _inside_edge_region_approach_cells(
+    grid: dict[str, Any],
+    polygon: list[Any],
+    *,
+    inside_candidates: list[tuple[int, int]],
+    min_clearance_m: float,
+) -> list[tuple[int, int]]:
+    resolution = float(grid["resolution"])
+    approach_band_m = max(0.35, float(min_clearance_m), resolution * 2.0)
+    candidates: list[tuple[int, int]] = []
+    for cell in inside_candidates:
+        point_x, point_y = _cell_center_xy(cell, grid)
+        if _point_to_polygon_edge_distance_m(point_x, point_y, polygon) <= approach_band_m:
+            candidates.append(cell)
+    return candidates
+
+
 def _valid_polygon_points(polygon: list[Any]) -> list[tuple[float, float]]:
     points: list[tuple[float, float]] = []
     for point in polygon:
@@ -1609,6 +1699,13 @@ def _point_to_polygon_distance_m(point_x: float, point_y: float, polygon: list[A
         return 99.0
     if _point_in_polygon(point_x, point_y, polygon):
         return 0.0
+    return _point_to_polygon_edge_distance_m(point_x, point_y, polygon)
+
+
+def _point_to_polygon_edge_distance_m(point_x: float, point_y: float, polygon: list[Any]) -> float:
+    points = _valid_polygon_points(polygon)
+    if not points:
+        return 99.0
     return min(
         _point_to_segment_distance_m(point_x, point_y, a[0], a[1], b[0], b[1])
         for a, b in zip(points, points[1:] + points[:1])
