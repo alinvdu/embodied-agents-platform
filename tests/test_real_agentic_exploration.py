@@ -28,6 +28,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--ros-manual-spin-direction-sign") + 1], "1.0")
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
+        self.assertEqual(translated[translated.index("--ros-relocalization-accept-confidence") + 1], "0.55")
         self.assertEqual(translated[translated.index("--ros-scan-active-topic") + 1], "/xlerobot/scan_active")
         self.assertEqual(translated[translated.index("--ros-nav-active-topic") + 1], "/xlerobot/nav_active")
         self.assertEqual(translated[translated.index("--ros-local-rotation-active-topic") + 1], "/xlerobot/local_rotation_active")
@@ -51,6 +52,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
                 "127.0.0.1",
                 "--review-port",
                 "8899",
+                "--ros-relocalization-accept-confidence",
+                "0.5",
             ]
         )
 
@@ -63,6 +66,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--no-serve-review-ui", translated)
         self.assertEqual(translated[translated.index("--review-host") + 1], "127.0.0.1")
         self.assertEqual(translated[translated.index("--review-port") + 1], "8899")
+        self.assertEqual(translated[translated.index("--ros-relocalization-accept-confidence") + 1], "0.5")
 
     def test_pause_for_operator_approval_is_translated(self) -> None:
         args = build_parser().parse_args(["--pause-for-operator-approval"])

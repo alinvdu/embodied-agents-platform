@@ -128,6 +128,7 @@ class SimExplorationConfig:
     ros_publish_identity_map_to_odom: bool = False
     ros_relocalization_map_topic: str = "/relocalization_projected_map"
     ros_relocalization_reset_service: str = "/relocalization_octomap_server/reset"
+    ros_relocalization_accept_confidence: float = 0.55
     ros_odom_reset_topic: str = "/xlerobot/odom/set_pose"
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
@@ -3979,6 +3980,7 @@ class RosExplorationSession:
                     estimated_pose=estimated_pose_after_scan,
                     local_pose=local_pose,
                 )
+                accept_confidence = max(0.0, min(1.0, float(self.config.ros_relocalization_accept_confidence)))
                 result = {
                     "status": "skipped",
                     "reason": match.get("reason", "Relocalization confidence is too low."),
@@ -3986,10 +3988,11 @@ class RosExplorationSession:
                     "scan": {key: value for key, value in scan_event.items() if key != "observations"},
                     "local_map_frame": local_map_frame,
                     "match": match,
+                    "accept_confidence_threshold": round(accept_confidence, 3),
                 }
                 confidence = float(match.get("confidence", 0.0) or 0.0)
                 corrected_pose = _pose_from_map_payload(match.get("corrected_pose"))
-                if match.get("status") == "matched" and confidence >= 0.60 and corrected_pose is not None:
+                if match.get("status") == "matched" and confidence >= accept_confidence and corrected_pose is not None:
                     reset_odom_pose = getattr(self.runtime, "reset_odom_pose", None)
                     if not callable(reset_odom_pose):
                         result = {
@@ -4002,6 +4005,7 @@ class RosExplorationSession:
                             "scan": {key: value for key, value in scan_event.items() if key != "observations"},
                             "local_map_frame": local_map_frame,
                             "match": match,
+                            "accept_confidence_threshold": round(accept_confidence, 3),
                         }
                     else:
                         correction = reset_odom_pose(corrected_pose)
@@ -4013,6 +4017,7 @@ class RosExplorationSession:
                                 "scan": {key: value for key, value in scan_event.items() if key != "observations"},
                                 "local_map_frame": local_map_frame,
                                 "match": match,
+                                "accept_confidence_threshold": round(accept_confidence, 3),
                                 "correction": correction,
                             }
                         else:
@@ -4030,6 +4035,7 @@ class RosExplorationSession:
                                 "scan": {key: value for key, value in scan_event.items() if key != "observations"},
                                 "local_map_frame": local_map_frame,
                                 "match": match,
+                                "accept_confidence_threshold": round(accept_confidence, 3),
                                 "correction": correction,
                             }
             with self._lock:
@@ -5927,6 +5933,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
     parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
+    parser.add_argument(
+        "--ros-relocalization-accept-confidence",
+        type=float,
+        default=0.55,
+        help="Minimum relocalization match confidence required before applying an odometry correction.",
+    )
     parser.add_argument("--ros-odom-reset-topic", default="/xlerobot/odom/set_pose")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
@@ -6067,6 +6079,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_publish_identity_map_to_odom=args.ros_publish_identity_map_to_odom,
             ros_relocalization_map_topic=args.ros_relocalization_map_topic,
             ros_relocalization_reset_service=args.ros_relocalization_reset_service,
+            ros_relocalization_accept_confidence=args.ros_relocalization_accept_confidence,
             ros_odom_reset_topic=args.ros_odom_reset_topic,
             ros_scan_topic=args.ros_scan_topic,
             ros_point_cloud_topic=args.ros_point_cloud_topic,

@@ -391,7 +391,7 @@ Expected temporary topics:
 /relocalization_octomap_full
 ```
 
-When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and publishes the corrected robot pose to `/xlerobot/odom/set_pose` if confidence is high enough.
+When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and publishes the corrected robot pose to `/xlerobot/odom/set_pose` if confidence is high enough. The default accept threshold is `0.55`; tune it with `--ros-relocalization-accept-confidence`.
 
 Keep the normal static `map -> odom` identity publisher running. `rgbd_visual_odometry` owns `/odom` and `odom -> base_link`; relocalization reseeds that odometry pose so `/odom` and TF stay consistent. The `odom -> relocalization_map` static publisher above should still run for the temporary OctoMap.
 
@@ -571,6 +571,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-active-topic /xlerobot/scan_active \
   --ros-nav-active-topic /xlerobot/nav_active \
   --ros-local-rotation-active-topic /xlerobot/local_rotation_active \
+  --ros-relocalization-accept-confidence 0.55 \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
@@ -634,6 +635,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-active-topic /xlerobot/scan_active \
   --ros-nav-active-topic /xlerobot/nav_active \
   --ros-local-rotation-active-topic /xlerobot/local_rotation_active \
+  --ros-relocalization-accept-confidence 0.55 \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \

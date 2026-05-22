@@ -411,6 +411,7 @@ function ExplorationConsole({ onExit }) {
   const [newRegionPurpose, setNewRegionPurpose] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
   const [navMessage, setNavMessage] = useState("");
+  const [regionDirty, setRegionDirty] = useState(false);
   const loadedRegionKey = useRef("");
   const regionDraftDirty = useRef(false);
 
@@ -462,6 +463,7 @@ function ExplorationConsole({ onExit }) {
     if (loadedRegionKey.current === selectedRegionKey && regionDraftDirty.current) return;
     loadedRegionKey.current = selectedRegionKey;
     regionDraftDirty.current = false;
+    setRegionDirty(false);
     setRegionLabel(selectedRegion.label || "");
     setRegionPurpose(selectedRegion.purpose || "");
     setRegionPolygon(JSON.stringify(selectedRegion.polygon_2d || [], null, 2));
@@ -496,16 +498,32 @@ function ExplorationConsole({ onExit }) {
     );
   };
 
+  const selectedRegionUpdatePayload = () => ({
+    region_id: selectedRegionId,
+    label: regionLabel,
+    purpose: regionPurpose,
+    polygon_2d: JSON.parse(regionPolygon || "[]"),
+    default_waypoints: JSON.parse(regionWaypoints || "[]"),
+  });
+
+  const markRegionDirty = () => {
+    regionDraftDirty.current = true;
+    setRegionDirty(true);
+  };
+
+  const commitSelectedRegionDraft = async ({ refreshAfter = true } = {}) => {
+    if (!selectedRegionId) return null;
+    const response = await apiPost(EXPLORATION_BASE, "/api/region/update", selectedRegionUpdatePayload());
+    regionDraftDirty.current = false;
+    setRegionDirty(false);
+    if (refreshAfter) await refresh();
+    return response;
+  };
+
   const saveRegion = async () => {
     if (!selectedRegionId) return;
-    await post("/api/region/update", {
-      region_id: selectedRegionId,
-      label: regionLabel,
-      purpose: regionPurpose,
-      polygon_2d: JSON.parse(regionPolygon || "[]"),
-      default_waypoints: JSON.parse(regionWaypoints || "[]"),
-    });
-    regionDraftDirty.current = false;
+    await commitSelectedRegionDraft();
+    setSaveMessage(`Region saved: ${regionLabel || selectedRegionId}.`);
   };
 
   const createDraftRegion = async () => {
@@ -521,31 +539,34 @@ function ExplorationConsole({ onExit }) {
   };
 
   const updateSelectedPolygon = (polygon) => {
-    regionDraftDirty.current = true;
+    markRegionDirty();
     setRegionPolygon(JSON.stringify(polygon, null, 2));
   };
 
   const editRegionLabel = (value) => {
-    regionDraftDirty.current = true;
+    markRegionDirty();
     setRegionLabel(value);
   };
 
   const editRegionPurpose = (value) => {
-    regionDraftDirty.current = true;
+    markRegionDirty();
     setRegionPurpose(value);
   };
 
   const editRegionPolygon = (value) => {
-    regionDraftDirty.current = true;
+    markRegionDirty();
     setRegionPolygon(value);
   };
 
   const editRegionWaypoints = (value) => {
-    regionDraftDirty.current = true;
+    markRegionDirty();
     setRegionWaypoints(value);
   };
 
   const approveAndSaveMemory = async () => {
+    if (selectedRegionId && regionDraftDirty.current) {
+      await commitSelectedRegionDraft({ refreshAfter: false });
+    }
     const approved = await post("/api/approve", {});
     const memory = approved?.artifacts?.home_memory;
     setSaveMessage(
@@ -727,6 +748,7 @@ function ExplorationConsole({ onExit }) {
             <button className="primary" disabled={!backendOnline || !selectedRegionId} onClick={saveRegion}><Save size={16} /> Save</button>
             <button disabled={!backendOnline || !selectedRegionId} onClick={() => selectedRegionId && post("/api/region/split", { region_id: selectedRegionId })}>Split</button>
           </div>
+          {regionDirty ? <p className="hint">Unsaved region edit. Save or Approve + Save Memory will commit it.</p> : null}
         </Panel>
         <Panel title="Named Place">
           <label>Name</label>
