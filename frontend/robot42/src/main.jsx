@@ -411,6 +411,8 @@ function ExplorationConsole({ onExit }) {
   const [newRegionPurpose, setNewRegionPurpose] = useState("");
   const [saveMessage, setSaveMessage] = useState("");
   const [navMessage, setNavMessage] = useState("");
+  const loadedRegionKey = useRef("");
+  const regionDraftDirty = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -436,6 +438,13 @@ function ExplorationConsole({ onExit }) {
   const activeTask = state?.active_task;
   const regions = map?.regions || [];
   const selectedRegion = regions.find((item) => item.region_id === selectedRegionId);
+  const selectedRegionKey = selectedRegion
+    ? [
+        selectedMemoryId || "",
+        map?.artifacts?.home_memory?.memory_id || map?.map_id || "",
+        selectedRegion.region_id,
+      ].join(":")
+    : "";
   const selectedRegionForMap = useMemo(() => {
     if (!selectedRegion) return null;
     try {
@@ -446,7 +455,13 @@ function ExplorationConsole({ onExit }) {
   }, [selectedRegion, regionPolygon]);
 
   useEffect(() => {
-    if (!selectedRegion) return;
+    if (!selectedRegion) {
+      loadedRegionKey.current = "";
+      return;
+    }
+    if (loadedRegionKey.current === selectedRegionKey && regionDraftDirty.current) return;
+    loadedRegionKey.current = selectedRegionKey;
+    regionDraftDirty.current = false;
     setRegionLabel(selectedRegion.label || "");
     setRegionPurpose(selectedRegion.purpose || "");
     setRegionPolygon(JSON.stringify(selectedRegion.polygon_2d || [], null, 2));
@@ -454,7 +469,7 @@ function ExplorationConsole({ onExit }) {
     if (selectedRegion.centroid) {
       setPlacePose(JSON.stringify({ x: selectedRegion.centroid.x, y: selectedRegion.centroid.y, yaw: 0 }, null, 2));
     }
-  }, [selectedRegion]);
+  }, [selectedRegion, selectedRegionKey]);
 
   const post = async (path, payload = {}) => {
     const response = await apiPost(EXPLORATION_BASE, path, payload);
@@ -490,6 +505,7 @@ function ExplorationConsole({ onExit }) {
       polygon_2d: JSON.parse(regionPolygon || "[]"),
       default_waypoints: JSON.parse(regionWaypoints || "[]"),
     });
+    regionDraftDirty.current = false;
   };
 
   const createDraftRegion = async () => {
@@ -505,7 +521,28 @@ function ExplorationConsole({ onExit }) {
   };
 
   const updateSelectedPolygon = (polygon) => {
+    regionDraftDirty.current = true;
     setRegionPolygon(JSON.stringify(polygon, null, 2));
+  };
+
+  const editRegionLabel = (value) => {
+    regionDraftDirty.current = true;
+    setRegionLabel(value);
+  };
+
+  const editRegionPurpose = (value) => {
+    regionDraftDirty.current = true;
+    setRegionPurpose(value);
+  };
+
+  const editRegionPolygon = (value) => {
+    regionDraftDirty.current = true;
+    setRegionPolygon(value);
+  };
+
+  const editRegionWaypoints = (value) => {
+    regionDraftDirty.current = true;
+    setRegionWaypoints(value);
   };
 
   const approveAndSaveMemory = async () => {
@@ -679,13 +716,13 @@ function ExplorationConsole({ onExit }) {
       <div className="exploration-right">
         <Panel title="Selected Region">
           <label>Label</label>
-          <input value={regionLabel} onChange={(event) => setRegionLabel(event.target.value)} />
+          <input value={regionLabel} onChange={(event) => editRegionLabel(event.target.value)} />
           <label>Purpose</label>
-          <textarea value={regionPurpose} onChange={(event) => setRegionPurpose(event.target.value)} />
+          <textarea value={regionPurpose} onChange={(event) => editRegionPurpose(event.target.value)} />
           <label>Polygon JSON</label>
-          <textarea value={regionPolygon} onChange={(event) => setRegionPolygon(event.target.value)} />
+          <textarea value={regionPolygon} onChange={(event) => editRegionPolygon(event.target.value)} />
           <label>Waypoints JSON</label>
-          <textarea value={regionWaypoints} onChange={(event) => setRegionWaypoints(event.target.value)} />
+          <textarea value={regionWaypoints} onChange={(event) => editRegionWaypoints(event.target.value)} />
           <div className="toolbar">
             <button className="primary" disabled={!backendOnline || !selectedRegionId} onClick={saveRegion}><Save size={16} /> Save</button>
             <button disabled={!backendOnline || !selectedRegionId} onClick={() => selectedRegionId && post("/api/region/split", { region_id: selectedRegionId })}>Split</button>
