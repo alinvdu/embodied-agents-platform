@@ -576,6 +576,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --camera-pan-step-deg 60 \
   --camera-pan-compute-s 1.5 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
+  --ros-manual-spin-direction-sign 1 \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
   --pause-for-operator-approval
@@ -637,6 +638,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --camera-pan-step-deg 60 \
   --camera-pan-compute-s 0.8 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
+  --ros-manual-spin-direction-sign 1 \
   --max-decisions 8
 ```
 
@@ -739,6 +741,7 @@ The `robot_brain_agent` terminal should log motion/action errors if it rejects a
 
 - RGB-D visual odometry is experimental and may drift, especially if RGB-D alignment, intrinsics, or feature texture are poor.
 - The default initial and arrival 360 scans use camera pan through robot brain `head_motor_1.pos`; robot base rotation is fallback only with `--ros-turn-scan-mode robot_spin`.
+- Local agent rotations use normal ROS/Nav2 yaw sign by default: positive angular velocity turns counter-clockwise in `map`. Keep `--ros-manual-spin-direction-sign 1` unless a low-level hardware adapter is not already correcting wheel/motor sign.
 - Frontier navigation uses Nav2 `navigate_to_pose`; this is the existing ROS exploration execution path.
 - Exact region naming and semantic waypoint quality depend on good RGB keyframes and LLM/VLM configuration.
 - Approved environments are saved under `--memory-root` as memory folders containing the editable environment map and the distilled agent memory side by side.

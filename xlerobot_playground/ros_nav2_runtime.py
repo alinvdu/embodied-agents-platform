@@ -331,7 +331,7 @@ class RosRuntimeConfig:
     turn_scan_settle_s: float = 1.0
     manual_spin_angular_speed_rad_s: float = 0.25
     manual_spin_publish_hz: float = 20.0
-    manual_spin_direction_sign: float = -1.0
+    manual_spin_direction_sign: float = 1.0
     turn_scan_mode: str = "camera_pan"
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"

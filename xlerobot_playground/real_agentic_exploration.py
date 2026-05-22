@@ -91,6 +91,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
@@ -202,6 +203,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.ros_manual_spin_angular_speed_rad_s),
         "--ros-manual-spin-publish-hz",
         str(args.ros_manual_spin_publish_hz),
+        "--ros-manual-spin-direction-sign",
+        str(args.ros_manual_spin_direction_sign),
         "--ros-turn-scan-mode",
         args.ros_turn_scan_mode,
         "--robot-brain-url",

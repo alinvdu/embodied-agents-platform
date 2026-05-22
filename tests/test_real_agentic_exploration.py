@@ -25,6 +25,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--memory-root", translated)
         self.assertEqual(translated[translated.index("--memory-root") + 1], "./artifacts/memories")
         self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
+        self.assertEqual(translated[translated.index("--ros-manual-spin-direction-sign") + 1], "1.0")
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
         self.assertEqual(translated[translated.index("--ros-scan-active-topic") + 1], "/xlerobot/scan_active")

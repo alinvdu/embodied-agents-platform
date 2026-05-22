@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from xlerobot_agent.exploration import Pose2D
 from xlerobot_playground.ros_nav2_runtime import (
+    RosRuntimeConfig,
     RosExplorationRuntime,
     RosOccupancyMap,
     apply_occupancy_grid_update,
@@ -18,6 +19,9 @@ from xlerobot_playground.ros_nav2_runtime import (
 
 
 class RosNav2RuntimeTests(unittest.TestCase):
+    def test_local_spin_uses_nav2_yaw_sign_by_default(self) -> None:
+        self.assertEqual(RosRuntimeConfig().manual_spin_direction_sign, 1.0)
+
     def test_compute_turn_command_stops_at_target(self) -> None:
         command, done = compute_turn_command(
             requested_angular_rad_s=0.3,

@@ -148,6 +148,7 @@ class SimExplorationConfig:
     ros_turn_scan_settle_s: float = 1.0
     ros_manual_spin_angular_speed_rad_s: float = 0.25
     ros_manual_spin_publish_hz: float = 20.0
+    ros_manual_spin_direction_sign: float = 1.0
     ros_turn_scan_mode: str = "camera_pan"
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"
@@ -3356,6 +3357,7 @@ class RosExplorationSession:
                     turn_scan_settle_s=config.ros_turn_scan_settle_s,
                     manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
                     manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
+                    manual_spin_direction_sign=config.ros_manual_spin_direction_sign,
                     turn_scan_mode=config.ros_turn_scan_mode,
                     robot_brain_url=config.robot_brain_url,
                     camera_pan_action_key=config.camera_pan_action_key,
@@ -5943,6 +5945,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
@@ -6081,6 +6084,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_turn_scan_settle_s=args.ros_turn_scan_settle_s,
             ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
             ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
+            ros_manual_spin_direction_sign=args.ros_manual_spin_direction_sign,
             ros_turn_scan_mode=args.ros_turn_scan_mode,
             robot_brain_url=args.robot_brain_url,
             camera_pan_action_key=args.camera_pan_action_key,
