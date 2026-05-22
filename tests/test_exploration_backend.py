@@ -477,6 +477,78 @@ class ExplorationBackendExternalTaskTests(unittest.TestCase):
             self.assertEqual(snapshot["current_map"]["regions"][0]["purpose"], "food prep")
             self.assertEqual(snapshot["current_map"]["named_places"], [])
 
+    def test_region_waypoints_without_names_are_normalized_on_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=f"{tmpdir}/map.json",
+                    memory_root_path=f"{tmpdir}/memories",
+                    occupancy_resolution=0.25,
+                )
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="manual_regions",
+                source="operator",
+            )
+            backend.complete_external_task(
+                task["task_id"],
+                map_payload={
+                    "map_id": "manual_regions",
+                    "frame": "map",
+                    "resolution": 0.25,
+                    "coverage": 0.5,
+                    "summary": "manual region map",
+                    "approved": False,
+                    "created_at": 1.0,
+                    "source": "operator",
+                    "mode": "sim",
+                    "trajectory": [],
+                    "keyframes": [],
+                    "regions": [
+                        {
+                            "region_id": "region_kitchen",
+                            "label": "Kitchen",
+                            "confidence": 1.0,
+                            "polygon_2d": [[0.0, 0.0], [2.0, 0.0], [2.0, 1.0], [0.0, 1.0]],
+                            "centroid": {"x": 1.0, "y": 0.5},
+                            "adjacency": [],
+                            "representative_keyframes": [],
+                            "evidence": [],
+                            "default_waypoints": [{"x": 1.4, "y": 0.6, "yaw": 0.0}],
+                        }
+                    ],
+                    "named_places": [],
+                    "occupancy": {
+                        "resolution": 0.25,
+                        "bounds": {"min_x": 0.0, "max_x": 4.0, "min_y": 0.0, "max_y": 4.0},
+                        "cells": [{"x": 0.0, "y": 0.0, "state": "free"}],
+                    },
+                },
+            )
+
+            snapshot = backend.snapshot()
+            waypoint = snapshot["current_map"]["regions"][0]["default_waypoints"][0]
+            self.assertEqual(waypoint["name"], "kitchen_waypoint_1")
+            self.assertEqual(snapshot["current_map"]["named_places"][0]["name"], "kitchen_waypoint_1")
+
+            updated = backend.update_region(
+                "region_kitchen",
+                default_waypoints=[
+                    {"x": 1.5, "y": 0.7, "yaw": 0.1},
+                    {"name": "kitchen_entry", "x": 0.2, "y": 0.5, "yaw": 1.57},
+                ],
+            )
+            assert updated is not None
+            self.assertEqual(updated["default_waypoints"][0]["name"], "kitchen_waypoint_1")
+            self.assertEqual(updated["default_waypoints"][1]["name"], "kitchen_entry")
+            approved = backend.approve_current_map()
+            assert approved is not None
+            self.assertEqual(approved["named_places"][0]["name"], "kitchen_waypoint_1")
+            self.assertEqual(approved["named_places"][1]["name"], "kitchen_entry")
+
 
 if __name__ == "__main__":
     unittest.main()

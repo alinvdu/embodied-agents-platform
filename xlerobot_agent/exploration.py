@@ -568,7 +568,7 @@ class ExplorationBackend:
                 region["polygon_2d"] = [[float(x), float(y)] for x, y in polygon_2d]
                 region["centroid"] = _polygon_centroid(region["polygon_2d"])
             if default_waypoints is not None:
-                region["default_waypoints"] = [_json_pose(item) for item in default_waypoints]
+                region["default_waypoints"] = _normalize_default_waypoints(region, default_waypoints)
             self._rebuild_named_places()
             self._persist()
             return json.loads(json.dumps(region))
@@ -599,10 +599,10 @@ class ExplorationBackend:
                 "adjacency": [],
                 "representative_keyframes": [],
                 "evidence": ["manual region annotation"],
-                "default_waypoints": [_json_pose(item) for item in default_waypoints]
-                if default_waypoints is not None
-                else [],
+                "default_waypoints": [],
             }
+            if default_waypoints is not None:
+                created["default_waypoints"] = _normalize_default_waypoints(created, default_waypoints)
             if purpose:
                 created["purpose"] = str(purpose)
             self._current_map.setdefault("regions", []).append(created)
@@ -990,12 +990,13 @@ class ExplorationBackend:
             if item.get("source") in {"manual", "operator_dock_pose"}
         ]
         for region in self._current_map.get("regions", []):
+            region["default_waypoints"] = _normalize_default_waypoints(region, region.get("default_waypoints", []))
             for waypoint in region.get("default_waypoints", []):
                 if _is_auto_centroid_waypoint(region, waypoint):
                     continue
                 named_places.append(
                     {
-                        "name": waypoint["name"],
+                        "name": str(waypoint.get("name") or _default_waypoint_name(region, len(named_places) + 1)),
                         "pose": _json_pose(waypoint),
                         "region_id": region["region_id"],
                         "source": "derived",
@@ -1261,6 +1262,31 @@ def _json_pose(pose: dict[str, Any]) -> dict[str, Any]:
         "y": round(float(pose.get("y", 0.0)), 3),
         "yaw": round(float(pose.get("yaw", 0.0)), 3),
     }
+
+
+def _default_waypoint_name(region: dict[str, Any], index: int) -> str:
+    base = _slug(str(region.get("label") or region.get("region_id") or "region"))
+    return f"{base}_waypoint_{max(int(index), 1)}"
+
+
+def _normalize_default_waypoints(region: dict[str, Any], waypoints: Any) -> list[dict[str, Any]]:
+    if not isinstance(waypoints, list):
+        return []
+    normalized: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, waypoint in enumerate(waypoints, start=1):
+        if not isinstance(waypoint, dict):
+            continue
+        name = str(waypoint.get("name") or "").strip() or _default_waypoint_name(region, index)
+        if name in used_names:
+            base = _slug(name)
+            suffix = 2
+            while f"{base}_{suffix}" in used_names:
+                suffix += 1
+            name = f"{base}_{suffix}"
+        used_names.add(name)
+        normalized.append({"name": name, **_json_pose(waypoint)})
+    return normalized
 
 
 def _slug(value: str) -> str:
