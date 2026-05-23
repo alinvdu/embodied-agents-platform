@@ -412,7 +412,7 @@ Notes:
 - To reopen an existing saved environment, start this backend, open `Configure Environment`, choose a memory, and click `Load`.
 - The editable snapshot path is internal/default during normal runs; only override it when debugging storage.
 - `--memory-root` is the folder of saved long-term environments.
-- Agent visual-search commands such as `scan the kitchen for a coke can` save RGB debug shots and show them in the React Agent UI under `What Robot Saw`.
+- Agent visual-search commands such as `scan the kitchen for a coke can` save RGB debug shots and show them in the React Agent UI under `What Robot Saw`; matched objects can now be focused, RGB-D approached, and passed to the mocked `grab_object` VLA entrypoint.
 - `examples/xlerobot_exploration_review.py` is only a review-only helper for already-saved maps; it is not the normal robot exploration entrypoint.
 
 ## Exploration Review

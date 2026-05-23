@@ -189,6 +189,125 @@ def _point_cloud2_xyz_array(message: Any) -> np.ndarray:
     return np.column_stack((structured["x"], structured["y"], structured["z"])).astype(np.float32, copy=False)
 
 
+def _bbox_xyxy(value: Any) -> tuple[float, float, float, float] | None:
+    if isinstance(value, dict):
+        value = value.get("bbox_xyxy") or value.get("box") or value.get("bbox")
+    if not isinstance(value, (list, tuple)) or len(value) < 4:
+        return None
+    try:
+        x0, y0, x1, y1 = (float(value[0]), float(value[1]), float(value[2]), float(value[3]))
+    except Exception:
+        return None
+    if not all(math.isfinite(item) for item in (x0, y0, x1, y1)):
+        return None
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _scaled_bbox_window(
+    *,
+    bbox_xyxy: tuple[float, float, float, float],
+    image_width: int,
+    image_height: int,
+    cloud_width: int,
+    cloud_height: int,
+    inner_ratio: float = 0.65,
+) -> tuple[int, int, int, int]:
+    image_width = max(int(image_width), 1)
+    image_height = max(int(image_height), 1)
+    cloud_width = max(int(cloud_width), 1)
+    cloud_height = max(int(cloud_height), 1)
+    left, top, right, bottom = bbox_xyxy
+    scale_x = float(cloud_width) / float(image_width)
+    scale_y = float(cloud_height) / float(image_height)
+    left *= scale_x
+    right *= scale_x
+    top *= scale_y
+    bottom *= scale_y
+    ratio = clamp(float(inner_ratio), 0.2, 1.0)
+    center_x = (left + right) * 0.5
+    center_y = (top + bottom) * 0.5
+    half_w = max((right - left) * ratio * 0.5, 1.0)
+    half_h = max((bottom - top) * ratio * 0.5, 1.0)
+    x0 = int(max(math.floor(center_x - half_w), 0))
+    y0 = int(max(math.floor(center_y - half_h), 0))
+    x1 = int(min(math.ceil(center_x + half_w), cloud_width - 1))
+    y1 = int(min(math.ceil(center_y + half_h), cloud_height - 1))
+    if x1 <= x0:
+        x1 = min(x0 + 1, cloud_width - 1)
+    if y1 <= y0:
+        y1 = min(y0 + 1, cloud_height - 1)
+    return x0, y0, x1, y1
+
+
+def _point_dict(point: np.ndarray) -> dict[str, float]:
+    return {
+        "x": round(float(point[0]), 4),
+        "y": round(float(point[1]), 4),
+        "z": round(float(point[2]), 4),
+    }
+
+
+def _safe_forward_step_from_points(
+    points_base: np.ndarray,
+    *,
+    target_forward_m: float,
+    target_max_m: float,
+    max_step_m: float,
+    robot_width_m: float,
+    clearance_m: float,
+    collision_height_min_m: float,
+    collision_height_max_m: float,
+) -> dict[str, Any]:
+    desired_step = min(max(float(max_step_m), 0.0), max(float(target_forward_m) - float(target_max_m), 0.0))
+    corridor_half_width = max(float(robot_width_m) * 0.5 + float(clearance_m), 0.05)
+    if desired_step <= 1e-3:
+        return {
+            "safe": True,
+            "safe_forward_step_m": 0.0,
+            "desired_forward_step_m": round(desired_step, 3),
+            "reason": "Object is already inside the configured approach range.",
+            "corridor_half_width_m": round(corridor_half_width, 3),
+        }
+    finite = np.isfinite(points_base).all(axis=1) if points_base.size else np.zeros((0,), dtype=bool)
+    if not np.any(finite):
+        return {
+            "safe": False,
+            "safe_forward_step_m": 0.0,
+            "desired_forward_step_m": round(desired_step, 3),
+            "reason": "No valid RGB-D points are available for corridor safety.",
+            "corridor_half_width_m": round(corridor_half_width, 3),
+        }
+    points = points_base[finite]
+    obstacle_mask = (
+        (points[:, 0] > 0.05)
+        & (points[:, 0] < max(desired_step + 0.15, 0.12))
+        & (np.abs(points[:, 1]) <= corridor_half_width)
+        & (points[:, 2] >= float(collision_height_min_m))
+        & (points[:, 2] <= float(collision_height_max_m))
+    )
+    if np.any(obstacle_mask):
+        nearest = float(np.min(points[obstacle_mask, 0]))
+        return {
+            "safe": False,
+            "safe_forward_step_m": 0.0,
+            "desired_forward_step_m": round(desired_step, 3),
+            "nearest_blocker_forward_m": round(nearest, 3),
+            "reason": "RGB-D corridor check found an obstacle before the requested forward step.",
+            "corridor_half_width_m": round(corridor_half_width, 3),
+        }
+    return {
+        "safe": True,
+        "safe_forward_step_m": round(desired_step, 3),
+        "desired_forward_step_m": round(desired_step, 3),
+        "reason": "RGB-D corridor is clear for the requested small forward step.",
+        "corridor_half_width_m": round(corridor_half_width, 3),
+    }
+
+
 def ros_goal_status_label(status: int | None) -> str:
     mapping = {
         GoalStatus.STATUS_UNKNOWN: "unknown",
@@ -515,6 +634,7 @@ class RosExplorationRuntime(Node):
         self.latest_scan: LaserScan | None = None
         self.latest_scan_stats: dict[str, Any] | None = None
         self.latest_point_cloud_stats: dict[str, Any] | None = None
+        self.latest_point_cloud_snapshot: dict[str, Any] | None = None
         self.latest_imu_msg: Imu | None = None
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
@@ -708,6 +828,19 @@ class RosExplorationRuntime(Node):
             "reference_frame": reference_frame,
             "tf_ready": transform is not None,
         }
+        if transform is not None:
+            self.latest_point_cloud_snapshot = {
+                "frame_id": str(message.header.frame_id),
+                "reference_frame": reference_frame,
+                "width": int(message.width),
+                "height": int(message.height),
+                "stamp_s": time.time(),
+                "points_camera": points.copy(),
+                "points_reference": transformed_points.copy(),
+                "sensor_origin_xyz": None
+                if sensor_origin is None
+                else tuple(float(item) for item in sensor_origin),
+            }
         if transform is None or sensor_origin is None:
             return
         self.point_cloud_observations.append(
@@ -848,6 +981,151 @@ class RosExplorationRuntime(Node):
             float(translation[1]),
             yaw_from_quaternion_xyzw(rotation[0], rotation[1], rotation[2], rotation[3]),
         )
+
+    def estimate_detection_geometry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            settle_s = clamp(float(payload.get("settle_s", 0.05) or 0.05), 0.0, 0.5)
+        except Exception:
+            settle_s = 0.05
+        if settle_s > 0.0:
+            self.spin_for(settle_s)
+        snapshot = self.latest_point_cloud_snapshot
+        if not isinstance(snapshot, dict):
+            return {
+                "status": "unavailable",
+                "reason": "No latest organized RGB-D point cloud is available yet.",
+            }
+        cloud_width = int(snapshot.get("width", 0) or 0)
+        cloud_height = int(snapshot.get("height", 0) or 0)
+        if cloud_width <= 1 or cloud_height <= 1:
+            return {
+                "status": "unavailable",
+                "reason": "The latest RGB-D point cloud is not organized, so bbox depth cannot be solved.",
+                "point_cloud": {
+                    "width": cloud_width,
+                    "height": cloud_height,
+                    "frame_id": snapshot.get("frame_id"),
+                },
+            }
+        points_camera = snapshot.get("points_camera")
+        if not hasattr(points_camera, "shape") or int(points_camera.shape[0]) != cloud_width * cloud_height:
+            return {
+                "status": "unavailable",
+                "reason": "The latest RGB-D point cloud does not match its organized dimensions.",
+                "point_cloud": {
+                    "width": cloud_width,
+                    "height": cloud_height,
+                    "frame_id": snapshot.get("frame_id"),
+                },
+            }
+        bbox = _bbox_xyxy(payload.get("bbox_xyxy") or payload.get("bbox") or payload.get("detection"))
+        if bbox is None:
+            return {"status": "rejected", "reason": "bbox_xyxy is required to estimate object geometry."}
+        image_width = int(payload.get("image_width") or payload.get("width") or cloud_width)
+        image_height = int(payload.get("image_height") or payload.get("height") or cloud_height)
+        inner_ratio = clamp(float(payload.get("bbox_sample_inner_ratio", 0.65) or 0.65), 0.2, 1.0)
+        x0, y0, x1, y1 = _scaled_bbox_window(
+            bbox_xyxy=bbox,
+            image_width=image_width,
+            image_height=image_height,
+            cloud_width=cloud_width,
+            cloud_height=cloud_height,
+            inner_ratio=inner_ratio,
+        )
+        frame_id = str(snapshot.get("frame_id") or "")
+        base_transform = self._lookup_transform_xyz_quat(self.config.base_frame, frame_id)
+        map_transform = self._lookup_transform_xyz_quat(self.config.map_frame, frame_id)
+        if base_transform is None:
+            return {
+                "status": "unavailable",
+                "reason": f"Could not transform RGB-D points from `{frame_id}` to `{self.config.base_frame}`.",
+                "bbox_xyxy": [round(item, 3) for item in bbox],
+            }
+        base_translation, base_quaternion = base_transform
+        base_rotation = _quaternion_rotation_matrix(*base_quaternion)
+        points_base = (points_camera @ base_rotation.T + base_translation.reshape(1, 3)).astype(np.float32, copy=False)
+        points_map = None
+        if map_transform is not None:
+            map_translation, map_quaternion = map_transform
+            map_rotation = _quaternion_rotation_matrix(*map_quaternion)
+            points_map = (points_camera @ map_rotation.T + map_translation.reshape(1, 3)).astype(np.float32, copy=False)
+
+        base_grid = points_base.reshape((cloud_height, cloud_width, 3))
+        sample_base = base_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
+        finite = np.isfinite(sample_base).all(axis=1) if sample_base.size else np.zeros((0,), dtype=bool)
+        max_depth_m = clamp(float(payload.get("max_depth_m", 4.0) or 4.0), 0.2, 12.0)
+        valid = finite & (sample_base[:, 0] > 0.05) & (sample_base[:, 0] <= max_depth_m)
+        min_points = max(int(payload.get("min_valid_points", 12) or 12), 1)
+        if int(np.count_nonzero(valid)) < min_points and inner_ratio < 1.0:
+            x0, y0, x1, y1 = _scaled_bbox_window(
+                bbox_xyxy=bbox,
+                image_width=image_width,
+                image_height=image_height,
+                cloud_width=cloud_width,
+                cloud_height=cloud_height,
+                inner_ratio=1.0,
+            )
+            sample_base = base_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
+            finite = np.isfinite(sample_base).all(axis=1) if sample_base.size else np.zeros((0,), dtype=bool)
+            valid = finite & (sample_base[:, 0] > 0.05) & (sample_base[:, 0] <= max_depth_m)
+        valid_count = int(np.count_nonzero(valid))
+        if valid_count < min_points:
+            return {
+                "status": "not_found",
+                "reason": f"Only {valid_count} valid depth samples were found inside the detection bbox.",
+                "bbox_xyxy": [round(item, 3) for item in bbox],
+                "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                "point_cloud": {"width": cloud_width, "height": cloud_height, "frame_id": frame_id},
+                "valid_sample_count": valid_count,
+            }
+
+        object_base = np.median(sample_base[valid], axis=0)
+        object_map = None
+        if points_map is not None:
+            map_grid = points_map.reshape((cloud_height, cloud_width, 3))
+            sample_map = map_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
+            if sample_map.shape[0] == sample_base.shape[0]:
+                object_map = np.median(sample_map[valid], axis=0)
+        forward_m = float(object_base[0])
+        lateral_m = float(object_base[1])
+        vertical_m = float(object_base[2])
+        range_m = math.sqrt(forward_m * forward_m + lateral_m * lateral_m + vertical_m * vertical_m)
+        target_max_m = clamp(float(payload.get("target_max_m", 0.45) or 0.45), 0.1, 2.0)
+        safety = _safe_forward_step_from_points(
+            points_base,
+            target_forward_m=forward_m,
+            target_max_m=target_max_m,
+            max_step_m=clamp(float(payload.get("max_step_m", 0.08) or 0.08), 0.0, 0.35),
+            robot_width_m=clamp(float(payload.get("robot_width_m", 0.459) or 0.459), 0.1, 1.2),
+            clearance_m=clamp(float(payload.get("clearance_m", 0.06) or 0.06), 0.0, 0.5),
+            collision_height_min_m=float(payload.get("collision_height_min_m", -0.05) or -0.05),
+            collision_height_max_m=float(payload.get("collision_height_max_m", 0.85) or 0.85),
+        )
+        current_pose = self.current_pose()
+        return {
+            "status": "succeeded",
+            "reason": "Detection bbox was grounded with the latest organized RGB-D point cloud.",
+            "bbox_xyxy": [round(item, 3) for item in bbox],
+            "image_size": {"width": image_width, "height": image_height},
+            "point_cloud": {
+                "width": cloud_width,
+                "height": cloud_height,
+                "frame_id": frame_id,
+                "reference_frame": snapshot.get("reference_frame"),
+                "age_s": round(max(time.time() - float(snapshot.get("stamp_s", time.time())), 0.0), 3),
+            },
+            "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "valid_sample_count": valid_count,
+            "estimated_pose_base": _point_dict(object_base),
+            "estimated_pose_map": None if object_map is None else _point_dict(object_map),
+            "current_pose": None if current_pose is None else current_pose.to_dict(),
+            "distance_m": round(range_m, 3),
+            "forward_m": round(forward_m, 3),
+            "lateral_m": round(lateral_m, 3),
+            "vertical_m": round(vertical_m, 3),
+            "bearing_error_deg": round(math.degrees(math.atan2(lateral_m, max(forward_m, 1e-6))), 2),
+            "safety": safety,
+        }
 
     def _lookup_transform_xyz_quat(self, target_frame: str, source_frame: str) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
         try:

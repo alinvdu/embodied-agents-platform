@@ -73,10 +73,14 @@ Agent navigation uses the same exploration backend calls as the UI:
 - `navigate_to_waypoint` posts to `/api/nav/waypoint`
 - `relocalize_here` posts to `/api/nav/relocalize`
 - `execute_region_exploration_plan` posts to `/api/nav/capture_rgb` after each shot alignment and saves RGB frames under `artifacts/agent_runs/<run_id>/vision_report/`
+- If the agent backend starts with `--object-detector-provider replicate_grounding_dino`, each saved shot is sent to Replicate Grounding DINO using the requested `object_label`; the scan stops early when `detection_status` is `matched`.
+- After a match, `focus_detected_object` keeps recapturing RGB and rotating until the bbox is centered.
+- `approach_detected_object` posts to `/api/nav/estimate_detection_geometry`, which solves bbox distance from the latest organized RGB-D point cloud in the exploration backend, then moves forward through tiny `micro_adjust_to_pose` steps.
+- `grab_object` is currently a mocked VLA entrypoint.
 
 Keep `real_agentic_exploration` running with a loaded environment and an active nav session when you want those agent tools to move the robot.
 
-When a command such as `scan the kitchen for a coke can` runs, the Agent screen shows the saved RGB frames in the `What Robot Saw` panel. Object recognition is still a separate next step; the current report is for debugging what the robot saw.
+When a command such as `scan the kitchen for a coke can` runs, the Agent screen shows the saved RGB frames and detection status in the `What Robot Saw` panel.
 
 Default backend targets:
 

@@ -4205,6 +4205,52 @@ class RosExplorationSession:
             self.guardrail_events.append({"type": "rgb_capture", "result": {key: value for key, value in result.items() if key != "image_data_url"}})
             return result
 
+    def capture_rgbd_snapshot(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        rgb = self.capture_rgb_snapshot(payload)
+        snapshot = getattr(self.runtime, "latest_point_cloud_stats", None)
+        rgbd_status = "succeeded" if rgb.get("status") == "succeeded" and isinstance(snapshot, dict) else "unavailable"
+        result = {
+            **rgb,
+            "status": rgbd_status,
+            "reason": (
+                rgb.get("reason")
+                if rgbd_status == "succeeded"
+                else "RGB image or organized RGB-D point cloud is not available from the active ROS runtime yet."
+            ),
+            "rgbd": {
+                "status": "available" if isinstance(snapshot, dict) else "unavailable",
+                "point_cloud": snapshot if isinstance(snapshot, dict) else None,
+                "note": "Depth geometry is solved server-side with /api/nav/estimate_detection_geometry.",
+            },
+        }
+        self.guardrail_events.append(
+            {
+                "type": "rgbd_capture",
+                "result": {key: value for key, value in result.items() if key != "image_data_url"},
+            }
+        )
+        return result
+
+    def estimate_detection_geometry(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        with self._lock:
+            self.last_error = None
+            estimate = getattr(self.runtime, "estimate_detection_geometry", None)
+            if not callable(estimate):
+                return {
+                    "status": "unavailable",
+                    "reason": "The active ROS runtime does not support RGB-D detection geometry estimation.",
+                }
+            try:
+                result = estimate(payload)
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "reason": f"RGB-D detection geometry estimation failed: {exc}",
+                }
+            self.guardrail_events.append({"type": "detection_geometry", "result": result})
+            return result
+
     def navigate_to_manual_waypoint(self, pose_payload: dict[str, Any]) -> dict[str, Any]:
         with self._lock:
             self._sync_manual_occupancy_edits()
@@ -5578,6 +5624,8 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         relocalizer: Callable[[], dict[str, Any]] | None = None,
         local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rgbd_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        detection_geometry_estimator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -5589,6 +5637,8 @@ class _GatedExplorationUIController(LocalExplorationUIController):
             relocalizer=relocalizer,
             local_motion_executor=local_motion_executor,
             rgb_capturer=rgb_capturer,
+            rgbd_capturer=rgbd_capturer,
+            detection_geometry_estimator=detection_geometry_estimator,
             navigation_session_starter=navigation_session_starter,
             navigation_session_stopper=navigation_session_stopper,
         )
@@ -5765,6 +5815,32 @@ class ExplorationRunner:
         if not callable(capture):
             return {"status": "unavailable", "reason": "The active session does not support RGB capture."}
         return capture(payload)
+
+    def capture_rgbd_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        capture = getattr(session, "capture_rgbd_snapshot", None)
+        if not callable(capture):
+            return {"status": "unavailable", "reason": "The active session does not support RGB-D capture."}
+        return capture(payload)
+
+    def estimate_detection_geometry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        estimate = getattr(session, "estimate_detection_geometry", None)
+        if not callable(estimate):
+            return {"status": "unavailable", "reason": "The active session does not support RGB-D detection geometry."}
+        return estimate(payload)
 
     def perform_manual_scan(self) -> dict[str, Any]:
         with self._active_session_lock:
@@ -6146,6 +6222,8 @@ def main(argv: list[str] | None = None) -> int:
                 relocalizer=runner.relocalize_here,
                 local_motion_executor=runner.execute_local_motion,
                 rgb_capturer=runner.capture_rgb_snapshot,
+                rgbd_capturer=runner.capture_rgbd_snapshot,
+                detection_geometry_estimator=runner.estimate_detection_geometry,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )
@@ -6158,6 +6236,8 @@ def main(argv: list[str] | None = None) -> int:
                 relocalizer=runner.relocalize_here,
                 local_motion_executor=runner.execute_local_motion,
                 rgb_capturer=runner.capture_rgb_snapshot,
+                rgbd_capturer=runner.capture_rgbd_snapshot,
+                detection_geometry_estimator=runner.estimate_detection_geometry,
                 navigation_session_starter=runner.start_navigation_session,
                 navigation_session_stopper=runner.stop_navigation_session,
             )

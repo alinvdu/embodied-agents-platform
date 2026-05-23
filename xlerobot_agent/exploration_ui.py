@@ -108,6 +108,12 @@ class ExplorationUIController(Protocol):
     def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def capture_rgbd_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
+    def estimate_detection_geometry(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
 
 class LocalExplorationUIController:
     def __init__(
@@ -120,6 +126,8 @@ class LocalExplorationUIController:
         relocalizer: Callable[[], dict[str, Any]] | None = None,
         local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        rgbd_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        detection_geometry_estimator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         navigation_session_starter: Callable[[], dict[str, Any]] | None = None,
         navigation_session_stopper: Callable[[], dict[str, Any]] | None = None,
     ) -> None:
@@ -130,6 +138,8 @@ class LocalExplorationUIController:
         self.relocalizer = relocalizer
         self.local_motion_executor = local_motion_executor
         self.rgb_capturer = rgb_capturer
+        self.rgbd_capturer = rgbd_capturer
+        self.detection_geometry_estimator = detection_geometry_estimator
         self.navigation_session_starter = navigation_session_starter
         self.navigation_session_stopper = navigation_session_stopper
 
@@ -258,6 +268,16 @@ class LocalExplorationUIController:
             return {"status": "unavailable", "reason": "No live RGB camera stream is attached to the review UI."}
         return self.rgb_capturer(payload)
 
+    def capture_rgbd_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.rgbd_capturer is None:
+            return {"status": "unavailable", "reason": "No live RGB-D camera stream is attached to the review UI."}
+        return self.rgbd_capturer(payload)
+
+    def estimate_detection_geometry(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.detection_geometry_estimator is None:
+            return {"status": "unavailable", "reason": "No live RGB-D geometry estimator is attached to the review UI."}
+        return self.detection_geometry_estimator(payload)
+
 
 class RemoteExplorationUIController:
     def __init__(self, client: OffloadClient) -> None:
@@ -366,6 +386,12 @@ class RemoteExplorationUIController:
 
     def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote RGB capture is not implemented yet."}
+
+    def capture_rgbd_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote RGB-D capture is not implemented yet."}
+
+    def estimate_detection_geometry(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote detection geometry estimation is not implemented yet."}
 
 
 HTML_PAGE = """<!doctype html>
@@ -1507,6 +1533,12 @@ class ExplorationReviewServer:
                     return
                 if self.path == "/api/nav/capture_rgb":
                     self._send_json(controller.capture_rgb_snapshot(payload=payload))
+                    return
+                if self.path == "/api/nav/capture_rgbd":
+                    self._send_json(controller.capture_rgbd_snapshot(payload=payload))
+                    return
+                if self.path == "/api/nav/estimate_detection_geometry":
+                    self._send_json(controller.estimate_detection_geometry(payload=payload))
                     return
                 if self.path == "/api/nav/local/rotate":
                     self._send_json(

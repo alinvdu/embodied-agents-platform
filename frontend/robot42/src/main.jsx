@@ -222,6 +222,13 @@ function AgentVisionReport({ shots }) {
       <div className="vision-strip">
         {shots.map((shot) => {
           const capture = shot.capture || {};
+          const detection = shot.detection || {};
+          const selected = detection.selected_detection || {};
+          const detectionLabel = detection.status === "matched"
+            ? `matched ${selected.label || detection.object_label || "object"} ${Math.round(Number(selected.confidence || 0) * 100)}%`
+            : detection.status && detection.status !== "not_configured"
+              ? `detection ${detection.status}`
+              : "";
           const src = artifactSrc(capture.artifact_url || capture.image_url);
           return (
             <div className="vision-shot" key={`${shot.stop_id}-${shot.shot_id}`}>
@@ -230,6 +237,7 @@ function AgentVisionReport({ shots }) {
                 <strong>{shot.region_label || "region"}</strong>
                 <span>{shot.stop_id} / {shot.shot_id}</span>
                 <span>{capture.status || "unknown"}</span>
+                {detectionLabel ? <span>{detectionLabel}</span> : null}
               </div>
             </div>
           );

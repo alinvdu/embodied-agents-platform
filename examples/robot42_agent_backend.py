@@ -37,6 +37,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--navigation-auto-rotate-threshold-deg", type=float, default=None)
     parser.add_argument("--backend-request-timeout-s", type=float, default=None)
     parser.add_argument("--agent-artifacts-root", default=None)
+    parser.add_argument("--object-detector-provider", choices=("none", "mock", "replicate_grounding_dino"), default=None)
+    parser.add_argument("--object-detector-api-key", default=None)
+    parser.add_argument("--object-detector-model", default=None)
+    parser.add_argument("--object-detector-model-version", default=None)
+    parser.add_argument("--object-detector-box-threshold", type=float, default=None)
+    parser.add_argument("--object-detector-text-threshold", type=float, default=None)
+    parser.add_argument("--object-detector-min-confidence", type=float, default=None)
+    parser.add_argument("--object-detector-timeout-s", type=float, default=None)
+    parser.add_argument("--object-focus-horizontal-fov-deg", type=float, default=None)
+    parser.add_argument("--object-focus-center-tolerance-norm", type=float, default=None)
+    parser.add_argument("--object-focus-max-attempts", type=int, default=None)
+    parser.add_argument("--object-approach-target-min-m", type=float, default=None)
+    parser.add_argument("--object-approach-target-max-m", type=float, default=None)
+    parser.add_argument("--object-approach-step-m", type=float, default=None)
+    parser.add_argument("--object-approach-max-attempts", type=int, default=None)
+    parser.add_argument("--object-approach-robot-width-m", type=float, default=None)
+    parser.add_argument("--object-approach-clearance-m", type=float, default=None)
     parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
     parser.add_argument("--specialist-model", default=None)
     parser.add_argument("--specialist-base-url", default=None)
@@ -63,11 +80,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Specialist model: {config.specialist_model.provider}/{config.specialist_model.model}")
     print(
         "Exposed tools: resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, "
-        "navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose"
+        "navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, "
+        "focus_detected_object, approach_detected_object, grab_object"
     )
     print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
     print(f"Agent artifacts: {config.agent_artifacts_root}")
+    print(f"Object detector: {config.object_detector_provider}")
+    print(
+        "Object approach: "
+        f"target={config.object_approach_target_min_m:g}-{config.object_approach_target_max_m:g}m, "
+        f"step={config.object_approach_step_m:g}m"
+    )
     if config.model.provider == "mock":
         print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")
     else:
@@ -124,6 +148,83 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             else config.backend_request_timeout_s
         ),
         agent_artifacts_root=args.agent_artifacts_root or config.agent_artifacts_root,
+        object_detector_provider=args.object_detector_provider or config.object_detector_provider,
+        object_detector_api_key=(
+            args.object_detector_api_key
+            if args.object_detector_api_key is not None
+            else config.object_detector_api_key
+        ),
+        object_detector_model=args.object_detector_model or config.object_detector_model,
+        object_detector_model_version=(
+            args.object_detector_model_version
+            if args.object_detector_model_version is not None
+            else config.object_detector_model_version
+        ),
+        object_detector_box_threshold=(
+            args.object_detector_box_threshold
+            if args.object_detector_box_threshold is not None
+            else config.object_detector_box_threshold
+        ),
+        object_detector_text_threshold=(
+            args.object_detector_text_threshold
+            if args.object_detector_text_threshold is not None
+            else config.object_detector_text_threshold
+        ),
+        object_detector_min_confidence=(
+            args.object_detector_min_confidence
+            if args.object_detector_min_confidence is not None
+            else config.object_detector_min_confidence
+        ),
+        object_detector_timeout_s=(
+            args.object_detector_timeout_s
+            if args.object_detector_timeout_s is not None
+            else config.object_detector_timeout_s
+        ),
+        object_focus_horizontal_fov_deg=(
+            args.object_focus_horizontal_fov_deg
+            if args.object_focus_horizontal_fov_deg is not None
+            else config.object_focus_horizontal_fov_deg
+        ),
+        object_focus_center_tolerance_norm=(
+            args.object_focus_center_tolerance_norm
+            if args.object_focus_center_tolerance_norm is not None
+            else config.object_focus_center_tolerance_norm
+        ),
+        object_focus_max_attempts=(
+            args.object_focus_max_attempts
+            if args.object_focus_max_attempts is not None
+            else config.object_focus_max_attempts
+        ),
+        object_approach_target_min_m=(
+            args.object_approach_target_min_m
+            if args.object_approach_target_min_m is not None
+            else config.object_approach_target_min_m
+        ),
+        object_approach_target_max_m=(
+            args.object_approach_target_max_m
+            if args.object_approach_target_max_m is not None
+            else config.object_approach_target_max_m
+        ),
+        object_approach_step_m=(
+            args.object_approach_step_m
+            if args.object_approach_step_m is not None
+            else config.object_approach_step_m
+        ),
+        object_approach_max_attempts=(
+            args.object_approach_max_attempts
+            if args.object_approach_max_attempts is not None
+            else config.object_approach_max_attempts
+        ),
+        object_approach_robot_width_m=(
+            args.object_approach_robot_width_m
+            if args.object_approach_robot_width_m is not None
+            else config.object_approach_robot_width_m
+        ),
+        object_approach_clearance_m=(
+            args.object_approach_clearance_m
+            if args.object_approach_clearance_m is not None
+            else config.object_approach_clearance_m
+        ),
     )
 
 

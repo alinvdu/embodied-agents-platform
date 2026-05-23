@@ -30,6 +30,7 @@ from .home_memory import (
 )
 from .memory_discovery import EnvironmentMemoryDiscovery
 from .llm import AgentLLMRouter, AgentModelSuite, ModelConfig
+from .object_detection import ObjectDetectorConfig, detect_object_in_image
 from .perception_service import execute_perception_tool
 
 
@@ -65,6 +66,23 @@ class HomeAgentConfig:
     navigation_auto_rotate_threshold_deg: float = 45.0
     backend_request_timeout_s: float = 120.0
     agent_artifacts_root: str = "artifacts/agent_runs"
+    object_detector_provider: str = "none"
+    object_detector_api_key: str | None = None
+    object_detector_model: str = "adirik/grounding-dino"
+    object_detector_model_version: str | None = None
+    object_detector_box_threshold: float = 0.25
+    object_detector_text_threshold: float = 0.25
+    object_detector_min_confidence: float = 0.25
+    object_detector_timeout_s: float = 90.0
+    object_focus_horizontal_fov_deg: float = 65.0
+    object_focus_center_tolerance_norm: float = 0.08
+    object_focus_max_attempts: int = 5
+    object_approach_target_min_m: float = 0.35
+    object_approach_target_max_m: float = 0.45
+    object_approach_step_m: float = 0.08
+    object_approach_max_attempts: int = 12
+    object_approach_robot_width_m: float = 0.459
+    object_approach_clearance_m: float = 0.06
 
 
 @dataclass
@@ -106,6 +124,8 @@ class HomeAgentToolRuntime:
         self.run_id = run_id or f"manual_{int(time.time())}"
         self.current_pose = self._initial_pose()
         self.stopped = False
+        self.detection_tracking: dict[str, dict[str, Any]] = {}
+        self.selected_detection_id: str | None = None
 
     def preview_path_to_pose(
         self,
@@ -242,6 +262,7 @@ class HomeAgentToolRuntime:
         executed_stops: list[dict[str, Any]] = []
         captured_shot_count = 0
         saved_rgb_count = 0
+        selected_detection: dict[str, Any] | None = None
         for stop_index, stop in enumerate(plan.get("stops", []), start=1):
             if not isinstance(stop, dict) or not isinstance(stop.get("pose"), dict):
                 continue
@@ -331,8 +352,57 @@ class HomeAgentToolRuntime:
                 shot_execution["capture"] = capture
                 if capture.get("status") == "succeeded":
                     saved_rgb_count += 1
+                    detection = self._detect_object_in_capture(
+                        object_label=object_label,
+                        shot_id=shot_id,
+                        capture=capture,
+                    )
+                    shot_execution["detection"] = detection
+                    if detection.get("status") == "matched":
+                        selected_detection = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else None
+                        result = {
+                            "tool": "execute_region_exploration_plan",
+                            "status": "object_found",
+                            "region_label": region_label,
+                            "object_label": object_label,
+                            "reason": f"Detected `{object_label}` during shot `{shot_id}`; remaining region exploration was aborted.",
+                            "plan": plan,
+                            "stops": executed_stops,
+                            "visited_stop_count": len(executed_stops),
+                            "captured_shot_count": captured_shot_count + 1,
+                            "saved_rgb_count": saved_rgb_count,
+                            "detection_status": "matched",
+                            "selected_detection": selected_detection,
+                            "selected_detection_id": detection.get("selected_detection_id"),
+                            "detection": detection,
+                        }
+                        self.emit(
+                            "tool_executed",
+                            "Region Exploration",
+                            f"Detected `{object_label}` during region exploration; stopped the remaining shots.",
+                            result,
+                        )
+                        return result
+                    if detection.get("status") in {"failed", "unavailable"}:
+                        result = {
+                            "tool": "execute_region_exploration_plan",
+                            "status": "blocked",
+                            "region_label": region_label,
+                            "object_label": object_label,
+                            "reason": detection.get("reason") or f"Object detection returned `{detection.get('status')}`.",
+                            "plan": plan,
+                            "stops": executed_stops,
+                            "visited_stop_count": len(executed_stops),
+                            "captured_shot_count": captured_shot_count + 1,
+                            "saved_rgb_count": saved_rgb_count,
+                            "detection_status": str(detection.get("status") or "failed"),
+                            "detection": detection,
+                        }
+                        self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+                        return result
                 captured_shot_count += 1
 
+        detection_status = _aggregate_detection_status(executed_stops, object_label)
         result = {
             "tool": "execute_region_exploration_plan",
             "status": "succeeded",
@@ -343,8 +413,9 @@ class HomeAgentToolRuntime:
             "visited_stop_count": len(executed_stops),
             "captured_shot_count": captured_shot_count,
             "saved_rgb_count": saved_rgb_count,
-            "detection_status": "not_configured",
-            "reason": "Region exploration motion completed; object detection is not wired yet.",
+            "detection_status": detection_status,
+            "selected_detection": selected_detection,
+            "reason": _region_exploration_result_reason(detection_status),
         }
         self.emit(
             "tool_executed",
@@ -356,6 +427,56 @@ class HomeAgentToolRuntime:
             result,
         )
         return result
+
+    def _detect_object_in_capture(
+        self,
+        *,
+        object_label: str,
+        shot_id: str,
+        capture: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not object_label.strip():
+            return {
+                "status": "skipped",
+                "object_label": object_label,
+                "shot_id": shot_id,
+                "reason": "No object label was requested for this shot.",
+            }
+        image_path = capture.get("image_path")
+        if not isinstance(image_path, str) or not image_path:
+            return {
+                "status": "failed",
+                "object_label": object_label,
+                "shot_id": shot_id,
+                "reason": "Capture succeeded but did not include an image path for detection.",
+            }
+        try:
+            data_url = _image_file_to_data_url(
+                Path(image_path),
+                str(capture.get("mime_type") or "image/png"),
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "object_label": object_label,
+                "shot_id": shot_id,
+                "reason": f"Could not prepare captured image for object detection: {exc}",
+            }
+        detection = detect_object_in_image(
+            config=_object_detector_config(self.config),
+            image_data_url=data_url,
+            object_label=object_label,
+            shot_id=shot_id,
+            image_path=image_path,
+        )
+        if detection.get("status") == "matched":
+            self._track_detection_result(
+                object_label=object_label,
+                detection=detection,
+                capture=capture,
+            )
+        _record_capture_detection(config=self.config, run_id=self.run_id, capture=capture, detection=detection)
+        return detection
 
     def _align_to_region_exploration_shot(
         self,
@@ -461,6 +582,524 @@ class HomeAgentToolRuntime:
             "backend_url": self.config.exploration_backend_url,
             **saved,
         }
+
+    def focus_detected_object(
+        self,
+        *,
+        detection_id: str = "",
+        object_label: str = "",
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        constraints = constraints or {}
+        state = self._resolve_detection_state(detection_id=detection_id, object_label=object_label)
+        label = object_label or str(state.get("object_label") or "")
+        if not label.strip():
+            result = {
+                "tool": "focus_detected_object",
+                "status": "blocked",
+                "reason": "No object label or tracked detection is available to focus.",
+            }
+            self.emit("tool_blocked", "Focus Object", result["reason"], result)
+            return result
+        attempts: list[dict[str, Any]] = []
+        max_attempts = int(_bounded_float(
+            constraints.get("max_attempts", self.config.object_focus_max_attempts),
+            self.config.object_focus_max_attempts,
+            minimum=1,
+            maximum=12,
+        ))
+        tolerance = _bounded_float(
+            constraints.get("center_tolerance_norm", self.config.object_focus_center_tolerance_norm),
+            self.config.object_focus_center_tolerance_norm,
+            minimum=0.01,
+            maximum=0.5,
+        )
+        for attempt_index in range(1, max_attempts + 1):
+            capture = self._capture_rgb_for_object_tool(
+                tool_name="focus_detected_object",
+                object_label=label,
+                attempt_index=attempt_index,
+            )
+            if capture.get("status") != "succeeded":
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "reason": capture.get("reason") or "RGB capture failed while focusing the object.",
+                    "attempts": attempts,
+                    "capture": capture,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+            detection = self._detect_object_in_capture(
+                object_label=label,
+                shot_id=str(capture.get("shot_id") or f"focus_{attempt_index}"),
+                capture=capture,
+            )
+            attempt: dict[str, Any] = {
+                "attempt": attempt_index,
+                "capture": capture,
+                "detection": detection,
+            }
+            attempts.append(attempt)
+            if detection.get("status") != "matched":
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "object_lost",
+                    "object_label": label,
+                    "reason": detection.get("reason") or "Object was not detected during focus.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+            selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
+            center = _detection_center_error(selected, capture)
+            attempt["center"] = center
+            if center.get("status") != "succeeded":
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "reason": center.get("reason") or "Detection bbox could not be centered.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+            if abs(float(center["error_norm"])) <= tolerance:
+                state = self._resolve_detection_state(
+                    detection_id=str(detection.get("selected_detection_id") or ""),
+                    object_label=label,
+                )
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "succeeded",
+                    "object_label": label,
+                    "detection_id": state.get("detection_id") or detection.get("selected_detection_id"),
+                    "selected_detection": selected,
+                    "center_error_norm": center["error_norm"],
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": "Object is centered in the camera view.",
+                }
+                self.emit("tool_executed", "Focus Object", result["reason"], result)
+                return result
+            rotation = self.rotate_by(
+                delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
+                reason=f"Center `{label}` in the camera before approach.",
+            )
+            attempt["rotation"] = rotation
+            if rotation.get("status") not in {"succeeded", "partial"}:
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "reason": rotation.get("reason") or "Focus rotation failed.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+        result = {
+            "tool": "focus_detected_object",
+            "status": "partial",
+            "object_label": label,
+            "reason": "Focus attempts ended before the detection reached the center tolerance.",
+            "attempts": attempts,
+        }
+        self.emit("tool_blocked", "Focus Object", result["reason"], result)
+        return result
+
+    def approach_detected_object(
+        self,
+        *,
+        detection_id: str = "",
+        object_label: str = "",
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        constraints = constraints or {}
+        state = self._resolve_detection_state(detection_id=detection_id, object_label=object_label)
+        label = object_label or str(state.get("object_label") or "")
+        if not label.strip():
+            result = {
+                "tool": "approach_detected_object",
+                "status": "blocked",
+                "reason": "No object label or tracked detection is available to approach.",
+            }
+            self.emit("tool_blocked", "Approach Object", result["reason"], result)
+            return result
+        target_min_m = _bounded_float(
+            constraints.get("target_min_m", self.config.object_approach_target_min_m),
+            self.config.object_approach_target_min_m,
+            minimum=0.1,
+            maximum=2.0,
+        )
+        target_max_m = _bounded_float(
+            constraints.get("target_max_m", self.config.object_approach_target_max_m),
+            self.config.object_approach_target_max_m,
+            minimum=max(target_min_m, 0.1),
+            maximum=2.5,
+        )
+        step_m = _bounded_float(
+            constraints.get("step_m", self.config.object_approach_step_m),
+            self.config.object_approach_step_m,
+            minimum=0.02,
+            maximum=0.25,
+        )
+        max_attempts = int(_bounded_float(
+            constraints.get("max_attempts", self.config.object_approach_max_attempts),
+            self.config.object_approach_max_attempts,
+            minimum=1,
+            maximum=30,
+        ))
+        attempts: list[dict[str, Any]] = []
+        for attempt_index in range(1, max_attempts + 1):
+            capture = self._capture_rgb_for_object_tool(
+                tool_name="approach_detected_object",
+                object_label=label,
+                attempt_index=attempt_index,
+            )
+            if capture.get("status") != "succeeded":
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "reason": capture.get("reason") or "RGB capture failed during object approach.",
+                    "attempts": attempts,
+                    "capture": capture,
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            detection = self._detect_object_in_capture(
+                object_label=label,
+                shot_id=str(capture.get("shot_id") or f"approach_{attempt_index}"),
+                capture=capture,
+            )
+            attempt: dict[str, Any] = {
+                "attempt": attempt_index,
+                "capture": capture,
+                "detection": detection,
+            }
+            attempts.append(attempt)
+            if detection.get("status") != "matched":
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "object_lost",
+                    "object_label": label,
+                    "reason": detection.get("reason") or "Object was lost during approach.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
+            geometry = self._estimate_detection_geometry(
+                detection=selected,
+                capture=capture,
+                constraints={
+                    **constraints,
+                    "target_max_m": target_max_m,
+                    "max_step_m": step_m,
+                },
+            )
+            attempt["geometry"] = geometry
+            if geometry.get("status") != "succeeded":
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "reason": geometry.get("reason") or "Could not solve detection depth.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
+            bearing_error_deg = float(geometry.get("bearing_error_deg", 0.0) or 0.0)
+            bearing_tolerance_deg = _bounded_float(
+                constraints.get("bearing_tolerance_deg", 6.0),
+                6.0,
+                minimum=1.0,
+                maximum=30.0,
+            )
+            if abs(bearing_error_deg) > bearing_tolerance_deg:
+                rotation = self.rotate_by(
+                    delta_yaw_deg=max(min(bearing_error_deg, 12.0), -12.0),
+                    reason=f"Center `{label}` from RGB-D bearing before forward approach.",
+                )
+                attempt["rotation"] = rotation
+                if rotation.get("status") not in {"succeeded", "partial"}:
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "reason": rotation.get("reason") or "Approach bearing rotation failed.",
+                        "attempts": attempts,
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+                continue
+            if target_min_m <= forward_m <= target_max_m:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "succeeded",
+                    "object_label": label,
+                    "detection_id": detection.get("selected_detection_id"),
+                    "selected_detection": selected,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": f"Object is within grasp staging range ({forward_m:.2f} m).",
+                }
+                self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
+                self.emit("tool_executed", "Approach Object", result["reason"], result)
+                return result
+            if forward_m < target_min_m:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "too_close",
+                    "object_label": label,
+                    "detection_id": detection.get("selected_detection_id"),
+                    "selected_detection": selected,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": f"Object is closer than the minimum grasp staging distance ({forward_m:.2f} m).",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            safety = geometry.get("safety") if isinstance(geometry.get("safety"), dict) else {}
+            if not bool(safety.get("safe", False)):
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": safety.get("reason") or "RGB-D corridor safety blocked the forward approach step.",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            forward_step = min(float(safety.get("safe_forward_step_m", step_m) or 0.0), step_m, max(forward_m - target_max_m, 0.0))
+            if forward_step <= 0.01:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "partial",
+                    "object_label": label,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": "Object is just outside range, but the safe forward step is too small.",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            target_pose = _pose_forward_step(self.current_pose, forward_step)
+            motion = self.micro_adjust_to_pose(
+                x=target_pose["x"],
+                y=target_pose["y"],
+                yaw=target_pose["yaw"],
+                max_distance_m=max(forward_step + 0.04, 0.08),
+                reason=f"Closed-loop visual approach toward `{label}` by {forward_step:.2f} m.",
+            )
+            attempt["motion"] = motion
+            if motion.get("status") not in {"succeeded", "partial"}:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": motion.get("reason") or "Forward visual-servo approach step failed.",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+        result = {
+            "tool": "approach_detected_object",
+            "status": "partial",
+            "object_label": label,
+            "reason": "Approach loop reached max attempts before grasp staging range.",
+            "attempts": attempts,
+        }
+        self.emit("tool_blocked", "Approach Object", result["reason"], result)
+        return result
+
+    def grab_object(
+        self,
+        *,
+        object_label: str,
+        detection_id: str = "",
+        object_description: str = "",
+        constraints: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        state = self._resolve_detection_state(detection_id=detection_id, object_label=object_label)
+        result = {
+            "tool": "grab_object",
+            "status": "mock_succeeded",
+            "object_label": object_label,
+            "detection_id": state.get("detection_id") or detection_id or self.selected_detection_id,
+            "object_description": object_description,
+            "constraints": constraints or {},
+            "detection_state": state or None,
+            "reason": "Mock grab_object completed. This is the future VLA skill entrypoint.",
+        }
+        self.emit("tool_executed", "Grab Object Mock", result["reason"], result)
+        return result
+
+    def _capture_rgb_for_object_tool(self, *, tool_name: str, object_label: str, attempt_index: int) -> dict[str, Any]:
+        shot_id = _safe_artifact_name(f"{tool_name}_{object_label}_{attempt_index}_{int(time.time() * 1000)}")
+        response = _post_exploration_backend(
+            self.config,
+            "/api/nav/capture_rgb",
+            {
+                "reason": tool_name,
+                "object_label": object_label,
+                "shot_id": shot_id,
+                "settle_s": 0.08,
+            },
+        )
+        data_url = response.get("image_data_url")
+        if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
+            return {
+                "status": str(response.get("status") or "unavailable"),
+                "reason": response.get("reason") or "Exploration backend did not return an RGB image.",
+                "backend_url": self.config.exploration_backend_url,
+                "captured_at": response.get("captured_at"),
+                "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+                "shot_id": shot_id,
+            }
+        metadata = {
+            "run_id": self.run_id,
+            "object_label": object_label,
+            "shot_id": shot_id,
+            "reason": tool_name,
+            "current_pose": _json_pose(self.current_pose),
+            "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+            "captured_at": response.get("captured_at") or time.time(),
+            "backend_url": self.config.exploration_backend_url,
+        }
+        try:
+            saved = _save_rgb_capture_artifact(
+                config=self.config,
+                run_id=self.run_id,
+                file_stem=shot_id,
+                data_url=data_url,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": f"RGB image was received but could not be saved: {exc}",
+                "backend_url": self.config.exploration_backend_url,
+                "captured_at": metadata.get("captured_at"),
+                "robot_pose": metadata.get("robot_pose"),
+                "shot_id": shot_id,
+            }
+        return {
+            "status": "succeeded",
+            "reason": "RGB object-tool shot saved.",
+            "shot_id": shot_id,
+            "backend_url": self.config.exploration_backend_url,
+            **saved,
+        }
+
+    def _estimate_detection_geometry(
+        self,
+        *,
+        detection: dict[str, Any],
+        capture: dict[str, Any],
+        constraints: dict[str, Any],
+    ) -> dict[str, Any]:
+        bbox = detection.get("bbox_xyxy")
+        if not isinstance(bbox, list):
+            return {"status": "rejected", "reason": "Detection did not include bbox_xyxy."}
+        image_width = capture.get("image_width")
+        image_height = capture.get("image_height")
+        bbox_payload = bbox
+        try:
+            if image_width and image_height:
+                bbox_payload = list(
+                    _bbox_to_pixel_xyxy(
+                        [float(item) for item in bbox[:4]],
+                        image_width=float(image_width),
+                        image_height=float(image_height),
+                    )
+                )
+        except Exception:
+            bbox_payload = bbox
+        response = _post_exploration_backend(
+            self.config,
+            "/api/nav/estimate_detection_geometry",
+            {
+                "bbox_xyxy": bbox_payload,
+                "image_width": image_width,
+                "image_height": image_height,
+                "target_max_m": constraints.get("target_max_m", self.config.object_approach_target_max_m),
+                "max_step_m": constraints.get("max_step_m", self.config.object_approach_step_m),
+                "robot_width_m": constraints.get("robot_width_m", self.config.object_approach_robot_width_m),
+                "clearance_m": constraints.get("clearance_m", self.config.object_approach_clearance_m),
+                "object_label": detection.get("label") or capture.get("object_label"),
+                "detection_id": detection.get("detection_id"),
+            },
+        )
+        return response if isinstance(response, dict) else {"status": "failed", "reason": "Geometry endpoint response was invalid."}
+
+    def _track_detection_result(
+        self,
+        *,
+        object_label: str,
+        detection: dict[str, Any],
+        capture: dict[str, Any],
+        geometry: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
+        detection_id = str(
+            selected.get("tracking_id")
+            or selected.get("detection_id")
+            or detection.get("selected_detection_id")
+            or f"det_{uuid.uuid4().hex[:10]}"
+        )
+        selected["tracking_id"] = detection_id
+        selected["detection_id"] = str(selected.get("detection_id") or detection_id)
+        detection["selected_detection"] = selected
+        detection["selected_detection_id"] = detection_id
+        state = {
+            "detection_id": detection_id,
+            "object_label": object_label,
+            "updated_at": time.time(),
+            "selected_detection": selected,
+            "detection": detection,
+            "capture": {
+                key: capture.get(key)
+                for key in (
+                    "image_path",
+                    "metadata_path",
+                    "artifact_url",
+                    "metadata_url",
+                    "shot_id",
+                    "captured_at",
+                    "robot_pose",
+                    "current_pose",
+                    "image_width",
+                    "image_height",
+                )
+                if capture.get(key) is not None
+            },
+            "geometry": geometry,
+        }
+        self.detection_tracking[detection_id] = state
+        self.selected_detection_id = detection_id
+        return state
+
+    def _resolve_detection_state(self, *, detection_id: str = "", object_label: str = "") -> dict[str, Any]:
+        if detection_id and detection_id in self.detection_tracking:
+            return dict(self.detection_tracking[detection_id])
+        if self.selected_detection_id and self.selected_detection_id in self.detection_tracking:
+            state = self.detection_tracking[self.selected_detection_id]
+            if not object_label or str(state.get("object_label") or "").lower() == object_label.lower():
+                return dict(state)
+        if object_label:
+            for state in reversed(list(self.detection_tracking.values())):
+                if str(state.get("object_label") or "").lower() == object_label.lower():
+                    return dict(state)
+        return {}
 
     def navigate_to_waypoint(
         self,
@@ -1160,6 +1799,40 @@ class HomeTaskAgent:
                 )
             )
 
+        @function_tool
+        def focus_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
+            """Closed-loop visual servo: recapture, redetect, and rotate until the detected object is centered."""
+            return json.dumps(
+                runtime.focus_detected_object(
+                    detection_id=detection_id,
+                    object_label=object_label,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def approach_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
+            """Closed-loop RGB-D approach: redetect, solve depth, move a tiny safe step, and repeat until grasp range."""
+            return json.dumps(
+                runtime.approach_detected_object(
+                    detection_id=detection_id,
+                    object_label=object_label,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
+        @function_tool
+        def grab_object(object_label: str, detection_id: str = "", object_description: str = "", constraints_json: str = "{}") -> str:
+            """Mock VLA grasp entrypoint for a focused object at grasp staging range."""
+            return json.dumps(
+                runtime.grab_object(
+                    object_label=object_label,
+                    detection_id=detection_id,
+                    object_description=object_description,
+                    constraints=_loads_object(constraints_json),
+                )
+            )
+
         agent = Agent(
             name="NavigationAgent",
             instructions=self._agent_instructions(memory),
@@ -1174,6 +1847,9 @@ class HomeTaskAgent:
                 rotate_by,
                 rotate_towards_point,
                 micro_adjust_to_pose,
+                focus_detected_object,
+                approach_detected_object,
+                grab_object,
             ],
         )
         result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
@@ -1186,7 +1862,7 @@ class HomeTaskAgent:
                 "You are Robot42's HomeTaskAgent.",
                 "For navigation commands, act as the NavigationAgent delegated by HomeTaskAgent.",
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
-                "Available navigation tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, and micro_adjust_to_pose.",
+                "Available tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, focus_detected_object, approach_detected_object, and grab_object.",
                 "Navigation model:",
                 "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
                 f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
@@ -1195,9 +1871,13 @@ class HomeTaskAgent:
                 "- Nav2 can be noisy for pure rotations, 180-degree turns, very close targets, and recovery after failed to make progress.",
                 "- Local motion tools are bounded backend-controlled motions. Use them for orientation, tiny final corrections, or recovery, not for long navigation.",
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
-                "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, and saves RGB debug shots. Object detection is not wired yet, so never claim an object was found from it.",
+                "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
+                "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
+                "- focus_detected_object recaptures RGB, redetects the object, and uses bounded rotation to center it.",
+                "- approach_detected_object recaptures RGB, redetects the object, solves bbox depth with RGB-D on the backend, moves only tiny safe forward steps, and repeats until the object is 0.35-0.45m away.",
+                "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
-                "For object-search commands such as `find Coke in the kitchen`, call execute_region_exploration_plan for that region and object label. Summarize the stops/shots executed and clearly say detection is not configured yet.",
+                "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
                 f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
@@ -1205,7 +1885,7 @@ class HomeTaskAgent:
                 "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
                 "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "If the target is within 0.5m and only a small final correction remains, use micro_adjust_to_pose.",
-                "Do not call or describe perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
+                "Do not call or describe unrelated perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
                 "Do not infer a navigation target yourself from a region shape.",
                 "Return a concise final summary of the navigation status, final/current pose, and any relocalization correction.",
                 "",
@@ -1218,7 +1898,8 @@ class HomeTaskAgent:
                 "6. If the waypoint failed, summarize status, reason, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "",
                 "Example custom horizon: resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"waypoint_horizon_m\": 1.5}').",
-                "Example object-search motion: execute_region_exploration_plan(region_label='kitchen', object_label='coke can', constraints_json='{\"max_stops\": 3, \"shots_per_stop\": 2}').",
+                "Example object-search motion: execute_region_exploration_plan(region_label='kitchen', object_label='coke can', constraints_json='{\"max_stops\": 3, \"shots_per_stop\": 2}'). If detection_status='matched', report the selected_detection label, confidence, and bbox.",
+                "Example object-grab flow: execute_region_exploration_plan(region_label='kitchen', object_label='coke can'), then focus_detected_object(detection_id=selected_detection_id, object_label='coke can'), then approach_detected_object(detection_id=selected_detection_id, object_label='coke can'), then grab_object(object_label='coke can', detection_id=selected_detection_id, object_description='detected coke can').",
                 "",
                 "Long-term home memory context:",
                 json.dumps(context, indent=2, sort_keys=True),
@@ -1593,6 +2274,26 @@ def config_from_env() -> HomeAgentConfig:
         navigation_auto_rotate_threshold_deg=float(os.getenv("ROBOT42_NAVIGATION_AUTO_ROTATE_THRESHOLD_DEG", "45")),
         backend_request_timeout_s=float(os.getenv("ROBOT42_AGENT_BACKEND_REQUEST_TIMEOUT_S", "120")),
         agent_artifacts_root=os.getenv("ROBOT42_AGENT_ARTIFACTS_ROOT", "artifacts/agent_runs"),
+        object_detector_provider=os.getenv("ROBOT42_OBJECT_DETECTOR_PROVIDER", "none"),
+        object_detector_api_key=(
+            os.getenv("ROBOT42_OBJECT_DETECTOR_API_KEY")
+            or os.getenv("REPLICATE_API_TOKEN")
+        ),
+        object_detector_model=os.getenv("ROBOT42_OBJECT_DETECTOR_MODEL", "adirik/grounding-dino"),
+        object_detector_model_version=os.getenv("ROBOT42_OBJECT_DETECTOR_MODEL_VERSION"),
+        object_detector_box_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_BOX_THRESHOLD", "0.25")),
+        object_detector_text_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD", "0.25")),
+        object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.25")),
+        object_detector_timeout_s=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TIMEOUT_S", "90")),
+        object_focus_horizontal_fov_deg=float(os.getenv("ROBOT42_OBJECT_FOCUS_HORIZONTAL_FOV_DEG", "65")),
+        object_focus_center_tolerance_norm=float(os.getenv("ROBOT42_OBJECT_FOCUS_CENTER_TOLERANCE_NORM", "0.08")),
+        object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "5")),
+        object_approach_target_min_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MIN_M", "0.35")),
+        object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
+        object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
+        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "12")),
+        object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
+        object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
     )
 
 
@@ -1968,6 +2669,175 @@ def _agent_artifacts_root(config: HomeAgentConfig) -> Path:
     return Path(config.agent_artifacts_root).expanduser()
 
 
+def _object_detector_config(config: HomeAgentConfig) -> ObjectDetectorConfig:
+    return ObjectDetectorConfig(
+        provider=config.object_detector_provider,
+        api_key=config.object_detector_api_key,
+        model=config.object_detector_model,
+        model_version=config.object_detector_model_version,
+        box_threshold=config.object_detector_box_threshold,
+        text_threshold=config.object_detector_text_threshold,
+        min_confidence=config.object_detector_min_confidence,
+        timeout_s=config.object_detector_timeout_s,
+    )
+
+
+def _image_file_to_data_url(path: Path, mime_type: str) -> str:
+    data = path.read_bytes()
+    encoded = base64.b64encode(data).decode("ascii")
+    return f"data:{mime_type or 'image/png'};base64,{encoded}"
+
+
+def _detection_center_error(detection: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any]:
+    bbox = detection.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return {"status": "failed", "reason": "Detection does not include bbox_xyxy."}
+    width = capture.get("image_width")
+    height = capture.get("image_height")
+    if not width or not height:
+        image_path = capture.get("image_path")
+        if isinstance(image_path, str):
+            size = _image_size_from_file(Path(image_path))
+            if size is not None:
+                width, height = size
+    try:
+        image_width = float(width)
+        image_height = float(height)
+        x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    except Exception:
+        return {"status": "failed", "reason": "Detection bbox or image size is invalid."}
+    if image_width <= 0.0 or image_height <= 0.0:
+        return {"status": "failed", "reason": "Image dimensions are unavailable."}
+    x0, y0, x1, y1 = _bbox_to_pixel_xyxy([x0, y0, x1, y1], image_width=image_width, image_height=image_height)
+    center_x = (x0 + x1) * 0.5
+    center_y = (y0 + y1) * 0.5
+    return {
+        "status": "succeeded",
+        "image_width": int(image_width),
+        "image_height": int(image_height),
+        "center_x": round(center_x, 3),
+        "center_y": round(center_y, 3),
+        "error_norm": round((center_x - image_width * 0.5) / (image_width * 0.5), 4),
+        "vertical_error_norm": round((center_y - image_height * 0.5) / (image_height * 0.5), 4),
+    }
+
+
+def _bbox_to_pixel_xyxy(bbox: list[float], *, image_width: float, image_height: float) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3]))
+    if max(abs(x0), abs(y0), abs(x1), abs(y1)) <= 1.5:
+        x0 *= image_width
+        x1 *= image_width
+        y0 *= image_height
+        y1 *= image_height
+    left, right = sorted((x0, x1))
+    top, bottom = sorted((y0, y1))
+    return left, top, right, bottom
+
+
+def _visual_servo_yaw_step_deg(
+    center: dict[str, Any],
+    constraints: dict[str, Any],
+    config: HomeAgentConfig,
+) -> float:
+    error_norm = float(center.get("error_norm", 0.0) or 0.0)
+    horizontal_fov_deg = _bounded_float(
+        constraints.get("horizontal_fov_deg", config.object_focus_horizontal_fov_deg),
+        config.object_focus_horizontal_fov_deg,
+        minimum=20.0,
+        maximum=120.0,
+    )
+    max_step_deg = _bounded_float(
+        constraints.get("max_yaw_step_deg", 12.0),
+        12.0,
+        minimum=1.0,
+        maximum=45.0,
+    )
+    yaw_sign = _bounded_float(constraints.get("image_yaw_sign", -1.0), -1.0, minimum=-1.0, maximum=1.0)
+    if abs(yaw_sign) < 1e-6:
+        yaw_sign = -1.0
+    delta = yaw_sign * error_norm * horizontal_fov_deg * 0.5
+    return round(max(min(delta, max_step_deg), -max_step_deg), 3)
+
+
+def _pose_forward_step(pose: dict[str, Any], distance_m: float) -> dict[str, float]:
+    yaw = float(pose.get("yaw", 0.0) or 0.0)
+    distance = float(distance_m)
+    return _json_pose(
+        {
+            "x": float(pose.get("x", 0.0) or 0.0) + distance * math.cos(yaw),
+            "y": float(pose.get("y", 0.0) or 0.0) + distance * math.sin(yaw),
+            "yaw": yaw,
+        }
+    )
+
+
+def _aggregate_detection_status(stops: list[dict[str, Any]], object_label: str) -> str:
+    if not object_label.strip():
+        return "skipped"
+    statuses = [
+        str(shot.get("detection", {}).get("status") or "")
+        for stop in stops
+        for shot in stop.get("shots", [])
+        if isinstance(shot, dict)
+    ]
+    if any(status == "matched" for status in statuses):
+        return "matched"
+    if any(status == "not_found" for status in statuses):
+        return "not_found"
+    if any(status in {"failed", "unavailable"} for status in statuses):
+        return "failed"
+    if any(status == "skipped" for status in statuses):
+        return "skipped"
+    return "not_configured"
+
+
+def _region_exploration_result_reason(detection_status: str) -> str:
+    if detection_status == "not_found":
+        return "Region exploration motion completed; no matching object was detected."
+    if detection_status == "failed":
+        return "Region exploration motion completed, but object detection failed on at least one shot."
+    if detection_status == "skipped":
+        return "Region exploration motion completed; object detection was skipped."
+    return "Region exploration motion completed; object detection is not configured."
+
+
+def _record_capture_detection(
+    *,
+    config: HomeAgentConfig,
+    run_id: str,
+    capture: dict[str, Any],
+    detection: dict[str, Any],
+) -> None:
+    metadata_path = capture.get("metadata_path")
+    if isinstance(metadata_path, str):
+        path = Path(metadata_path)
+        metadata = _load_json_file(path)
+        if isinstance(metadata, dict):
+            metadata["detection"] = detection
+            try:
+                path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+    manifest_path = _agent_artifacts_root(config) / run_id / "vision_report" / "manifest.json"
+    manifest = _load_json_file(manifest_path)
+    if not isinstance(manifest, dict):
+        return
+    image_path = capture.get("image_path")
+    captures = manifest.get("captures")
+    if not isinstance(captures, list):
+        return
+    for item in captures:
+        if isinstance(item, dict) and item.get("image_path") == image_path:
+            item["detection"] = detection
+            break
+    manifest["updated_at"] = time.time()
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception:
+        pass
+
+
 def _save_rgb_capture_artifact(
     *,
     config: HomeAgentConfig,
@@ -1978,6 +2848,7 @@ def _save_rgb_capture_artifact(
 ) -> dict[str, Any]:
     mime_type, image_bytes = _decode_image_data_url(data_url)
     extension = _image_extension_for_mime(mime_type)
+    image_size = _image_size_from_bytes(image_bytes)
     report_dir = _agent_artifacts_root(config) / run_id / "vision_report"
     shots_dir = report_dir / "shots"
     shots_dir.mkdir(parents=True, exist_ok=True)
@@ -1990,6 +2861,9 @@ def _save_rgb_capture_artifact(
         "image_filename": image_path.name,
         "metadata_filename": metadata_path.name,
     }
+    if image_size is not None:
+        metadata["image_width"] = image_size[0]
+        metadata["image_height"] = image_size[1]
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     manifest_path = report_dir / "manifest.json"
     manifest = _load_json_file(manifest_path)
@@ -2029,6 +2903,8 @@ def _save_rgb_capture_artifact(
         "captured_at": metadata.get("captured_at"),
         "robot_pose": metadata.get("robot_pose"),
         "current_pose": metadata.get("current_pose"),
+        "image_width": metadata.get("image_width"),
+        "image_height": metadata.get("image_height"),
     }
 
 
@@ -2036,6 +2912,41 @@ def _decode_image_data_url(data_url: str) -> tuple[str, bytes]:
     header, encoded = data_url.split(",", 1)
     mime_type = header.removeprefix("data:").split(";", 1)[0] or "image/png"
     return mime_type, base64.b64decode(encoded)
+
+
+def _image_size_from_file(path: Path) -> tuple[int, int] | None:
+    try:
+        return _image_size_from_bytes(path.read_bytes())
+    except Exception:
+        return None
+
+
+def _image_size_from_bytes(data: bytes) -> tuple[int, int] | None:
+    if len(data) >= 24 and data[:8] == b"\x89PNG\r\n\x1a\n":
+        return int.from_bytes(data[16:20], "big"), int.from_bytes(data[20:24], "big")
+    if len(data) >= 10 and data[:2] == b"\xff\xd8":
+        index = 2
+        while index + 9 < len(data):
+            if data[index] != 0xFF:
+                index += 1
+                continue
+            marker = data[index + 1]
+            index += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if index + 2 > len(data):
+                return None
+            segment_length = int.from_bytes(data[index : index + 2], "big")
+            if segment_length < 2 or index + segment_length > len(data):
+                return None
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+                if segment_length >= 7:
+                    height = int.from_bytes(data[index + 3 : index + 5], "big")
+                    width = int.from_bytes(data[index + 5 : index + 7], "big")
+                    return width, height
+                return None
+            index += segment_length
+    return None
 
 
 def _image_extension_for_mime(mime_type: str) -> str:

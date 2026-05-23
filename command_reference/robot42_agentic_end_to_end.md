@@ -88,13 +88,14 @@ Current behavior:
 - the agent reads regions and occupancy from `home_memory.json`
 - memory lookup is prompt/context, not a tool call
 - region navigation starts with `resolve_navigation_to_region`, which resolves `kitchen` against saved occupancy/free space and returns a final safe pose plus a short-horizon waypoint
-- the exposed navigation tools are `resolve_navigation_to_region`, `plan_region_exploration`, `execute_region_exploration_plan`, `navigate_to_waypoint`, `relocalize_here`, `rotate_by`, `rotate_towards_point`, and `micro_adjust_to_pose`
+- the exposed tools are `resolve_navigation_to_region`, `plan_region_exploration`, `execute_region_exploration_plan`, `navigate_to_waypoint`, `relocalize_here`, `rotate_by`, `rotate_towards_point`, `micro_adjust_to_pose`, `focus_detected_object`, `approach_detected_object`, and `grab_object`
 - `navigate_to_waypoint` auto-rotates toward the waypoint before Nav2 when the bearing error is above `--navigation-auto-rotate-threshold-deg`
 - if Nav2 fails, `navigate_to_waypoint` can use the direct local-motion fallback only when the saved occupancy map says the short straight-line corridor is footprint-clear
 - `execute_region_exploration_plan` plans visual inspection stops for a named region, navigates to each stop, and rotates the robot through the planned 65-degree shot directions
 - each executed visual-search shot saves an RGB frame under `artifacts/agent_runs/<run_id>/vision_report/`
+- if `--object-detector-provider replicate_grounding_dino` is configured, each shot is sent to Replicate Grounding DINO with the requested `object_label`; the region search stops early when a match is found
+- after a match, `focus_detected_object` recenters the object, `approach_detected_object` uses RGB-D bbox depth plus tiny safe forward steps until the object is around `0.35-0.45m`, and `grab_object` returns a mocked VLA entrypoint result
 - the React Agent screen shows those frames in the `What Robot Saw` panel
-- perception, manipulation, and VLA/skill tools are intentionally not exposed yet
 
 Region polygons are semantic labels, not navigation goals. The agent should not choose a target from the region shape directly. When it needs to move to a region, it calls the region navigation resolver, which searches known-free occupancy cells inside the named region, erodes free space by the robot footprint plus a small gap, and prefers centerline cells with higher clearance from occupied space. The resolver then walks along that same preview path to produce `next_waypoint`, defaulting to a `2.0 m` horizon.
 
@@ -113,7 +114,51 @@ Region visual-search flow:
 - it uses `navigate_to_waypoint` for each stop, so auto-rotation and direct fallback still apply
 - it uses bounded local rotation to face each planned shot
 - it saves RGB debug shots plus metadata in the agent vision report
-- for now, capture/object detection returns `not_configured`; this is the next plug-in point for object recognition
+- if object detection is configured, it runs after each shot and returns `detection_status`: `matched`, `not_found`, `not_configured`, `unavailable`, or `failed`
+- when `detection_status='matched'`, remaining shots are aborted and `selected_detection` contains the selected bounding box
+
+Object approach flow:
+- `focus_detected_object(detection_id, object_label)` recaptures RGB and rotates in small backend-controlled steps until the bbox is centered
+- `approach_detected_object(detection_id, object_label)` recaptures RGB, redetects, asks the exploration backend to solve bbox depth from the latest organized RGB-D point cloud, checks a small body corridor, then calls `micro_adjust_to_pose` for a short forward step
+- the approach loop repeats until the object is in the configured staging range
+- `grab_object(object_label, detection_id, object_description)` is mocked for now; it is where the VLA grasp skill will connect
+
+### Optional Online Object Detection
+
+For the first runnable object-recognition prototype, use Replicate Grounding DINO. This avoids loading a detector beside a future VLA model on the same 16GB GPU.
+
+Set the token:
+
+```bash
+export REPLICATE_API_TOKEN="r8_..."
+```
+
+Start the agent backend with detection enabled:
+
+```bash
+python examples/robot42_agent_backend.py \
+  --memory-root ./artifacts/memories \
+  --exploration-backend-url http://127.0.0.1:8770 \
+  --provider openai \
+  --model gpt-5.5 \
+  --navigation-waypoint-horizon-m 2.0 \
+  --max-turns 80 \
+  --object-detector-provider replicate_grounding_dino \
+  --object-detector-api-key "$REPLICATE_API_TOKEN" \
+  --object-detector-model adirik/grounding-dino \
+  --object-detector-box-threshold 0.25 \
+  --object-detector-text-threshold 0.25 \
+  --object-detector-min-confidence 0.25 \
+  --object-approach-target-min-m 0.35 \
+  --object-approach-target-max-m 0.45 \
+  --object-approach-step-m 0.08
+```
+
+For a no-network smoke test that always returns a centered fake detection:
+
+```bash
+--object-detector-provider mock
+```
 
 The default pre-Nav2 auto-rotation threshold is `45` degrees. Override it with:
 
