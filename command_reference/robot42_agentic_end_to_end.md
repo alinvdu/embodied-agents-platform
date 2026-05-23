@@ -85,7 +85,6 @@ Current behavior:
 - region navigation starts with `resolve_navigation_to_region`, which resolves `kitchen` against saved occupancy/free space and returns a final safe pose plus a short-horizon waypoint
 - the exposed navigation tools are `resolve_navigation_to_region`, `plan_region_exploration`, `execute_region_exploration_plan`, `navigate_to_waypoint`, `relocalize_here`, `rotate_by`, `rotate_towards_point`, and `micro_adjust_to_pose`
 - `navigate_to_waypoint` auto-rotates toward the waypoint before Nav2 when the bearing error is above `--navigation-auto-rotate-threshold-deg`
-- `navigate_to_waypoint` automatically calls relocalization after a successful waypoint, so the robot performs the scan/correction before the next resolve step
 - if Nav2 fails, `navigate_to_waypoint` can use the direct local-motion fallback only when the saved occupancy map says the short straight-line corridor is footprint-clear
 - `execute_region_exploration_plan` plans visual inspection stops for a named region, navigates to each stop, and rotates the robot through the planned 65-degree shot directions
 - each executed visual-search shot saves an RGB frame under `artifacts/agent_runs/<run_id>/vision_report/`
@@ -100,7 +99,7 @@ Navigation flow:
 - `navigate_to_waypoint(waypoint_id, x, y, yaw)`
 - `navigate_to_waypoint` may first call a backend local rotation if the waypoint is sideways/behind the robot
 - wait for the Nav2 result from the exploration backend; if Nav2 fails and the waypoint is short/direct/clear, the same tool may fall back to bounded local motion
-- the same tool automatically calls `relocalize_here()` after a successful waypoint unless disabled with `relocalize_after_success=false`
+- `relocalize_here()`
 - resolve again from the updated/corrected pose if the waypoint was not final
 
 Region visual-search flow:
@@ -121,18 +120,6 @@ or through the environment:
 
 ```bash
 export ROBOT42_NAVIGATION_AUTO_ROTATE_THRESHOLD_DEG=60
-```
-
-Post-waypoint relocalization is on by default. Disable it only for dry debugging with:
-
-```bash
---no-relocalize-after-waypoint
-```
-
-or:
-
-```bash
-export ROBOT42_RELOCALIZE_AFTER_WAYPOINT=0
 ```
 
 ## Configure Or Update Environment

@@ -542,45 +542,24 @@ class HomeTaskAgentTests(unittest.TestCase):
             },
             "map": {"robot_pose": {"x": 1.2, "y": 0.4, "yaw": 0.1}},
         }
-        relocalize_payload = {
-            "status": "corrected",
-            "message": "Relocalization correction applied to odometry pose.",
-            "match": {
-                "status": "matched",
-                "confidence": 0.9,
-                "delta": {"dx_m": 0.02, "dy_m": 0.0, "dyaw_deg": 0.0},
-                "corrected_pose": {"x": 1.22, "y": 0.4, "yaw": 0.1},
-            },
-            "correction": {"status": "ok"},
-        }
-
-        def fake_urlopen(request, timeout=0):
-            if request.full_url.endswith("/api/nav/waypoint"):
-                return FakeHTTPResponse(payload)
-            if request.full_url.endswith("/api/nav/relocalize"):
-                return FakeHTTPResponse(relocalize_payload)
-            raise AssertionError(f"unexpected URL {request.full_url}")
-
-        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen) as mocked:
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", return_value=FakeHTTPResponse(payload)) as mocked:
             result = runtime.navigate_to_waypoint(waypoint_id="kitchen_step", x=1.2, y=0.4, yaw=0.1)
 
         self.assertEqual(result["status"], "succeeded")
-        self.assertEqual(result["current_pose"], {"x": 1.22, "y": 0.4, "yaw": 0.1})
-        self.assertEqual(runtime.current_pose, {"x": 1.22, "y": 0.4, "yaw": 0.1})
-        self.assertEqual(result["post_navigation_relocalization"]["status"], "corrected")
+        self.assertEqual(result["current_pose"], {"x": 1.2, "y": 0.4, "yaw": 0.1})
+        self.assertEqual(runtime.current_pose, {"x": 1.2, "y": 0.4, "yaw": 0.1})
         self.assertEqual(result["distance_remaining_m"], 0.0)
         self.assertEqual(result["actual_pose_delta_m"], 1.1)
         self.assertEqual(result["nav2"]["feedback_summary"]["sample_count"], 1)
-        request = mocked.call_args_list[0].args[0]
+        request = mocked.call_args.args[0]
         self.assertEqual(request.full_url, "http://explore.local/api/nav/waypoint")
-        self.assertEqual(mocked.call_args_list[1].args[0].full_url, "http://explore.local/api/nav/relocalize")
         self.assertTrue(any(event["details"].get("tool") == "navigate_to_waypoint" for event in events))
 
     def test_runtime_navigate_to_waypoint_uses_direct_fallback_after_nav2_failure(self) -> None:
         events = []
         runtime = HomeAgentToolRuntime(
             memory=direct_fallback_memory(),
-            config=HomeAgentConfig(exploration_backend_url="http://explore.local", relocalize_after_waypoint=False),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
             emit=lambda kind, title, summary, details=None: events.append(
                 {"kind": kind, "title": title, "summary": summary, "details": details or {}}
             ),
@@ -639,7 +618,6 @@ class HomeTaskAgentTests(unittest.TestCase):
             config=HomeAgentConfig(
                 exploration_backend_url="http://explore.local",
                 navigation_auto_rotate_threshold_deg=45.0,
-                relocalize_after_waypoint=False,
             ),
             emit=lambda *_args, **_kwargs: None,
         )
@@ -697,7 +675,6 @@ class HomeTaskAgentTests(unittest.TestCase):
             config=HomeAgentConfig(
                 exploration_backend_url="http://explore.local",
                 agent_artifacts_root=tmpdir.name,
-                relocalize_after_waypoint=False,
             ),
             emit=lambda kind, title, summary, details=None: events.append(
                 {"kind": kind, "title": title, "summary": summary, "details": details or {}}
@@ -791,7 +768,7 @@ class HomeTaskAgentTests(unittest.TestCase):
     def test_runtime_execute_region_exploration_plan_skips_capture_when_alignment_fails(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=visual_sweep_memory(),
-            config=HomeAgentConfig(exploration_backend_url="http://explore.local", relocalize_after_waypoint=False),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
             emit=lambda *_args, **_kwargs: None,
         )
         current_pose = dict(runtime.current_pose)
@@ -850,7 +827,7 @@ class HomeTaskAgentTests(unittest.TestCase):
     def test_runtime_navigate_does_not_treat_normalized_goal_as_current_pose(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=sample_memory(),
-            config=HomeAgentConfig(exploration_backend_url="http://explore.local", relocalize_after_waypoint=False),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
             emit=lambda *_args, **_kwargs: None,
         )
         payload = {
@@ -1019,11 +996,12 @@ class HomeTaskAgentTests(unittest.TestCase):
                 y=waypoint["y"],
                 yaw=waypoint["yaw"],
             )
+            relocalized = runtime.relocalize_here()
             second = runtime.resolve_navigation_to_region(target_label="kitchen")
 
         self.assertEqual(nav["status"], "succeeded")
         self.assertEqual(nav["distance_remaining_m"], 0.0)
-        self.assertEqual(nav["post_navigation_relocalization"]["status"], "corrected")
+        self.assertEqual(relocalized["status"], "corrected")
         self.assertEqual(second["status"], "succeeded")
         self.assertLess(second["path_length_m"], first["path_length_m"])
         self.assertEqual(
@@ -1043,8 +1021,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("saves RGB debug shots", instructions)
         self.assertIn("Nav2 can sometimes fail to find paths", instructions)
         self.assertIn("constraints_json='{}'", instructions)
-        self.assertIn("automatically runs relocalize_here after each successful waypoint", instructions)
-        self.assertIn("post_navigation_relocalization", instructions)
+        self.assertIn("After each successful waypoint", instructions)
 
     def test_openai_provider_applies_cli_api_key_to_agents_sdk_env(self) -> None:
         agent = HomeTaskAgent(
