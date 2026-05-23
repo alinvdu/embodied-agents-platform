@@ -13,6 +13,10 @@ From the repo root:
 For live agent navigation with OpenAI traces:
 
 ```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
 python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories \
   --provider openai \
@@ -20,7 +24,8 @@ python examples/robot42_agent_backend.py \
   --exploration-backend-url http://127.0.0.1:8770 \
   --navigation-waypoint-horizon-m 2.0 \
   --navigation-auto-rotate-threshold-deg 45 \
-  --agent-artifacts-root ./artifacts/agent_runs
+  --agent-artifacts-root ./artifacts/agent_runs \
+  --max-turns 80
 ```
 
 For preview-only local testing, omit the provider:
