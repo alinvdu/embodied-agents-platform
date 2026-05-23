@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exploration-backend-url", default=None)
     parser.add_argument("--navigation-waypoint-horizon-m", type=float, default=None)
     parser.add_argument("--navigation-auto-rotate-threshold-deg", type=float, default=None)
+    parser.add_argument("--no-relocalize-after-waypoint", action="store_true")
     parser.add_argument("--backend-request-timeout-s", type=float, default=None)
     parser.add_argument("--agent-artifacts-root", default=None)
     parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
@@ -67,6 +68,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
+    print(f"Relocalize after waypoint: {config.relocalize_after_waypoint}")
     print(f"Agent artifacts: {config.agent_artifacts_root}")
     if config.model.provider == "mock":
         print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")
@@ -117,6 +119,9 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.navigation_auto_rotate_threshold_deg
             if args.navigation_auto_rotate_threshold_deg is not None
             else config.navigation_auto_rotate_threshold_deg
+        ),
+        relocalize_after_waypoint=(
+            False if args.no_relocalize_after_waypoint else config.relocalize_after_waypoint
         ),
         backend_request_timeout_s=(
             args.backend_request_timeout_s

@@ -63,6 +63,7 @@ class HomeAgentConfig:
     exploration_backend_url: str | None = "http://127.0.0.1:8770"
     navigation_waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M
     navigation_auto_rotate_threshold_deg: float = 45.0
+    relocalize_after_waypoint: bool = True
     backend_request_timeout_s: float = 120.0
     agent_artifacts_root: str = "artifacts/agent_runs"
 
@@ -524,7 +525,28 @@ class HomeAgentToolRuntime:
             ),
             result,
         )
+        post_relocalization = self._maybe_relocalize_after_waypoint(result, constraints)
+        if post_relocalization is not None:
+            result["post_navigation_relocalization"] = post_relocalization
+            current_pose = post_relocalization.get("current_pose")
+            if isinstance(current_pose, dict):
+                result["current_pose"] = _json_pose(current_pose)
         return result
+
+    def _maybe_relocalize_after_waypoint(
+        self,
+        result: dict[str, Any],
+        constraints: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if result.get("status") != "succeeded":
+            return None
+        if not _constraint_bool(constraints, "relocalize_after_success", self.config.relocalize_after_waypoint):
+            return {
+                "tool": "relocalize_here",
+                "status": "skipped",
+                "reason": "Post-waypoint relocalization is disabled by configuration or constraints.",
+            }
+        return self.relocalize_here()
 
     def _maybe_auto_rotate_before_waypoint(
         self,
@@ -1190,6 +1212,7 @@ class HomeTaskAgent:
                 "Navigation model:",
                 "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
                 f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
+                "- navigate_to_waypoint automatically runs relocalize_here after each successful waypoint unless constraints_json sets relocalize_after_success=false.",
                 "- If Nav2 fails, navigate_to_waypoint can automatically use a short direct primitive fallback only when the saved occupancy map proves the straight corridor is footprint-clear.",
                 "- Nav2 can sometimes fail to find paths toward objects or places, even when a route may exist.",
                 "- Nav2 can be noisy for pure rotations, 180-degree turns, very close targets, and recovery after failed to make progress.",
@@ -1201,7 +1224,7 @@ class HomeTaskAgent:
                 f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
-                "After each successful waypoint, call relocalize_here before resolving the next waypoint.",
+                "After each successful waypoint, inspect navigate_to_waypoint.post_navigation_relocalization before resolving the next waypoint.",
                 "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
                 "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "If the target is within 0.5m and only a small final correction remains, use micro_adjust_to_pose.",
@@ -1211,11 +1234,10 @@ class HomeTaskAgent:
                 "",
                 "Example navigation loop for `go to kitchen`:",
                 "1. Call resolve_navigation_to_region(target_label='kitchen', constraints_json='{}').",
-                "2. Call navigate_to_waypoint with that exact waypoint and constraints_json='{}'. The tool handles pre-Nav2 auto-rotation and direct fallback internally.",
-                "3. If the waypoint succeeded, call relocalize_here.",
-                "4. If the waypoint succeeded and was not final, repeat from step 1.",
-                "5. If the waypoint succeeded and was final, summarize that the region was reached.",
-                "6. If the waypoint failed, summarize status, reason, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
+                "2. Call navigate_to_waypoint with that exact waypoint and constraints_json='{}'. The tool handles pre-Nav2 auto-rotation, direct fallback, and post-waypoint relocalization internally.",
+                "3. If the waypoint succeeded and was not final, repeat from step 1.",
+                "4. If the waypoint succeeded and was final, summarize that the region was reached.",
+                "5. If the waypoint failed, summarize status, reason, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "",
                 "Example custom horizon: resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"waypoint_horizon_m\": 1.5}').",
                 "Example object-search motion: execute_region_exploration_plan(region_label='kitchen', object_label='coke can', constraints_json='{\"max_stops\": 3, \"shots_per_stop\": 2}').",
@@ -1591,6 +1613,7 @@ def config_from_env() -> HomeAgentConfig:
             os.getenv("ROBOT42_NAVIGATION_WAYPOINT_HORIZON_M", str(DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M))
         ),
         navigation_auto_rotate_threshold_deg=float(os.getenv("ROBOT42_NAVIGATION_AUTO_ROTATE_THRESHOLD_DEG", "45")),
+        relocalize_after_waypoint=_env_bool("ROBOT42_RELOCALIZE_AFTER_WAYPOINT", True),
         backend_request_timeout_s=float(os.getenv("ROBOT42_AGENT_BACKEND_REQUEST_TIMEOUT_S", "120")),
         agent_artifacts_root=os.getenv("ROBOT42_AGENT_ARTIFACTS_ROOT", "artifacts/agent_runs"),
     )
