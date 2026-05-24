@@ -740,7 +740,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                     {
                         "status": "succeeded",
                         "reason": "captured",
-                        "image_data_url": "data:image/png;base64,cG5n",
+                        "image_data_url": TEST_PNG_DATA_URL,
                         "robot_pose": dict(current_pose),
                         "captured_at": 123.0,
                     }
@@ -855,6 +855,15 @@ class HomeTaskAgentTests(unittest.TestCase):
         manifest_path = Path(result["stops"][0]["shots"][0]["capture"]["manifest_path"])
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         self.assertEqual(manifest["captures"][0]["detection"]["status"], "matched")
+        capture = result["stops"][0]["shots"][0]["capture"]
+        try:
+            import PIL  # noqa: F401
+        except Exception:
+            self.assertNotIn("annotated_artifact_url", capture)
+        else:
+            self.assertIn("annotated_artifact_url", capture)
+            self.assertTrue(Path(capture["annotated_image_path"]).is_file())
+            self.assertEqual(manifest["captures"][0]["annotated_artifact_url"], capture["annotated_artifact_url"])
 
     def test_runtime_execute_region_exploration_plan_aborts_when_detector_unavailable(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()

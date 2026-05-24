@@ -2823,12 +2823,21 @@ def _record_capture_detection(
     capture: dict[str, Any],
     detection: dict[str, Any],
 ) -> None:
+    annotation = _write_detection_annotation_artifact(
+        config=config,
+        run_id=run_id,
+        capture=capture,
+        detection=detection,
+    )
+    if annotation:
+        capture.update(annotation)
     metadata_path = capture.get("metadata_path")
     if isinstance(metadata_path, str):
         path = Path(metadata_path)
         metadata = _load_json_file(path)
         if isinstance(metadata, dict):
             metadata["detection"] = detection
+            metadata.update(annotation)
             try:
                 path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
             except Exception:
@@ -2845,12 +2854,123 @@ def _record_capture_detection(
     for item in captures:
         if isinstance(item, dict) and item.get("image_path") == image_path:
             item["detection"] = detection
+            item.update(annotation)
             break
     manifest["updated_at"] = time.time()
     try:
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except Exception:
         pass
+
+
+def _write_detection_annotation_artifact(
+    *,
+    config: HomeAgentConfig,
+    run_id: str,
+    capture: dict[str, Any],
+    detection: dict[str, Any],
+) -> dict[str, Any]:
+    boxes = _detection_boxes_for_annotation(detection)
+    image_path_value = capture.get("image_path")
+    if not boxes or not isinstance(image_path_value, str):
+        return {}
+    image_path = Path(image_path_value)
+    if not image_path.is_file():
+        return {}
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except Exception:
+        return {}
+    try:
+        with Image.open(image_path) as opened:
+            image = opened.convert("RGBA")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            return {}
+        overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        font = ImageFont.load_default()
+        stroke = max(2, int(round(max(width, height) / 320)))
+        for index, box in enumerate(boxes):
+            bbox = box.get("bbox_xyxy")
+            if not isinstance(bbox, list) or len(bbox) < 4:
+                continue
+            left, top, right, bottom = _bbox_to_pixel_xyxy(
+                [float(item) for item in bbox[:4]],
+                image_width=float(width),
+                image_height=float(height),
+            )
+            left = max(0.0, min(float(width), left))
+            right = max(0.0, min(float(width), right))
+            top = max(0.0, min(float(height), top))
+            bottom = max(0.0, min(float(height), bottom))
+            if right <= left or bottom <= top:
+                continue
+            selected = bool(box.get("selected") or (index == 0 and not any(item.get("selected") for item in boxes)))
+            outline = (20, 160, 90, 255) if selected else (224, 130, 20, 255)
+            fill = (20, 160, 90, 42) if selected else (224, 130, 20, 38)
+            draw.rectangle([left, top, right, bottom], fill=fill, outline=outline, width=stroke)
+            label = str(box.get("label") or detection.get("object_label") or "object")
+            confidence = box.get("confidence")
+            try:
+                confidence_value = float(confidence)
+                if confidence_value > 0.0:
+                    label = f"{label} {confidence_value * 100:.0f}%"
+            except Exception:
+                pass
+            text_bbox = draw.textbbox((0, 0), label, font=font)
+            text_width = max(float(text_bbox[2] - text_bbox[0]), 1.0)
+            text_height = max(float(text_bbox[3] - text_bbox[1]), 1.0)
+            label_x = min(max(left, 0.0), max(float(width) - text_width - 8.0, 0.0))
+            label_y = max(top - text_height - 8.0, 0.0)
+            draw.rectangle(
+                [label_x, label_y, label_x + text_width + 8.0, label_y + text_height + 6.0],
+                fill=(17, 24, 39, 218),
+            )
+            draw.text((label_x + 4.0, label_y + 3.0), label, fill=(255, 255, 255, 255), font=font)
+        annotated = Image.alpha_composite(image, overlay).convert("RGB")
+        annotated_path = image_path.with_name(f"{image_path.stem}_detections.png")
+        annotated.save(annotated_path, format="PNG")
+    except Exception:
+        return {}
+    root = _agent_artifacts_root(config)
+    try:
+        relpath = str(annotated_path.relative_to(root))
+    except Exception:
+        relpath = f"{run_id}/vision_report/shots/{annotated_path.name}"
+    return {
+        "annotated_image_path": str(annotated_path),
+        "annotated_artifact_relpath": relpath,
+        "annotated_artifact_url": f"/api/artifacts/{relpath}",
+    }
+
+
+def _detection_boxes_for_annotation(detection: dict[str, Any]) -> list[dict[str, Any]]:
+    selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else None
+    selected_id = None
+    if selected is not None:
+        selected_id = selected.get("tracking_id") or selected.get("detection_id")
+    selected_id = selected_id or detection.get("selected_detection_id")
+    raw_boxes = detection.get("detections") if isinstance(detection.get("detections"), list) else []
+    if not raw_boxes and selected is not None:
+        raw_boxes = [selected]
+    boxes: list[dict[str, Any]] = []
+    for index, raw in enumerate(raw_boxes):
+        if not isinstance(raw, dict):
+            continue
+        bbox = raw.get("bbox_xyxy")
+        if not isinstance(bbox, list) or len(bbox) < 4:
+            continue
+        box_id = raw.get("tracking_id") or raw.get("detection_id") or f"box_{index}"
+        boxes.append(
+            {
+                "bbox_xyxy": bbox,
+                "label": raw.get("label") or detection.get("object_label") or "object",
+                "confidence": raw.get("confidence"),
+                "selected": bool(selected_id and box_id == selected_id),
+            }
+        )
+    return boxes
 
 
 def _save_rgb_capture_artifact(

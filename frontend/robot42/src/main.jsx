@@ -232,7 +232,9 @@ function AgentVisionReport({ shots }) {
             : detection.status && detection.status !== "not_configured"
               ? `detection ${detection.status}`
               : "";
-          const src = artifactSrc(capture.artifact_url || capture.image_url);
+          const annotatedSrc = artifactSrc(capture.annotated_artifact_url);
+          const src = annotatedSrc || artifactSrc(capture.artifact_url || capture.image_url);
+          const showDynamicOverlay = !annotatedSrc;
           return (
             <div className="vision-shot" key={`${shot.stop_id}-${shot.shot_id}`}>
               {src ? (
@@ -241,7 +243,7 @@ function AgentVisionReport({ shots }) {
                   style={imageWidth > 0 && imageHeight > 0 ? { aspectRatio: `${imageWidth} / ${imageHeight}` } : undefined}
                 >
                   <img src={src} alt={`${shot.stop_id} ${shot.shot_id}`} />
-                  {imageWidth > 0 && imageHeight > 0 && detectionBoxes.length ? (
+                  {showDynamicOverlay && imageWidth > 0 && imageHeight > 0 && detectionBoxes.length ? (
                     <svg className="vision-detections" viewBox={`0 0 ${imageWidth} ${imageHeight}`} preserveAspectRatio="none">
                       {detectionBoxes.map((box) => (
                         <g key={box.id}>
