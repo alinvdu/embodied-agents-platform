@@ -224,6 +224,9 @@ function AgentVisionReport({ shots }) {
           const capture = shot.capture || {};
           const detection = shot.detection || {};
           const selected = detection.selected_detection || {};
+          const imageWidth = Number(capture.image_width || 0);
+          const imageHeight = Number(capture.image_height || 0);
+          const detectionBoxes = boxesForDetection(detection, imageWidth, imageHeight);
           const detectionLabel = detection.status === "matched"
             ? `matched ${selected.label || detection.object_label || "object"} ${Math.round(Number(selected.confidence || 0) * 100)}%`
             : detection.status && detection.status !== "not_configured"
@@ -232,7 +235,32 @@ function AgentVisionReport({ shots }) {
           const src = artifactSrc(capture.artifact_url || capture.image_url);
           return (
             <div className="vision-shot" key={`${shot.stop_id}-${shot.shot_id}`}>
-              {src ? <img src={src} alt={`${shot.stop_id} ${shot.shot_id}`} /> : <div className="vision-missing">No RGB</div>}
+              {src ? (
+                <div
+                  className="vision-image-frame"
+                  style={imageWidth > 0 && imageHeight > 0 ? { aspectRatio: `${imageWidth} / ${imageHeight}` } : undefined}
+                >
+                  <img src={src} alt={`${shot.stop_id} ${shot.shot_id}`} />
+                  {imageWidth > 0 && imageHeight > 0 && detectionBoxes.length ? (
+                    <svg className="vision-detections" viewBox={`0 0 ${imageWidth} ${imageHeight}`} preserveAspectRatio="none">
+                      {detectionBoxes.map((box) => (
+                        <g key={box.id}>
+                          <rect
+                            x={box.x}
+                            y={box.y}
+                            width={box.width}
+                            height={box.height}
+                            className={box.selected ? "selected" : ""}
+                          />
+                          <text x={box.x + 6} y={Math.max(box.y + 16, 16)}>
+                            {box.label}
+                          </text>
+                        </g>
+                      ))}
+                    </svg>
+                  ) : null}
+                </div>
+              ) : <div className="vision-missing">No RGB</div>}
               <div>
                 <strong>{shot.region_label || "region"}</strong>
                 <span>{shot.stop_id} / {shot.shot_id}</span>
@@ -245,6 +273,55 @@ function AgentVisionReport({ shots }) {
       </div>
     </section>
   );
+}
+
+function boxesForDetection(detection, imageWidth, imageHeight) {
+  if (!detection || imageWidth <= 0 || imageHeight <= 0) return [];
+  const selectedId = detection.selected_detection_id || detection.selected_detection?.detection_id || detection.selected_detection?.tracking_id;
+  const rawBoxes = Array.isArray(detection.detections) && detection.detections.length
+    ? detection.detections
+    : detection.selected_detection
+      ? [detection.selected_detection]
+      : [];
+  return rawBoxes
+    .map((item, index) => {
+      const bbox = Array.isArray(item?.bbox_xyxy) ? item.bbox_xyxy : null;
+      if (!bbox || bbox.length < 4) return null;
+      const parsed = bboxToPixels(bbox, imageWidth, imageHeight);
+      if (!parsed) return null;
+      const confidence = Number(item.confidence || 0);
+      const label = `${item.label || detection.object_label || "object"}${confidence ? ` ${Math.round(confidence * 100)}%` : ""}`;
+      const id = item.detection_id || item.tracking_id || `box-${index}`;
+      return {
+        id,
+        label,
+        selected: selectedId ? id === selectedId : index === 0,
+        ...parsed,
+      };
+    })
+    .filter(Boolean);
+}
+
+function bboxToPixels(bbox, imageWidth, imageHeight) {
+  let [x0, y0, x1, y1] = bbox.map((value) => Number(value));
+  if (![x0, y0, x1, y1].every(Number.isFinite)) return null;
+  if (Math.max(Math.abs(x0), Math.abs(y0), Math.abs(x1), Math.abs(y1)) <= 1.5) {
+    x0 *= imageWidth;
+    x1 *= imageWidth;
+    y0 *= imageHeight;
+    y1 *= imageHeight;
+  }
+  const left = Math.max(0, Math.min(x0, x1));
+  const top = Math.max(0, Math.min(y0, y1));
+  const right = Math.min(imageWidth, Math.max(x0, x1));
+  const bottom = Math.min(imageHeight, Math.max(y0, y1));
+  if (right <= left || bottom <= top) return null;
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
 }
 
 function EnvironmentCard({

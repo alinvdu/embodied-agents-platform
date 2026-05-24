@@ -331,13 +331,53 @@ label {
   overflow: hidden;
 }
 
-.vision-shot img,
+.vision-image-frame,
 .vision-missing {
   width: 100%;
   aspect-ratio: 4 / 3;
   display: block;
-  object-fit: cover;
   background: #f1f2ef;
+}
+
+.vision-image-frame {
+  position: relative;
+  overflow: hidden;
+}
+
+.vision-image-frame img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
+}
+
+.vision-detections {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.vision-detections rect {
+  fill: rgba(245, 158, 11, 0.12);
+  stroke: rgba(217, 119, 6, 0.95);
+  stroke-width: 4;
+}
+
+.vision-detections rect.selected {
+  fill: rgba(34, 197, 94, 0.14);
+  stroke: rgba(22, 163, 74, 0.98);
+}
+
+.vision-detections text {
+  fill: #ffffff;
+  paint-order: stroke;
+  stroke: rgba(17, 24, 39, 0.88);
+  stroke-width: 5;
+  stroke-linejoin: round;
+  font-size: 16px;
+  font-weight: 800;
 }
 
 .vision-missing {
