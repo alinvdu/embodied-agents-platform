@@ -256,6 +256,38 @@ def _camera_info_intrinsics(message: Any) -> dict[str, Any] | None:
     }
 
 
+def _fallback_camera_intrinsics(
+    *,
+    width: int,
+    height: int,
+    frame_id: str,
+    horizontal_fov_deg: float,
+) -> dict[str, Any] | None:
+    try:
+        width = int(width)
+        height = int(height)
+        horizontal_fov_rad = math.radians(float(horizontal_fov_deg))
+    except Exception:
+        return None
+    if width <= 1 or height <= 1 or horizontal_fov_rad <= 0.0:
+        return None
+    fx = width / (2.0 * math.tan(horizontal_fov_rad / 2.0))
+    if fx <= 0.0 or not math.isfinite(fx):
+        return None
+    return {
+        "width": width,
+        "height": height,
+        "fx": fx,
+        "fy": fx,
+        "cx": width / 2.0,
+        "cy": height / 2.0,
+        "frame_id": frame_id,
+        "stamp_s": time.time(),
+        "source": "fallback_horizontal_fov",
+        "horizontal_fov_deg": float(horizontal_fov_deg),
+    }
+
+
 def _snapshot_stamp_s(snapshot: Any) -> float:
     if isinstance(snapshot, dict):
         try:
@@ -575,6 +607,7 @@ class RosRuntimeConfig:
     depth_topic: str = "/camera/head/depth/image_raw"
     camera_info_topic: str = "/camera/head/camera_info"
     rgbd_update_timeout_s: float = 0.7
+    rgbd_fallback_horizontal_fov_deg: float = 64.0
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
     initial_pose_topic: str = "/initialpose"
@@ -1336,11 +1369,11 @@ class RosExplorationRuntime(Node):
                 "status": "unavailable",
                 "reason": "No latest aligned RGB-D depth image is available yet.",
             }
-        camera_info = self.latest_camera_info_snapshot
-        if not isinstance(camera_info, dict):
+        depth_m = depth_snapshot.get("depth_m")
+        if not hasattr(depth_m, "shape") or len(depth_m.shape) != 2:
             return {
                 "status": "unavailable",
-                "reason": "No latest camera_info intrinsics are available for RGB-D bbox grounding.",
+                "reason": "Latest depth image could not be decoded.",
                 "depth_image": {
                     "width": depth_snapshot.get("width"),
                     "height": depth_snapshot.get("height"),
@@ -1348,11 +1381,23 @@ class RosExplorationRuntime(Node):
                     "encoding": depth_snapshot.get("encoding"),
                 },
             }
-        depth_m = depth_snapshot.get("depth_m")
-        if not hasattr(depth_m, "shape") or len(depth_m.shape) != 2:
+        depth_height, depth_width = int(depth_m.shape[0]), int(depth_m.shape[1])
+        frame_id = str(depth_snapshot.get("frame_id") or "")
+        camera_info = self.latest_camera_info_snapshot
+        if not isinstance(camera_info, dict):
+            camera_info = _fallback_camera_intrinsics(
+                width=depth_width,
+                height=depth_height,
+                frame_id=frame_id,
+                horizontal_fov_deg=self.config.rgbd_fallback_horizontal_fov_deg,
+            )
+        if not isinstance(camera_info, dict):
             return {
                 "status": "unavailable",
-                "reason": "Latest depth image could not be decoded.",
+                "reason": (
+                    "No latest camera_info intrinsics are available for RGB-D bbox grounding, "
+                    "and fallback camera FOV is disabled."
+                ),
                 "depth_image": {
                     "width": depth_snapshot.get("width"),
                     "height": depth_snapshot.get("height"),
@@ -1381,7 +1426,6 @@ class RosExplorationRuntime(Node):
                     "age_s": round(max(time.time() - float(camera_info.get("stamp_s", time.time())), 0.0), 3),
                 },
             }
-        depth_height, depth_width = int(depth_m.shape[0]), int(depth_m.shape[1])
         if depth_width <= 1 or depth_height <= 1:
             return {"status": "unavailable", "reason": "Latest depth image is empty."}
         frame_id = str(depth_snapshot.get("frame_id") or camera_info.get("frame_id") or "")
@@ -1503,6 +1547,8 @@ class RosExplorationRuntime(Node):
                 "fy": round(float(camera_info.get("fy", 0.0) or 0.0), 3),
                 "cx": round(float(camera_info.get("cx", 0.0) or 0.0), 3),
                 "cy": round(float(camera_info.get("cy", 0.0) or 0.0), 3),
+                "source": camera_info.get("source", "camera_info_topic"),
+                "horizontal_fov_deg": camera_info.get("horizontal_fov_deg"),
             },
             "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
             "valid_sample_count": valid_count,
@@ -1552,15 +1598,25 @@ class RosExplorationRuntime(Node):
             camera_info_stamp_s = _snapshot_stamp_s(self.latest_camera_info_snapshot)
             if (
                 isinstance(self.latest_depth_snapshot, dict)
-                and isinstance(self.latest_camera_info_snapshot, dict)
                 and depth_stamp_s > after_depth_stamp_s
-                and (after_camera_info_stamp_s <= 0.0 or camera_info_stamp_s > 0.0)
+                and (
+                    isinstance(self.latest_camera_info_snapshot, dict)
+                    or self.config.rgbd_fallback_horizontal_fov_deg > 0.0
+                )
+                and (
+                    after_camera_info_stamp_s <= 0.0
+                    or camera_info_stamp_s > 0.0
+                    or self.config.rgbd_fallback_horizontal_fov_deg > 0.0
+                )
             ):
                 return True
         return (
             isinstance(self.latest_depth_snapshot, dict)
-            and isinstance(self.latest_camera_info_snapshot, dict)
             and _snapshot_stamp_s(self.latest_depth_snapshot) > after_depth_stamp_s
+            and (
+                isinstance(self.latest_camera_info_snapshot, dict)
+                or self.config.rgbd_fallback_horizontal_fov_deg > 0.0
+            )
         )
 
     def wait_for_map_update(self, *, after_stamp_s: float, timeout_s: float = 2.0) -> bool:
@@ -2329,7 +2385,7 @@ class RosExplorationRuntime(Node):
             if self.latest_camera_info_snapshot is None
             else {
                 key: self.latest_camera_info_snapshot.get(key)
-                for key in ("frame_id", "width", "height", "fx", "fy", "cx", "cy")
+                for key in ("frame_id", "width", "height", "fx", "fy", "cx", "cy", "source", "horizontal_fov_deg")
             },
             "latest_map": self.latest_map_summary(),
             "latest_relocalization_map": None

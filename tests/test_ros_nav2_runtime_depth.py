@@ -72,6 +72,24 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
         self.assertEqual(ros_nav2_runtime._snapshot_stamp_s({"stamp_s": "bad"}), 0.0)
         self.assertEqual(ros_nav2_runtime._snapshot_stamp_s({"stamp_s": 123.5}), 123.5)
 
+    def test_fallback_camera_intrinsics_from_horizontal_fov(self) -> None:
+        intrinsics = ros_nav2_runtime._fallback_camera_intrinsics(
+            width=640,
+            height=480,
+            frame_id="head_camera_link",
+            horizontal_fov_deg=64.0,
+        )
+
+        self.assertIsNotNone(intrinsics)
+        assert intrinsics is not None
+        self.assertEqual(intrinsics["source"], "fallback_horizontal_fov")
+        self.assertEqual(intrinsics["frame_id"], "head_camera_link")
+        self.assertEqual(intrinsics["width"], 640)
+        self.assertAlmostEqual(float(intrinsics["fx"]), 512.1, delta=5.0)
+        self.assertAlmostEqual(float(intrinsics["fy"]), float(intrinsics["fx"]), places=5)
+        self.assertEqual(intrinsics["cx"], 320.0)
+        self.assertEqual(intrinsics["cy"], 240.0)
+
 
 if __name__ == "__main__":
     unittest.main()

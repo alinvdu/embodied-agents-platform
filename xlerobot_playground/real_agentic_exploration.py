@@ -84,6 +84,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-depth-topic", default="/camera/head/depth/image_raw")
     parser.add_argument("--ros-camera-info-topic", default="/camera/head/camera_info")
+    parser.add_argument("--ros-rgbd-fallback-horizontal-fov-deg", type=float, default=64.0)
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
@@ -193,6 +194,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_depth_topic,
         "--ros-camera-info-topic",
         args.ros_camera_info_topic,
+        "--ros-rgbd-fallback-horizontal-fov-deg",
+        str(args.ros_rgbd_fallback_horizontal_fov_deg),
         "--ros-imu-topic",
         args.ros_imu_topic,
         "--ros-cmd-vel-topic",

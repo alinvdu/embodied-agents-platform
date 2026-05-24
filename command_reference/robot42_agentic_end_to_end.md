@@ -129,9 +129,10 @@ For real-robot approach, the exploration backend needs these ROS topics. The def
 --ros-rgb-topic /camera/head/image_raw
 --ros-depth-topic /camera/head/depth/image_raw
 --ros-camera-info-topic /camera/head/camera_info
+--ros-rgbd-fallback-horizontal-fov-deg 64.0
 ```
 
-The older point-cloud grounding path is only a fallback now; object approach should use RGB-D image depth directly.
+The older point-cloud grounding path is only a fallback now; object approach should use RGB-D image depth directly. If `/camera/head/camera_info` is slow or missing, the backend synthesizes camera intrinsics from the depth image size and `--ros-rgbd-fallback-horizontal-fov-deg` so approach does not block just because the camera-info callback has not arrived.
 
 ### Optional Online Object Detection
 

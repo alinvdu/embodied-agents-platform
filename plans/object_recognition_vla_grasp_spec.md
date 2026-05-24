@@ -65,6 +65,7 @@ Implemented:
   - focus_detected_object
   - approach_detected_object
   - depth-image + camera_info bbox grounding for object approach
+  - fallback RGB-D intrinsics from configured horizontal FOV when camera_info is slow/missing
   - tracked bbox reuse for focus and early approach
   - Replicate HTTP 429 retry/backoff
   - grab_object mock/VLA entrypoint
@@ -422,7 +423,7 @@ Behavior:
 
 1. Use the tracked bbox from the selected detection.
 2. Send the bbox to the exploration backend.
-3. The backend solves median object position from the latest aligned RGB-D depth image plus `camera_info`.
+3. The backend solves median object position from the latest aligned RGB-D depth image plus `camera_info`; if `camera_info` is slow/missing, it synthesizes intrinsics from the configured fallback horizontal FOV.
 4. If distance is already in grasp range, stop.
 5. If too far, check a local swept footprint corridor from RGB-D geometry.
 6. Move forward in small increments.
@@ -565,6 +566,7 @@ Manifest:
 - Done: add `focus_detected_object`.
 - Done: add `approach_detected_object`.
 - Done: solve depth median inside bbox from the backend's aligned RGB-D depth image and `camera_info`.
+- Done: synthesize fallback camera intrinsics from horizontal FOV when `camera_info` has not arrived.
 - Done: use the tracked bbox for focus and early approach instead of re-running the detector every loop.
 - Done: add a first-pass local footprint corridor safety check.
 

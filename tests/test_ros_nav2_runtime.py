@@ -23,6 +23,7 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertEqual(RosRuntimeConfig().manual_spin_direction_sign, 1.0)
         self.assertEqual(RosRuntimeConfig().local_rotation_active_topic, "/xlerobot/local_rotation_active")
         self.assertGreaterEqual(RosRuntimeConfig().rgbd_update_timeout_s, 0.5)
+        self.assertAlmostEqual(RosRuntimeConfig().rgbd_fallback_horizontal_fov_deg, 64.0)
 
     def test_compute_turn_command_stops_at_target(self) -> None:
         command, done = compute_turn_command(

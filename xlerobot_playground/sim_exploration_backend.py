@@ -139,6 +139,7 @@ class SimExplorationConfig:
     ros_rgb_topic: str = "/camera/head/image_raw"
     ros_depth_topic: str = "/camera/head/depth/image_raw"
     ros_camera_info_topic: str = "/camera/head/camera_info"
+    ros_rgbd_fallback_horizontal_fov_deg: float = 64.0
     ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
     ros_map_frame: str = "map"
@@ -3352,6 +3353,7 @@ class RosExplorationSession:
                     rgb_topic=config.ros_rgb_topic,
                     depth_topic=config.ros_depth_topic,
                     camera_info_topic=config.ros_camera_info_topic,
+                    rgbd_fallback_horizontal_fov_deg=config.ros_rgbd_fallback_horizontal_fov_deg,
                     imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
                     map_frame=config.ros_map_frame,
@@ -4214,9 +4216,11 @@ class RosExplorationSession:
         depth_snapshot = getattr(self.runtime, "latest_depth_stats", None)
         camera_info = getattr(self.runtime, "latest_camera_info_snapshot", None)
         point_cloud_snapshot = getattr(self.runtime, "latest_point_cloud_stats", None)
+        fallback_fov_deg = float(getattr(self.runtime.config, "rgbd_fallback_horizontal_fov_deg", 0.0) or 0.0)
+        has_intrinsics = isinstance(camera_info, dict) or fallback_fov_deg > 0.0
         rgbd_status = (
             "succeeded"
-            if rgb.get("status") == "succeeded" and isinstance(depth_snapshot, dict) and isinstance(camera_info, dict)
+            if rgb.get("status") == "succeeded" and isinstance(depth_snapshot, dict) and has_intrinsics
             else "unavailable"
         )
         result = {
@@ -4238,6 +4242,7 @@ class RosExplorationSession:
                     if isinstance(camera_info, dict)
                     else None
                 ),
+                "fallback_horizontal_fov_deg": fallback_fov_deg if not isinstance(camera_info, dict) else None,
                 "point_cloud": point_cloud_snapshot if isinstance(point_cloud_snapshot, dict) else None,
                 "note": "Depth geometry is solved server-side with /api/nav/estimate_detection_geometry.",
             },
@@ -5527,6 +5532,7 @@ class RosExplorationSession:
                     "rgb_topic": self.config.ros_rgb_topic,
                     "depth_topic": self.config.ros_depth_topic,
                     "camera_info_topic": self.config.ros_camera_info_topic,
+                    "rgbd_fallback_horizontal_fov_deg": self.config.ros_rgbd_fallback_horizontal_fov_deg,
                     "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
@@ -6046,6 +6052,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
     parser.add_argument("--ros-depth-topic", default="/camera/head/depth/image_raw")
     parser.add_argument("--ros-camera-info-topic", default="/camera/head/camera_info")
+    parser.add_argument(
+        "--ros-rgbd-fallback-horizontal-fov-deg",
+        type=float,
+        default=64.0,
+        help=(
+            "Fallback head-camera horizontal FOV used to synthesize RGB-D intrinsics when "
+            "camera_info has not arrived yet. Set <=0 to require camera_info."
+        ),
+    )
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
@@ -6189,6 +6204,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_rgb_topic=args.ros_rgb_topic,
             ros_depth_topic=args.ros_depth_topic,
             ros_camera_info_topic=args.ros_camera_info_topic,
+            ros_rgbd_fallback_horizontal_fov_deg=args.ros_rgbd_fallback_horizontal_fov_deg,
             ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
             ros_map_frame=args.ros_map_frame,
