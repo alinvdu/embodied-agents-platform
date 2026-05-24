@@ -264,18 +264,25 @@ def _replicate_request_json(
         request_headers["Content-Type"] = "application/json"
     if headers:
         request_headers.update(headers)
-    request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
-    try:
-        with urllib.request.urlopen(request, timeout=max(float(timeout_s), 1.0)) as response:
-            raw = response.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
+    max_attempts = 4
+    raw = ""
+    for attempt in range(1, max_attempts + 1):
+        request = urllib.request.Request(url, data=body, headers=request_headers, method=method)
         try:
-            raw_error = exc.read().decode("utf-8")
-        except Exception:
-            raw_error = str(exc)
-        raise RuntimeError(f"HTTP {exc.code}: {raw_error[:500]}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        raise RuntimeError(str(exc)) from exc
+            with urllib.request.urlopen(request, timeout=max(float(timeout_s), 1.0)) as response:
+                raw = response.read().decode("utf-8")
+            break
+        except urllib.error.HTTPError as exc:
+            try:
+                raw_error = exc.read().decode("utf-8")
+            except Exception:
+                raw_error = str(exc)
+            if exc.code == 429 and attempt < max_attempts:
+                time.sleep(_replicate_retry_after_s(exc, raw_error))
+                continue
+            raise RuntimeError(f"HTTP {exc.code}: {raw_error[:500]}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise RuntimeError(str(exc)) from exc
     try:
         parsed = json.loads(raw or "{}")
     except json.JSONDecodeError as exc:
@@ -283,6 +290,23 @@ def _replicate_request_json(
     if not isinstance(parsed, dict):
         raise RuntimeError("Replicate response was not a JSON object.")
     return parsed
+
+
+def _replicate_retry_after_s(exc: urllib.error.HTTPError, raw_error: str) -> float:
+    try:
+        retry_after = exc.headers.get("Retry-After")
+        if retry_after:
+            return max(min(float(retry_after) + 0.5, 20.0), 1.0)
+    except Exception:
+        pass
+    try:
+        parsed = json.loads(raw_error or "{}")
+        retry_after = parsed.get("retry_after") if isinstance(parsed, dict) else None
+        if retry_after is not None:
+            return max(min(float(retry_after) + 0.5, 20.0), 1.0)
+    except Exception:
+        pass
+    return 3.0
 
 
 def _normalize_replicate_detections(

@@ -94,7 +94,7 @@ Current behavior:
 - `execute_region_exploration_plan` plans visual inspection stops for a named region, navigates to each stop, and rotates the robot through the planned 65-degree shot directions
 - each executed visual-search shot saves an RGB frame under `artifacts/agent_runs/<run_id>/vision_report/`
 - if `--object-detector-provider replicate_grounding_dino` is configured, each shot is sent to Replicate Grounding DINO with the requested `object_label`; the region search stops early when a match is found
-- after a match, `focus_detected_object` recenters the object, `approach_detected_object` uses RGB-D bbox depth plus tiny safe forward steps until the object is around `0.35-0.45m`, and `grab_object` returns a mocked VLA entrypoint result
+- after a match, `focus_detected_object` reuses the selected bbox to recenter the object, `approach_detected_object` uses that tracked bbox with RGB-D depth plus tiny safe forward steps until the object is around `0.35-0.45m`, and `grab_object` returns a mocked VLA entrypoint result
 - the React Agent screen shows those frames in the `What Robot Saw` panel
 
 Region polygons are semantic labels, not navigation goals. The agent should not choose a target from the region shape directly. When it needs to move to a region, it calls the region navigation resolver, which searches known-free occupancy cells inside the named region, erodes free space by the robot footprint plus a small gap, and prefers centerline cells with higher clearance from occupied space. The resolver then walks along that same preview path to produce `next_waypoint`, defaulting to a `2.0 m` horizon.
@@ -118,9 +118,9 @@ Region visual-search flow:
 - when `detection_status='matched'`, remaining shots are aborted and `selected_detection` contains the selected bounding box
 
 Object approach flow:
-- `focus_detected_object(detection_id, object_label)` recaptures RGB and rotates in small backend-controlled steps until the bbox is centered
-- `approach_detected_object(detection_id, object_label)` recaptures RGB, redetects, asks the exploration backend to solve bbox depth from the latest aligned RGB-D depth image + camera intrinsics, checks a small body corridor, then calls `micro_adjust_to_pose` for a short forward step
-- the approach loop repeats until the object is in the configured staging range
+- `focus_detected_object(detection_id, object_label)` first uses the tracked bbox from the successful detection; if needed it rotates once from bbox-center error without re-calling the detector
+- `approach_detected_object(detection_id, object_label)` first asks the exploration backend to solve the tracked bbox depth from the latest aligned RGB-D depth image + camera intrinsics, checks a small body corridor, then calls `micro_adjust_to_pose` for a short forward step
+- the approach loop repeats until the object is in the configured staging range; detector refresh happens only after a couple of physical motion steps or when tracked-bbox depth fails
 - `grab_object(object_label, detection_id, object_description)` is mocked for now; it is where the VLA grasp skill will connect
 
 For real-robot approach, the exploration backend needs these ROS topics. The defaults match `real_ros_bridge.py`:
@@ -167,6 +167,8 @@ python examples/robot42_agent_backend.py \
 ```
 
 Robot42 resizes/re-encodes images sent to Replicate by default. This keeps detector calls small enough for Replicate/Cloudflare while mapping returned boxes back to the original saved RGB shot for focus and RGB-D approach.
+
+Replicate is used for the initial search and occasional verification, not every visual-servo step. The tracked bbox is reused for focus and early approach, and HTTP 429 responses are retried using Replicate's retry delay.
 
 For a no-network smoke test that always returns a centered fake detection:
 

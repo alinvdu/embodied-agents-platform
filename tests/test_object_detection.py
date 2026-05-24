@@ -1,6 +1,7 @@
 import base64
 import io
 import json
+import urllib.error
 import unittest
 from unittest.mock import patch
 
@@ -140,6 +141,55 @@ class ObjectDetectionTest(unittest.TestCase):
         self.assertEqual(metadata["sent_width"], 100)
         self.assertEqual(metadata["sent_height"], 50)
         self.assertEqual(detections[0]["bbox_xyxy"], [20.0, 40.0, 100.0, 80.0])
+
+    def test_replicate_retries_rate_limited_prediction_creation(self) -> None:
+        prediction_calls = 0
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal prediction_calls
+            if request.full_url.endswith("/v1/models/adirik/grounding-dino"):
+                return FakeHTTPResponse({"latest_version": {"id": "version-123"}})
+            if request.full_url.endswith("/v1/predictions"):
+                prediction_calls += 1
+                if prediction_calls == 1:
+                    raise urllib.error.HTTPError(
+                        request.full_url,
+                        429,
+                        "Too Many Requests",
+                        {"Retry-After": "0"},
+                        io.BytesIO(b'{"retry_after": 0}'),
+                    )
+                return FakeHTTPResponse(
+                    {
+                        "id": "prediction-123",
+                        "status": "succeeded",
+                        "output": {
+                            "detections": [
+                                {"label": "bottle", "score": 0.8, "bbox": [1, 2, 3, 4]},
+                            ],
+                        },
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with (
+            patch("xlerobot_agent.object_detection.urllib.request.urlopen", side_effect=fake_urlopen),
+            patch("xlerobot_agent.object_detection.time.sleep") as sleep,
+        ):
+            result = detect_object_in_image(
+                config=ObjectDetectorConfig(
+                    provider="replicate_grounding_dino",
+                    api_key="token",
+                    min_confidence=0.25,
+                ),
+                image_data_url="data:image/png;base64,cG5n",
+                object_label="bottle",
+                shot_id="shot_retry",
+            )
+
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(prediction_calls, 2)
+        sleep.assert_called_once()
 
 
 if __name__ == "__main__":

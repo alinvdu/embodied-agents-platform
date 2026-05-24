@@ -78,11 +78,11 @@ class HomeAgentConfig:
     object_detector_jpeg_quality: int = 85
     object_focus_horizontal_fov_deg: float = 65.0
     object_focus_center_tolerance_norm: float = 0.08
-    object_focus_max_attempts: int = 5
+    object_focus_max_attempts: int = 3
     object_approach_target_min_m: float = 0.35
     object_approach_target_max_m: float = 0.45
     object_approach_step_m: float = 0.08
-    object_approach_max_attempts: int = 12
+    object_approach_max_attempts: int = 5
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
 
@@ -607,6 +607,7 @@ class HomeAgentToolRuntime:
             self.emit("tool_blocked", "Focus Object", result["reason"], result)
             return result
         attempts: list[dict[str, Any]] = []
+        tracked = self._tracked_detection_and_capture(state)
         max_attempts = int(_bounded_float(
             constraints.get("max_attempts", self.config.object_focus_max_attempts),
             self.config.object_focus_max_attempts,
@@ -619,6 +620,79 @@ class HomeAgentToolRuntime:
             minimum=0.01,
             maximum=0.5,
         )
+        if tracked is not None:
+            selected, capture = tracked
+            center = _detection_center_error(selected, capture)
+            attempt: dict[str, Any] = {
+                "attempt": 0,
+                "source": "tracked_detection",
+                "capture": capture,
+                "selected_detection": selected,
+                "center": center,
+            }
+            attempts.append(attempt)
+            if center.get("status") != "succeeded":
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "detection_id": state.get("detection_id") or detection_id,
+                    "reason": center.get("reason") or "Tracked detection bbox could not be centered.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+            if abs(float(center["error_norm"])) <= tolerance:
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "succeeded",
+                    "object_label": label,
+                    "detection_id": state.get("detection_id") or selected.get("detection_id") or detection_id,
+                    "selected_detection": selected,
+                    "center_error_norm": center["error_norm"],
+                    "attempt_count": 0,
+                    "attempts": attempts,
+                    "detector_refreshed": False,
+                    "reason": "Tracked object bbox is already centered; detector was not re-run.",
+                }
+                self.emit("tool_executed", "Focus Object", result["reason"], result)
+                return result
+            rotation = self.rotate_by(
+                delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
+                reason=f"Center `{label}` from tracked bbox before approach.",
+            )
+            attempt["rotation"] = rotation
+            if rotation.get("status") not in {"succeeded", "partial"}:
+                result = {
+                    "tool": "focus_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "detection_id": state.get("detection_id") or selected.get("detection_id") or detection_id,
+                    "reason": rotation.get("reason") or "Focus rotation failed.",
+                    "attempts": attempts,
+                }
+                self.emit("tool_blocked", "Focus Object", result["reason"], result)
+                return result
+            predicted = _horizontally_centered_detection(selected, capture)
+            if predicted is not None:
+                selected = predicted
+                self._update_tracked_detection(str(state.get("detection_id") or detection_id or ""), selected)
+                attempt["predicted_selected_detection"] = selected
+            result = {
+                "tool": "focus_detected_object",
+                "status": "succeeded",
+                "object_label": label,
+                "detection_id": state.get("detection_id") or selected.get("detection_id") or detection_id,
+                "selected_detection": selected,
+                "center_error_norm_before": center["error_norm"],
+                "attempt_count": 0,
+                "attempts": attempts,
+                "detector_refreshed": False,
+                "reason": "Applied one tracked-bbox focus rotation; detector was not re-run.",
+            }
+            self.emit("tool_executed", "Focus Object", result["reason"], result)
+            return result
+
         for attempt_index in range(1, max_attempts + 1):
             capture = self._capture_rgb_for_object_tool(
                 tool_name="focus_detected_object",
@@ -755,31 +829,71 @@ class HomeAgentToolRuntime:
             minimum=1,
             maximum=30,
         ))
+        redetect_after_motion_steps = int(_bounded_float(
+            constraints.get("redetect_after_motion_steps", 2),
+            2,
+            minimum=1,
+            maximum=6,
+        ))
         attempts: list[dict[str, Any]] = []
+        motion_steps_since_detection = 0
+        refresh_after_geometry_failure = False
+        last_state = state
         for attempt_index in range(1, max_attempts + 1):
-            capture = self._capture_rgb_for_object_tool(
-                tool_name="approach_detected_object",
-                object_label=label,
-                attempt_index=attempt_index,
+            tracked = self._tracked_detection_and_capture(last_state)
+            use_tracked_detection = (
+                tracked is not None
+                and motion_steps_since_detection < redetect_after_motion_steps
+                and not refresh_after_geometry_failure
             )
-            if capture.get("status") != "succeeded":
-                result = {
-                    "tool": "approach_detected_object",
-                    "status": "blocked",
-                    "object_label": label,
-                    "reason": capture.get("reason") or "RGB capture failed during object approach.",
-                    "attempts": attempts,
-                    "capture": capture,
-                }
-                self.emit("tool_blocked", "Approach Object", result["reason"], result)
-                return result
-            detection = self._detect_object_in_capture(
-                object_label=label,
-                shot_id=str(capture.get("shot_id") or f"approach_{attempt_index}"),
-                capture=capture,
-            )
+            if use_tracked_detection and tracked is not None:
+                selected, capture = tracked
+                detection = dict(last_state.get("detection")) if isinstance(last_state.get("detection"), dict) else {}
+                detection.update(
+                    {
+                        "status": "matched",
+                        "object_label": label,
+                        "selected_detection": selected,
+                        "selected_detection_id": last_state.get("detection_id")
+                        or selected.get("tracking_id")
+                        or selected.get("detection_id"),
+                    }
+                )
+                source = "tracked_detection"
+            else:
+                capture = self._capture_rgb_for_object_tool(
+                    tool_name="approach_detected_object",
+                    object_label=label,
+                    attempt_index=attempt_index,
+                )
+                if capture.get("status") != "succeeded":
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "reason": capture.get("reason") or "RGB capture failed during object approach.",
+                        "attempts": attempts,
+                        "capture": capture,
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+                detection = self._detect_object_in_capture(
+                    object_label=label,
+                    shot_id=str(capture.get("shot_id") or f"approach_{attempt_index}"),
+                    capture=capture,
+                )
+                source = "detector_refresh"
+                refresh_after_geometry_failure = False
+                motion_steps_since_detection = 0
+                if detection.get("status") == "matched":
+                    last_state = self._resolve_detection_state(
+                        detection_id=str(detection.get("selected_detection_id") or ""),
+                        object_label=label,
+                    )
             attempt: dict[str, Any] = {
                 "attempt": attempt_index,
+                "source": source,
+                "motion_steps_since_detection": motion_steps_since_detection,
                 "capture": capture,
                 "detection": detection,
             }
@@ -806,6 +920,10 @@ class HomeAgentToolRuntime:
             )
             attempt["geometry"] = geometry
             if geometry.get("status") != "succeeded":
+                if source == "tracked_detection" and not refresh_after_geometry_failure:
+                    refresh_after_geometry_failure = True
+                    attempt["next_action"] = "refresh_detector_due_to_geometry_failure"
+                    continue
                 result = {
                     "tool": "approach_detected_object",
                     "status": "blocked",
@@ -839,6 +957,7 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
+                motion_steps_since_detection += 1
                 continue
             if target_min_m <= forward_m <= target_max_m:
                 result = {
@@ -916,6 +1035,7 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
+            motion_steps_since_detection += 1
         result = {
             "tool": "approach_detected_object",
             "status": "partial",
@@ -1051,6 +1171,35 @@ class HomeAgentToolRuntime:
         if isinstance(current_pose, dict):
             self.current_pose = _json_pose(current_pose)
         return response if isinstance(response, dict) else {"status": "failed", "reason": "Geometry endpoint response was invalid."}
+
+    def _tracked_detection_and_capture(self, state: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        selected = state.get("selected_detection")
+        capture = state.get("capture")
+        if not isinstance(selected, dict) or not isinstance(capture, dict):
+            return None
+        if not isinstance(selected.get("bbox_xyxy"), list):
+            return None
+        if not (capture.get("image_width") and capture.get("image_height")):
+            image_path = capture.get("image_path")
+            if isinstance(image_path, str):
+                size = _image_size_from_file(Path(image_path))
+                if size is not None:
+                    capture = dict(capture)
+                    capture["image_width"], capture["image_height"] = size
+        if not (capture.get("image_width") and capture.get("image_height")):
+            return None
+        return dict(selected), dict(capture)
+
+    def _update_tracked_detection(self, detection_id: str, selected: dict[str, Any]) -> None:
+        if not detection_id or detection_id not in self.detection_tracking:
+            return
+        state = self.detection_tracking[detection_id]
+        state["selected_detection"] = dict(selected)
+        state["updated_at"] = time.time()
+        detection = state.get("detection")
+        if isinstance(detection, dict):
+            detection["selected_detection"] = dict(selected)
+            detection["selected_detection_id"] = detection_id
 
     def _track_detection_result(
         self,
@@ -2300,11 +2449,11 @@ def config_from_env() -> HomeAgentConfig:
         object_detector_jpeg_quality=int(os.getenv("ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY", "85")),
         object_focus_horizontal_fov_deg=float(os.getenv("ROBOT42_OBJECT_FOCUS_HORIZONTAL_FOV_DEG", "65")),
         object_focus_center_tolerance_norm=float(os.getenv("ROBOT42_OBJECT_FOCUS_CENTER_TOLERANCE_NORM", "0.08")),
-        object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "5")),
+        object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "3")),
         object_approach_target_min_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MIN_M", "0.35")),
         object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
         object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
-        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "12")),
+        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "5")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
     )
@@ -2735,6 +2884,43 @@ def _detection_center_error(detection: dict[str, Any], capture: dict[str, Any]) 
         "error_norm": round((center_x - image_width * 0.5) / (image_width * 0.5), 4),
         "vertical_error_norm": round((center_y - image_height * 0.5) / (image_height * 0.5), 4),
     }
+
+
+def _horizontally_centered_detection(detection: dict[str, Any], capture: dict[str, Any]) -> dict[str, Any] | None:
+    bbox = detection.get("bbox_xyxy")
+    if not isinstance(bbox, list) or len(bbox) < 4:
+        return None
+    width = capture.get("image_width")
+    height = capture.get("image_height")
+    if not width or not height:
+        image_path = capture.get("image_path")
+        if isinstance(image_path, str):
+            size = _image_size_from_file(Path(image_path))
+            if size is not None:
+                width, height = size
+    try:
+        image_width = float(width)
+        image_height = float(height)
+    except Exception:
+        return None
+    if image_width <= 0.0 or image_height <= 0.0:
+        return None
+    left, top, right, bottom = _bbox_to_pixel_xyxy(
+        [float(item) for item in bbox[:4]],
+        image_width=image_width,
+        image_height=image_height,
+    )
+    box_width = max(right - left, 1.0)
+    new_left = max(min(image_width * 0.5 - box_width * 0.5, image_width - box_width), 0.0)
+    predicted = dict(detection)
+    predicted["bbox_xyxy"] = [
+        round(new_left, 3),
+        round(top, 3),
+        round(new_left + box_width, 3),
+        round(bottom, 3),
+    ]
+    predicted["tracking_prediction"] = "horizontally_centered_after_focus_rotation"
+    return predicted
 
 
 def _bbox_to_pixel_xyxy(bbox: list[float], *, image_width: float, image_height: float) -> tuple[float, float, float, float]:

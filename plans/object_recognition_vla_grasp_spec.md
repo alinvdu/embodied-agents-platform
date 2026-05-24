@@ -65,6 +65,8 @@ Implemented:
   - focus_detected_object
   - approach_detected_object
   - depth-image + camera_info bbox grounding for object approach
+  - tracked bbox reuse for focus and early approach
+  - Replicate HTTP 429 retry/backoff
   - grab_object mock/VLA entrypoint
 
 Not implemented yet:
@@ -390,19 +392,19 @@ focus_detected_object(detection_id, constraints_json)
 
 Behavior:
 
-1. Capture a fresh RGB frame from the exploration backend.
-2. Re-detect or track the selected object.
-3. Compare box center to image center.
-4. Rotate the robot in small bounded increments.
-5. Stop when the object center is inside a configurable normalized tolerance.
-6. Return the updated tracked detection.
+1. Use the selected tracked bbox from the successful search detection.
+2. Compare box center to image center.
+3. If centered, return without recapturing or re-running the detector.
+4. If not centered, rotate once from the bbox-center error.
+5. Predict the tracked bbox as horizontally centered after the rotation.
+6. Re-run the detector only later if tracking/depth becomes invalid.
 
 Suggested defaults:
 
 ```json
 {
   "center_tolerance_norm": 0.08,
-  "max_attempts": 5,
+  "max_attempts": 3,
   "max_yaw_step_deg": 12,
   "horizontal_fov_deg": 65
 }
@@ -418,14 +420,14 @@ approach_detected_object(detection_id, constraints_json)
 
 Behavior:
 
-1. Capture RGB and re-run detection.
+1. Use the tracked bbox from the selected detection.
 2. Send the bbox to the exploration backend.
-3. The backend solves median object position from the latest organized RGB-D point cloud.
+3. The backend solves median object position from the latest aligned RGB-D depth image plus `camera_info`.
 4. If distance is already in grasp range, stop.
 5. If too far, check a local swept footprint corridor from RGB-D geometry.
 6. Move forward in small increments.
-7. Re-capture and re-detect after every increment.
-8. Stop if the object is lost, depth is invalid, or the footprint corridor is unsafe.
+7. Reuse the tracked bbox for short-horizon approach; refresh the detector only after a couple of physical motion steps or if bbox depth is invalid.
+8. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
 
 Suggested defaults:
 
@@ -436,7 +438,8 @@ Suggested defaults:
   "step_m": 0.08,
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
-  "max_attempts": 12
+  "max_attempts": 5,
+  "redetect_after_motion_steps": 2
 }
 ```
 
@@ -561,7 +564,8 @@ Manifest:
 
 - Done: add `focus_detected_object`.
 - Done: add `approach_detected_object`.
-- Done: solve depth median inside bbox from the backend's organized RGB-D point cloud.
+- Done: solve depth median inside bbox from the backend's aligned RGB-D depth image and `camera_info`.
+- Done: use the tracked bbox for focus and early approach instead of re-running the detector every loop.
 - Done: add a first-pass local footprint corridor safety check.
 
 ### Phase 4: Mock Grab

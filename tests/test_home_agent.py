@@ -985,6 +985,39 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertAlmostEqual(result["center_error_norm"], 0.0)
         self.assertTrue(any(event["details"].get("tool") == "focus_detected_object" for event in events))
 
+    def test_runtime_focus_detected_object_reuses_tracked_bbox_without_detector_refresh(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [0.35, 0.25, 0.65, 0.75],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                raise AssertionError("focus should reuse the tracked bbox")
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.focus_detected_object(object_label="coke can")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertFalse(result["detector_refreshed"])
+        self.assertEqual(result["attempt_count"], 0)
+
     def test_runtime_approach_detected_object_uses_rgbd_depth_and_micro_steps(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
@@ -1064,6 +1097,58 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(geometry_calls, 2)
         self.assertTrue(any(url.endswith("/api/nav/local_motion") for url in urls))
         self.assertIn(result["detection_id"], runtime.detection_tracking)
+
+    def test_runtime_approach_detected_object_reuses_tracked_bbox_for_depth(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [220, 120, 420, 360],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            calls.append((request.full_url, body))
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                raise AssertionError("approach should reuse the tracked bbox for the first RGB-D solve")
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.42,
+                        "distance_m": 0.42,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(object_label="coke can")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["attempts"][0]["source"], "tracked_detection")
+        self.assertEqual(
+            len([url for url, _body in calls if url.endswith("/api/nav/estimate_detection_geometry")]),
+            1,
+        )
 
     def test_runtime_grab_object_is_mock_vla_entrypoint(self) -> None:
         runtime = HomeAgentToolRuntime(
