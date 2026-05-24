@@ -55,6 +55,7 @@ class ObjectDetectionTest(unittest.TestCase):
             if request.full_url.endswith("/v1/models/adirik/grounding-dino"):
                 return FakeHTTPResponse({"latest_version": {"id": "version-123"}})
             if request.full_url.endswith("/v1/predictions"):
+                self.assertIn("Robot42", request.headers.get("User-agent", ""))
                 body = json.loads(request.data.decode("utf-8"))
                 self.assertEqual(body["version"], "version-123")
                 self.assertEqual(body["input"]["query"], "coke can")

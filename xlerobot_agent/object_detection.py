@@ -258,6 +258,7 @@ def _replicate_request_json(
     request_headers = {
         "Authorization": f"Bearer {api_key}",
         "Accept": "application/json",
+        "User-Agent": "Robot42/0.1 ReplicateAPIClient",
     }
     if payload is not None:
         request_headers["Content-Type"] = "application/json"
