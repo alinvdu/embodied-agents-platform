@@ -62,12 +62,13 @@ Implemented:
   - abort remaining shots when a match is found
   - abort region exploration if the configured detector fails or is unavailable
   - detection metadata saved into the vision report manifest
-
-Not implemented yet:
-  - depth-based 3D pose extraction
   - focus_detected_object
   - approach_detected_object
+  - depth-image + camera_info bbox grounding for object approach
   - grab_object mock/VLA entrypoint
+
+Not implemented yet:
+  - real VLA grasp execution behind grab_object
 ```
 
 ## Model Options

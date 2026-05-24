@@ -46,7 +46,7 @@ try:
         qos_profile_sensor_data,
     )
     from rclpy.time import Time as RosTime
-    from sensor_msgs.msg import Image, Imu, LaserScan, PointCloud2
+    from sensor_msgs.msg import CameraInfo, Image, Imu, LaserScan, PointCloud2
     from std_msgs.msg import Bool
     from std_srvs.srv import Empty
     from tf2_ros import Buffer, TransformBroadcaster, TransformListener
@@ -73,6 +73,7 @@ except Exception as exc:  # pragma: no cover - runtime guard.
     ReliabilityPolicy = None
     qos_profile_sensor_data = None
     RosTime = None
+    CameraInfo = None
     Image = None
     Imu = None
     LaserScan = None
@@ -187,6 +188,131 @@ def _point_cloud2_xyz_array(message: Any) -> np.ndarray:
     )
     structured = np.frombuffer(data, dtype=dtype, count=point_count)
     return np.column_stack((structured["x"], structured["y"], structured["z"])).astype(np.float32, copy=False)
+
+
+def _depth_image_to_meters_array(message: Any) -> np.ndarray:
+    if np is None:
+        return np.empty((0, 0), dtype=np.float32)
+    encoding = str(getattr(message, "encoding", "") or "").lower()
+    height = int(getattr(message, "height", 0) or 0)
+    width = int(getattr(message, "width", 0) or 0)
+    if height <= 0 or width <= 0:
+        return np.empty((0, 0), dtype=np.float32)
+    if encoding in {"mono16", "16uc1", "uint16"}:
+        bytes_per_pixel = 2
+        dtype = np.dtype(">u2" if bool(getattr(message, "is_bigendian", False)) else "<u2")
+        scale = 0.001
+    elif encoding in {"32fc1", "float32"}:
+        bytes_per_pixel = 4
+        dtype = np.dtype(">f4" if bool(getattr(message, "is_bigendian", False)) else "<f4")
+        scale = 1.0
+    else:
+        return np.empty((0, 0), dtype=np.float32)
+    row_bytes = width * bytes_per_pixel
+    step = int(getattr(message, "step", 0) or row_bytes)
+    if step < row_bytes:
+        return np.empty((0, 0), dtype=np.float32)
+    data = bytes(getattr(message, "data", b""))
+    expected = height * step
+    if len(data) < expected:
+        return np.empty((0, 0), dtype=np.float32)
+    rows = np.frombuffer(data, dtype=np.uint8, count=expected).reshape(height, step)
+    packed = np.ascontiguousarray(rows[:, :row_bytes])
+    depth = np.frombuffer(packed.tobytes(), dtype=dtype, count=height * width).reshape(height, width)
+    return depth.astype(np.float32, copy=False) * float(scale)
+
+
+def _camera_info_intrinsics(message: Any) -> dict[str, Any] | None:
+    try:
+        width = int(getattr(message, "width", 0) or 0)
+        height = int(getattr(message, "height", 0) or 0)
+        k = list(getattr(message, "k", []) or [])
+        p = list(getattr(message, "p", []) or [])
+        if len(k) >= 6 and float(k[0]) > 0.0 and float(k[4]) > 0.0:
+            fx = float(k[0])
+            fy = float(k[4])
+            cx = float(k[2])
+            cy = float(k[5])
+        elif len(p) >= 7 and float(p[0]) > 0.0 and float(p[5]) > 0.0:
+            fx = float(p[0])
+            fy = float(p[5])
+            cx = float(p[2])
+            cy = float(p[6])
+        else:
+            return None
+    except Exception:
+        return None
+    if min(width, height) <= 0 or min(fx, fy) <= 0.0:
+        return None
+    return {
+        "width": width,
+        "height": height,
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "frame_id": str(getattr(getattr(message, "header", None), "frame_id", "") or ""),
+        "stamp_s": time.time(),
+    }
+
+
+def _scaled_intrinsics_for_image(intrinsics: dict[str, Any], *, width: int, height: int) -> tuple[float, float, float, float]:
+    source_width = max(float(intrinsics.get("width") or width), 1.0)
+    source_height = max(float(intrinsics.get("height") or height), 1.0)
+    scale_x = float(width) / source_width
+    scale_y = float(height) / source_height
+    return (
+        float(intrinsics["fx"]) * scale_x,
+        float(intrinsics["fy"]) * scale_y,
+        float(intrinsics["cx"]) * scale_x,
+        float(intrinsics["cy"]) * scale_y,
+    )
+
+
+def _project_depth_pixels_to_camera_link(
+    *,
+    u: np.ndarray,
+    v: np.ndarray,
+    depth_m: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+) -> np.ndarray:
+    optical_x = (u.astype(np.float32, copy=False) - float(cx)) * depth_m / max(float(fx), 1e-6)
+    optical_y = (v.astype(np.float32, copy=False) - float(cy)) * depth_m / max(float(fy), 1e-6)
+    optical_z = depth_m.astype(np.float32, copy=False)
+    return np.column_stack((optical_z, -optical_x, -optical_y)).astype(np.float32, copy=False)
+
+
+def _depth_image_to_sampled_camera_link_points(
+    *,
+    depth_m: np.ndarray,
+    valid: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    max_points: int,
+) -> np.ndarray:
+    rows, cols = np.nonzero(valid)
+    if rows.size <= 0:
+        return np.empty((0, 3), dtype=np.float32)
+    limit = max(int(max_points), 1)
+    if rows.size > limit:
+        stride = max(int(math.ceil(rows.size / float(limit))), 1)
+        rows = rows[::stride]
+        cols = cols[::stride]
+    z = depth_m[rows, cols].astype(np.float32, copy=False)
+    return _project_depth_pixels_to_camera_link(
+        u=cols.astype(np.float32),
+        v=rows.astype(np.float32),
+        depth_m=z,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+    )
 
 
 def _bbox_xyxy(value: Any) -> tuple[float, float, float, float] | None:
@@ -437,6 +563,8 @@ class RosRuntimeConfig:
     local_rotation_active_topic: str = "/xlerobot/local_rotation_active"
     scan_active_release_delay_s: float = 3.0
     rgb_topic: str = "/camera/head/image_raw"
+    depth_topic: str = "/camera/head/depth/image_raw"
+    camera_info_topic: str = "/camera/head/camera_info"
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
     initial_pose_topic: str = "/initialpose"
@@ -644,6 +772,11 @@ class RosExplorationRuntime(Node):
         self.point_cloud_observations: list[dict[str, Any]] = []
         self.latest_image_msg: Image | None = None
         self.latest_image_data_url: str | None = None
+        self.latest_depth_msg: Image | None = None
+        self.latest_depth_stats: dict[str, Any] | None = None
+        self.latest_depth_snapshot: dict[str, Any] | None = None
+        self.latest_camera_info_msg: CameraInfo | None = None
+        self.latest_camera_info_snapshot: dict[str, Any] | None = None
         self._nav_goal_history: list[dict[str, Any]] = []
         self._nav_plan_history: list[dict[str, Any]] = []
         self._nav_scan_history: list[dict[str, Any]] = []
@@ -700,6 +833,8 @@ class RosExplorationRuntime(Node):
         self.create_subscription(LaserScan, config.scan_topic, self._on_scan, qos_profile_sensor_data)
         self.create_subscription(PointCloud2, config.point_cloud_topic, self._on_point_cloud, qos_profile_sensor_data)
         self.create_subscription(Image, config.rgb_topic, self._on_rgb, qos_profile_sensor_data)
+        self.create_subscription(Image, config.depth_topic, self._on_depth, qos_profile_sensor_data)
+        self.create_subscription(CameraInfo, config.camera_info_topic, self._on_camera_info, qos_profile_sensor_data)
         self.create_subscription(Imu, config.imu_topic, self._on_imu, qos_profile_sensor_data)
         if Log is not None:
             self.create_subscription(Log, "/rosout", self._on_rosout, 50)
@@ -861,6 +996,34 @@ class RosExplorationRuntime(Node):
         if encoded:
             self.latest_image_data_url = encoded
 
+    def _on_depth(self, message: Image) -> None:
+        self.latest_depth_msg = message
+        depth_m = _depth_image_to_meters_array(message)
+        valid = np.isfinite(depth_m) & (depth_m > 0.0) if depth_m.size else np.zeros((0,), dtype=bool)
+        self.latest_depth_stats = {
+            "frame_id": str(message.header.frame_id),
+            "width": int(message.width),
+            "height": int(message.height),
+            "encoding": str(message.encoding),
+            "valid_depth_count": int(np.count_nonzero(valid)),
+            "stamp_s": time.time(),
+        }
+        if depth_m.size:
+            self.latest_depth_snapshot = {
+                "frame_id": str(message.header.frame_id),
+                "width": int(message.width),
+                "height": int(message.height),
+                "encoding": str(message.encoding),
+                "stamp_s": time.time(),
+                "depth_m": depth_m.copy(),
+            }
+
+    def _on_camera_info(self, message: CameraInfo) -> None:
+        self.latest_camera_info_msg = message
+        intrinsics = _camera_info_intrinsics(message)
+        if intrinsics is not None:
+            self.latest_camera_info_snapshot = intrinsics
+
     def _on_rosout(self, message: Any) -> None:
         node = str(getattr(message, "name", "") or "")
         text = str(getattr(message, "msg", "") or "")
@@ -989,11 +1152,22 @@ class RosExplorationRuntime(Node):
             settle_s = 0.05
         if settle_s > 0.0:
             self.spin_for(settle_s)
+        bbox = _bbox_xyxy(payload.get("bbox_xyxy") or payload.get("bbox") or payload.get("detection"))
+        if bbox is None:
+            return {"status": "rejected", "reason": "bbox_xyxy is required to estimate object geometry."}
+        depth_result = self._estimate_detection_geometry_from_depth(payload, bbox)
+        if depth_result.get("status") != "unavailable":
+            return depth_result
         snapshot = self.latest_point_cloud_snapshot
         if not isinstance(snapshot, dict):
             return {
                 "status": "unavailable",
-                "reason": "No latest organized RGB-D point cloud is available yet.",
+                "reason": (
+                    f"{depth_result.get('reason', 'No aligned RGB-D depth image is available yet.')} "
+                    "Point-cloud fallback is also unavailable."
+                ),
+                "depth_image": depth_result.get("depth_image"),
+                "camera_info": depth_result.get("camera_info"),
             }
         cloud_width = int(snapshot.get("width", 0) or 0)
         cloud_height = int(snapshot.get("height", 0) or 0)
@@ -1018,9 +1192,6 @@ class RosExplorationRuntime(Node):
                     "frame_id": snapshot.get("frame_id"),
                 },
             }
-        bbox = _bbox_xyxy(payload.get("bbox_xyxy") or payload.get("bbox") or payload.get("detection"))
-        if bbox is None:
-            return {"status": "rejected", "reason": "bbox_xyxy is required to estimate object geometry."}
         image_width = int(payload.get("image_width") or payload.get("width") or cloud_width)
         image_height = int(payload.get("image_height") or payload.get("height") or cloud_height)
         inner_ratio = clamp(float(payload.get("bbox_sample_inner_ratio", 0.65) or 0.65), 0.2, 1.0)
@@ -1104,7 +1275,8 @@ class RosExplorationRuntime(Node):
         current_pose = self.current_pose()
         return {
             "status": "succeeded",
-            "reason": "Detection bbox was grounded with the latest organized RGB-D point cloud.",
+            "reason": "Detection bbox was grounded with the latest organized RGB-D point cloud fallback.",
+            "geometry_source": "organized_point_cloud",
             "bbox_xyxy": [round(item, 3) for item in bbox],
             "image_size": {"width": image_width, "height": image_height},
             "point_cloud": {
@@ -1113,6 +1285,177 @@ class RosExplorationRuntime(Node):
                 "frame_id": frame_id,
                 "reference_frame": snapshot.get("reference_frame"),
                 "age_s": round(max(time.time() - float(snapshot.get("stamp_s", time.time())), 0.0), 3),
+            },
+            "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "valid_sample_count": valid_count,
+            "estimated_pose_base": _point_dict(object_base),
+            "estimated_pose_map": None if object_map is None else _point_dict(object_map),
+            "current_pose": None if current_pose is None else current_pose.to_dict(),
+            "distance_m": round(range_m, 3),
+            "forward_m": round(forward_m, 3),
+            "lateral_m": round(lateral_m, 3),
+            "vertical_m": round(vertical_m, 3),
+            "bearing_error_deg": round(math.degrees(math.atan2(lateral_m, max(forward_m, 1e-6))), 2),
+            "safety": safety,
+        }
+
+    def _estimate_detection_geometry_from_depth(
+        self,
+        payload: dict[str, Any],
+        bbox: tuple[float, float, float, float],
+    ) -> dict[str, Any]:
+        depth_snapshot = self.latest_depth_snapshot
+        if not isinstance(depth_snapshot, dict):
+            return {
+                "status": "unavailable",
+                "reason": "No latest aligned RGB-D depth image is available yet.",
+            }
+        camera_info = self.latest_camera_info_snapshot
+        if not isinstance(camera_info, dict):
+            return {
+                "status": "unavailable",
+                "reason": "No latest camera_info intrinsics are available for RGB-D bbox grounding.",
+                "depth_image": {
+                    "width": depth_snapshot.get("width"),
+                    "height": depth_snapshot.get("height"),
+                    "frame_id": depth_snapshot.get("frame_id"),
+                    "encoding": depth_snapshot.get("encoding"),
+                },
+            }
+        depth_m = depth_snapshot.get("depth_m")
+        if not hasattr(depth_m, "shape") or len(depth_m.shape) != 2:
+            return {
+                "status": "unavailable",
+                "reason": "Latest depth image could not be decoded.",
+                "depth_image": {
+                    "width": depth_snapshot.get("width"),
+                    "height": depth_snapshot.get("height"),
+                    "frame_id": depth_snapshot.get("frame_id"),
+                    "encoding": depth_snapshot.get("encoding"),
+                },
+            }
+        depth_height, depth_width = int(depth_m.shape[0]), int(depth_m.shape[1])
+        if depth_width <= 1 or depth_height <= 1:
+            return {"status": "unavailable", "reason": "Latest depth image is empty."}
+        frame_id = str(depth_snapshot.get("frame_id") or camera_info.get("frame_id") or "")
+        base_transform = self._lookup_transform_xyz_quat(self.config.base_frame, frame_id)
+        map_transform = self._lookup_transform_xyz_quat(self.config.map_frame, frame_id)
+        if base_transform is None:
+            return {
+                "status": "unavailable",
+                "reason": f"Could not transform RGB-D depth points from `{frame_id}` to `{self.config.base_frame}`.",
+                "bbox_xyxy": [round(item, 3) for item in bbox],
+                "depth_image": {"width": depth_width, "height": depth_height, "frame_id": frame_id},
+            }
+        image_width = int(payload.get("image_width") or payload.get("width") or depth_width)
+        image_height = int(payload.get("image_height") or payload.get("height") or depth_height)
+        inner_ratio = clamp(float(payload.get("bbox_sample_inner_ratio", 0.65) or 0.65), 0.2, 1.0)
+        x0, y0, x1, y1 = _scaled_bbox_window(
+            bbox_xyxy=bbox,
+            image_width=image_width,
+            image_height=image_height,
+            cloud_width=depth_width,
+            cloud_height=depth_height,
+            inner_ratio=inner_ratio,
+        )
+        max_depth_m = clamp(float(payload.get("max_depth_m", 4.0) or 4.0), 0.2, 12.0)
+        min_depth_m = clamp(float(payload.get("min_depth_m", 0.05) or 0.05), 0.01, 2.0)
+        min_points = max(int(payload.get("min_valid_points", 12) or 12), 1)
+        sample_depth = depth_m[y0 : y1 + 1, x0 : x1 + 1]
+        valid = np.isfinite(sample_depth) & (sample_depth >= min_depth_m) & (sample_depth <= max_depth_m)
+        if int(np.count_nonzero(valid)) < min_points and inner_ratio < 1.0:
+            x0, y0, x1, y1 = _scaled_bbox_window(
+                bbox_xyxy=bbox,
+                image_width=image_width,
+                image_height=image_height,
+                cloud_width=depth_width,
+                cloud_height=depth_height,
+                inner_ratio=1.0,
+            )
+            sample_depth = depth_m[y0 : y1 + 1, x0 : x1 + 1]
+            valid = np.isfinite(sample_depth) & (sample_depth >= min_depth_m) & (sample_depth <= max_depth_m)
+        valid_count = int(np.count_nonzero(valid))
+        if valid_count < min_points:
+            return {
+                "status": "not_found",
+                "reason": f"Only {valid_count} valid depth samples were found inside the detection bbox.",
+                "geometry_source": "depth_image",
+                "bbox_xyxy": [round(item, 3) for item in bbox],
+                "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+                "depth_image": {"width": depth_width, "height": depth_height, "frame_id": frame_id},
+                "valid_sample_count": valid_count,
+            }
+
+        fx, fy, cx, cy = _scaled_intrinsics_for_image(camera_info, width=depth_width, height=depth_height)
+        rows, cols = np.nonzero(valid)
+        u = cols.astype(np.float32) + float(x0)
+        v = rows.astype(np.float32) + float(y0)
+        z = sample_depth[valid].astype(np.float32, copy=False)
+        sample_camera = _project_depth_pixels_to_camera_link(u=u, v=v, depth_m=z, fx=fx, fy=fy, cx=cx, cy=cy)
+        base_translation, base_quaternion = base_transform
+        base_rotation = _quaternion_rotation_matrix(*base_quaternion)
+        sample_base = (sample_camera @ base_rotation.T + base_translation.reshape(1, 3)).astype(np.float32, copy=False)
+        object_base = np.median(sample_base, axis=0)
+        object_map = None
+        if map_transform is not None:
+            map_translation, map_quaternion = map_transform
+            map_rotation = _quaternion_rotation_matrix(*map_quaternion)
+            object_map = np.median(
+                (sample_camera @ map_rotation.T + map_translation.reshape(1, 3)).astype(np.float32, copy=False),
+                axis=0,
+            )
+
+        depth_valid = np.isfinite(depth_m) & (depth_m >= min_depth_m) & (depth_m <= max_depth_m)
+        safety_points_camera = _depth_image_to_sampled_camera_link_points(
+            depth_m=depth_m,
+            valid=depth_valid,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            max_points=int(payload.get("max_safety_depth_points", 50000) or 50000),
+        )
+        safety_points_base = (
+            (safety_points_camera @ base_rotation.T + base_translation.reshape(1, 3)).astype(np.float32, copy=False)
+            if safety_points_camera.size
+            else sample_base
+        )
+        forward_m = float(object_base[0])
+        lateral_m = float(object_base[1])
+        vertical_m = float(object_base[2])
+        range_m = math.sqrt(forward_m * forward_m + lateral_m * lateral_m + vertical_m * vertical_m)
+        target_max_m = clamp(float(payload.get("target_max_m", 0.45) or 0.45), 0.1, 2.0)
+        safety = _safe_forward_step_from_points(
+            safety_points_base,
+            target_forward_m=forward_m,
+            target_max_m=target_max_m,
+            max_step_m=clamp(float(payload.get("max_step_m", 0.08) or 0.08), 0.0, 0.35),
+            robot_width_m=clamp(float(payload.get("robot_width_m", 0.459) or 0.459), 0.1, 1.2),
+            clearance_m=clamp(float(payload.get("clearance_m", 0.06) or 0.06), 0.0, 0.5),
+            collision_height_min_m=float(payload.get("collision_height_min_m", -0.05) or -0.05),
+            collision_height_max_m=float(payload.get("collision_height_max_m", 0.85) or 0.85),
+        )
+        current_pose = self.current_pose()
+        return {
+            "status": "succeeded",
+            "reason": "Detection bbox was grounded with the latest aligned RGB-D depth image.",
+            "geometry_source": "depth_image",
+            "bbox_xyxy": [round(item, 3) for item in bbox],
+            "image_size": {"width": image_width, "height": image_height},
+            "depth_image": {
+                "width": depth_width,
+                "height": depth_height,
+                "frame_id": frame_id,
+                "encoding": depth_snapshot.get("encoding"),
+                "age_s": round(max(time.time() - float(depth_snapshot.get("stamp_s", time.time())), 0.0), 3),
+            },
+            "camera_info": {
+                "width": int(camera_info.get("width", 0) or 0),
+                "height": int(camera_info.get("height", 0) or 0),
+                "fx": round(float(camera_info.get("fx", 0.0) or 0.0), 3),
+                "fy": round(float(camera_info.get("fy", 0.0) or 0.0), 3),
+                "cx": round(float(camera_info.get("cx", 0.0) or 0.0), 3),
+                "cy": round(float(camera_info.get("cy", 0.0) or 0.0), 3),
             },
             "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
             "valid_sample_count": valid_count,
@@ -1895,6 +2238,8 @@ class RosExplorationRuntime(Node):
             "scan_topic": self.config.scan_topic,
             "point_cloud_topic": self.config.point_cloud_topic,
             "rgb_topic": self.config.rgb_topic,
+            "depth_topic": self.config.depth_topic,
+            "camera_info_topic": self.config.camera_info_topic,
             "navigation_map_source": self.config.navigation_map_source
             if self.config.publish_internal_navigation_map
             else "external",
@@ -1903,6 +2248,13 @@ class RosExplorationRuntime(Node):
             "turn_scans": list(self._nav_scan_history),
             "latest_scan": self.latest_scan_stats,
             "latest_point_cloud": self.latest_point_cloud_stats,
+            "latest_depth_image": self.latest_depth_stats,
+            "latest_camera_info": None
+            if self.latest_camera_info_snapshot is None
+            else {
+                key: self.latest_camera_info_snapshot.get(key)
+                for key in ("frame_id", "width", "height", "fx", "fy", "cx", "cy")
+            },
             "latest_map": self.latest_map_summary(),
             "latest_relocalization_map": None
             if self.latest_relocalization_map is None

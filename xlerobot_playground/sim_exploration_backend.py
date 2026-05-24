@@ -137,6 +137,8 @@ class SimExplorationConfig:
     ros_local_rotation_active_topic: str = "/xlerobot/local_rotation_active"
     ros_scan_active_release_delay_s: float = 3.0
     ros_rgb_topic: str = "/camera/head/image_raw"
+    ros_depth_topic: str = "/camera/head/depth/image_raw"
+    ros_camera_info_topic: str = "/camera/head/camera_info"
     ros_imu_topic: str = "/imu/filtered_yaw"
     ros_cmd_vel_topic: str = "/cmd_vel"
     ros_map_frame: str = "map"
@@ -3348,6 +3350,8 @@ class RosExplorationSession:
                     local_rotation_active_topic=config.ros_local_rotation_active_topic,
                     scan_active_release_delay_s=config.ros_scan_active_release_delay_s,
                     rgb_topic=config.ros_rgb_topic,
+                    depth_topic=config.ros_depth_topic,
+                    camera_info_topic=config.ros_camera_info_topic,
                     imu_topic=config.ros_imu_topic,
                     cmd_vel_topic=config.ros_cmd_vel_topic,
                     map_frame=config.ros_map_frame,
@@ -5506,6 +5510,8 @@ class RosExplorationSession:
                     "scan_topic": self.config.ros_scan_topic,
                     "point_cloud_topic": self.config.ros_point_cloud_topic,
                     "rgb_topic": self.config.ros_rgb_topic,
+                    "depth_topic": self.config.ros_depth_topic,
+                    "camera_info_topic": self.config.ros_camera_info_topic,
                     "imu_topic": self.config.ros_imu_topic,
                     "navigation_map_source": self.config.ros_navigation_map_source,
                     "base_frame": self.config.ros_base_frame,
@@ -6023,6 +6029,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-local-rotation-active-topic", default="/xlerobot/local_rotation_active")
     parser.add_argument("--ros-scan-active-release-delay-s", type=float, default=3.0)
     parser.add_argument("--ros-rgb-topic", default="/camera/head/image_raw")
+    parser.add_argument("--ros-depth-topic", default="/camera/head/depth/image_raw")
+    parser.add_argument("--ros-camera-info-topic", default="/camera/head/camera_info")
     parser.add_argument("--ros-imu-topic", default="/imu/filtered_yaw")
     parser.add_argument("--ros-cmd-vel-topic", default="/cmd_vel")
     parser.add_argument("--ros-map-frame", default="map")
@@ -6164,6 +6172,8 @@ def main(argv: list[str] | None = None) -> int:
             ros_local_rotation_active_topic=args.ros_local_rotation_active_topic,
             ros_scan_active_release_delay_s=args.ros_scan_active_release_delay_s,
             ros_rgb_topic=args.ros_rgb_topic,
+            ros_depth_topic=args.ros_depth_topic,
+            ros_camera_info_topic=args.ros_camera_info_topic,
             ros_imu_topic=args.ros_imu_topic,
             ros_cmd_vel_topic=args.ros_cmd_vel_topic,
             ros_map_frame=args.ros_map_frame,

@@ -119,9 +119,19 @@ Region visual-search flow:
 
 Object approach flow:
 - `focus_detected_object(detection_id, object_label)` recaptures RGB and rotates in small backend-controlled steps until the bbox is centered
-- `approach_detected_object(detection_id, object_label)` recaptures RGB, redetects, asks the exploration backend to solve bbox depth from the latest organized RGB-D point cloud, checks a small body corridor, then calls `micro_adjust_to_pose` for a short forward step
+- `approach_detected_object(detection_id, object_label)` recaptures RGB, redetects, asks the exploration backend to solve bbox depth from the latest aligned RGB-D depth image + camera intrinsics, checks a small body corridor, then calls `micro_adjust_to_pose` for a short forward step
 - the approach loop repeats until the object is in the configured staging range
 - `grab_object(object_label, detection_id, object_description)` is mocked for now; it is where the VLA grasp skill will connect
+
+For real-robot approach, the exploration backend needs these ROS topics. The defaults match `real_ros_bridge.py`:
+
+```bash
+--ros-rgb-topic /camera/head/image_raw
+--ros-depth-topic /camera/head/depth/image_raw
+--ros-camera-info-topic /camera/head/camera_info
+```
+
+The older point-cloud grounding path is only a fallback now; object approach should use RGB-D image depth directly.
 
 ### Optional Online Object Detection
 
