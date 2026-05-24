@@ -535,13 +535,16 @@ class HomeAgentToolRuntime:
             },
         )
         data_url = response.get("image_data_url")
+        robot_pose = _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None
+        if robot_pose is not None:
+            self.current_pose = robot_pose
         if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
             return {
                 "status": str(response.get("status") or "unavailable"),
                 "reason": response.get("reason") or "Exploration backend did not return an RGB image.",
                 "backend_url": self.config.exploration_backend_url,
                 "captured_at": response.get("captured_at"),
-                "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+                "robot_pose": robot_pose,
             }
         metadata = {
             "run_id": self.run_id,
@@ -556,7 +559,7 @@ class HomeAgentToolRuntime:
                 "fov_deg": shot.get("fov_deg"),
             },
             "current_pose": _json_pose(self.current_pose),
-            "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+            "robot_pose": robot_pose,
             "captured_at": response.get("captured_at") or time.time(),
             "backend_url": self.config.exploration_backend_url,
         }
@@ -956,13 +959,16 @@ class HomeAgentToolRuntime:
             },
         )
         data_url = response.get("image_data_url")
+        robot_pose = _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None
+        if robot_pose is not None:
+            self.current_pose = robot_pose
         if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
             return {
                 "status": str(response.get("status") or "unavailable"),
                 "reason": response.get("reason") or "Exploration backend did not return an RGB image.",
                 "backend_url": self.config.exploration_backend_url,
                 "captured_at": response.get("captured_at"),
-                "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+                "robot_pose": robot_pose,
                 "shot_id": shot_id,
             }
         metadata = {
@@ -971,7 +977,7 @@ class HomeAgentToolRuntime:
             "shot_id": shot_id,
             "reason": tool_name,
             "current_pose": _json_pose(self.current_pose),
-            "robot_pose": _json_pose(response["robot_pose"]) if isinstance(response.get("robot_pose"), dict) else None,
+            "robot_pose": robot_pose,
             "captured_at": response.get("captured_at") or time.time(),
             "backend_url": self.config.exploration_backend_url,
         }
@@ -1039,6 +1045,9 @@ class HomeAgentToolRuntime:
                 "detection_id": detection.get("detection_id"),
             },
         )
+        current_pose = response.get("current_pose") if isinstance(response, dict) else None
+        if isinstance(current_pose, dict):
+            self.current_pose = _json_pose(current_pose)
         return response if isinstance(response, dict) else {"status": "failed", "reason": "Geometry endpoint response was invalid."}
 
     def _track_detection_result(
