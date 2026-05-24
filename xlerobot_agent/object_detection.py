@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+import io
 import json
 import time
 from typing import Any
 import urllib.error
 import urllib.request
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - exercised only when Pillow is unavailable.
+    Image = None  # type: ignore[assignment]
 
 
 _REPLICATE_VERSION_CACHE: dict[str, str] = {}
@@ -21,6 +28,8 @@ class ObjectDetectorConfig:
     text_threshold: float = 0.25
     min_confidence: float = 0.25
     timeout_s: float = 90.0
+    max_image_edge_px: int = 1280
+    jpeg_quality: int = 85
 
 
 def detect_object_in_image(
@@ -107,6 +116,11 @@ def _replicate_grounding_dino_detection(
             "reason": "Missing Replicate API token. Set REPLICATE_API_TOKEN or ROBOT42_OBJECT_DETECTOR_API_KEY.",
         }
     try:
+        image_data_url, image_preprocess = _prepare_replicate_image_data_url(
+            image_data_url,
+            max_edge_px=config.max_image_edge_px,
+            jpeg_quality=config.jpeg_quality,
+        )
         version = config.model_version or _replicate_latest_version(
             model=config.model,
             api_key=api_key,
@@ -147,6 +161,7 @@ def _replicate_grounding_dino_detection(
         object_label=object_label,
         image_path=image_path,
         min_confidence=config.min_confidence,
+        image_preprocess=image_preprocess,
     )
     result_image = output.get("result_image") if isinstance(output, dict) else None
     result = {
@@ -160,6 +175,7 @@ def _replicate_grounding_dino_detection(
         "replicate_prediction_id": prediction.get("id"),
         "replicate_status": status,
         "provider_result_image_url": result_image,
+        "image_preprocess": image_preprocess,
         "reason": (
             f"Detected `{object_label}` with Replicate Grounding DINO."
             if detections
@@ -275,6 +291,7 @@ def _normalize_replicate_detections(
     object_label: str,
     image_path: str | None,
     min_confidence: float,
+    image_preprocess: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     raw_detections: list[Any]
     if isinstance(output, dict) and isinstance(output.get("detections"), list):
@@ -292,6 +309,7 @@ def _normalize_replicate_detections(
         confidence = _extract_confidence(raw)
         if bbox is None or confidence is None or confidence < min_confidence:
             continue
+        bbox = _scale_bbox_to_source_image(bbox, image_preprocess)
         label = str(raw.get("label") or raw.get("class") or raw.get("phrase") or object_label)
         detection = {
             "detection_id": f"{shot_id}_det_{index}",
@@ -305,6 +323,99 @@ def _normalize_replicate_detections(
         detections.append(detection)
     detections.sort(key=lambda item: float(item.get("confidence", 0.0) or 0.0), reverse=True)
     return detections
+
+
+def _prepare_replicate_image_data_url(
+    image_data_url: str,
+    *,
+    max_edge_px: int,
+    jpeg_quality: int,
+) -> tuple[str, dict[str, Any]]:
+    metadata: dict[str, Any] = {
+        "status": "unchanged",
+        "reason": "image was not resized",
+    }
+    if Image is None:
+        metadata["reason"] = "Pillow is unavailable; sent original data URL"
+        return image_data_url, metadata
+    try:
+        header, encoded = image_data_url.split(",", 1)
+        if ";base64" not in header:
+            metadata["reason"] = "image data URL is not base64; sent original data URL"
+            return image_data_url, metadata
+        mime_type = header.removeprefix("data:").split(";", 1)[0] or "application/octet-stream"
+        raw = base64.b64decode(encoded)
+        with Image.open(io.BytesIO(raw)) as opened:
+            image = opened.convert("RGB")
+            source_width, source_height = image.size
+            metadata.update(
+                {
+                    "source_mime_type": mime_type,
+                    "source_width": source_width,
+                    "source_height": source_height,
+                    "source_bytes": len(raw),
+                }
+            )
+            max_edge = max(int(max_edge_px or 0), 1)
+            scale = min(1.0, float(max_edge) / float(max(source_width, source_height)))
+            if scale < 1.0:
+                resized_width = max(int(round(source_width * scale)), 1)
+                resized_height = max(int(round(source_height * scale)), 1)
+                resample = getattr(Image, "Resampling", Image).LANCZOS
+                image = image.resize((resized_width, resized_height), resample)
+            else:
+                resized_width, resized_height = source_width, source_height
+            buffer = io.BytesIO()
+            image.save(
+                buffer,
+                format="JPEG",
+                quality=max(1, min(int(jpeg_quality), 95)),
+                optimize=True,
+            )
+    except Exception as exc:
+        metadata["status"] = "unchanged"
+        metadata["reason"] = f"could not preprocess image; sent original data URL: {exc}"
+        return image_data_url, metadata
+
+    data = buffer.getvalue()
+    metadata.update(
+        {
+            "status": "resized" if (resized_width, resized_height) != (source_width, source_height) else "reencoded",
+            "sent_mime_type": "image/jpeg",
+            "sent_width": resized_width,
+            "sent_height": resized_height,
+            "sent_bytes": len(data),
+            "max_image_edge_px": max_edge_px,
+            "jpeg_quality": max(1, min(int(jpeg_quality), 95)),
+        }
+    )
+    return f"data:image/jpeg;base64,{base64.b64encode(data).decode('ascii')}", metadata
+
+
+def _scale_bbox_to_source_image(bbox: list[float], image_preprocess: dict[str, Any] | None) -> list[float]:
+    if not isinstance(image_preprocess, dict):
+        return bbox
+    try:
+        source_width = float(image_preprocess.get("source_width") or 0)
+        source_height = float(image_preprocess.get("source_height") or 0)
+        sent_width = float(image_preprocess.get("sent_width") or 0)
+        sent_height = float(image_preprocess.get("sent_height") or 0)
+    except Exception:
+        return bbox
+    if min(source_width, source_height, sent_width, sent_height) <= 0.0:
+        return bbox
+    if abs(source_width - sent_width) < 0.001 and abs(source_height - sent_height) < 0.001:
+        return bbox
+    if max(abs(value) for value in bbox[:4]) <= 1.5:
+        return bbox
+    x_scale = source_width / sent_width
+    y_scale = source_height / sent_height
+    return [
+        round(float(bbox[0]) * x_scale, 3),
+        round(float(bbox[1]) * y_scale, 3),
+        round(float(bbox[2]) * x_scale, 3),
+        round(float(bbox[3]) * y_scale, 3),
+    ]
 
 
 def _extract_bbox_xyxy(raw: dict[str, Any]) -> list[float] | None:

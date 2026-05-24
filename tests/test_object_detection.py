@@ -1,3 +1,5 @@
+import base64
+import io
 import json
 import unittest
 from unittest.mock import patch
@@ -108,6 +110,35 @@ class ObjectDetectionTest(unittest.TestCase):
         )
 
         self.assertEqual(detections[0]["bbox_xyxy"], [80.0, 70.0, 120.0, 90.0])
+
+    def test_replicate_preprocess_resizes_image_and_maps_boxes_back_to_source_pixels(self) -> None:
+        if object_detection.Image is None:
+            self.skipTest("Pillow is unavailable")
+        image = object_detection.Image.new("RGB", (200, 100), (255, 0, 0))
+        buffer = io.BytesIO()
+        image.save(buffer, format="PNG")
+        data_url = "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
+
+        resized_url, metadata = object_detection._prepare_replicate_image_data_url(
+            data_url,
+            max_edge_px=100,
+            jpeg_quality=80,
+        )
+        detections = object_detection._normalize_replicate_detections(
+            [{"label": "red thing", "confidence": 0.9, "bbox": [10, 20, 50, 40]}],
+            shot_id="shot_3",
+            object_label="red thing",
+            image_path=None,
+            min_confidence=0.25,
+            image_preprocess=metadata,
+        )
+
+        self.assertTrue(resized_url.startswith("data:image/jpeg;base64,"))
+        self.assertEqual(metadata["source_width"], 200)
+        self.assertEqual(metadata["source_height"], 100)
+        self.assertEqual(metadata["sent_width"], 100)
+        self.assertEqual(metadata["sent_height"], 50)
+        self.assertEqual(detections[0]["bbox_xyxy"], [20.0, 40.0, 100.0, 80.0])
 
 
 if __name__ == "__main__":

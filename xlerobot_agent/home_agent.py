@@ -74,6 +74,8 @@ class HomeAgentConfig:
     object_detector_text_threshold: float = 0.25
     object_detector_min_confidence: float = 0.25
     object_detector_timeout_s: float = 90.0
+    object_detector_max_image_edge_px: int = 1280
+    object_detector_jpeg_quality: int = 85
     object_focus_horizontal_fov_deg: float = 65.0
     object_focus_center_tolerance_norm: float = 0.08
     object_focus_max_attempts: int = 5
@@ -2294,6 +2296,8 @@ def config_from_env() -> HomeAgentConfig:
         object_detector_text_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD", "0.25")),
         object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.25")),
         object_detector_timeout_s=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TIMEOUT_S", "90")),
+        object_detector_max_image_edge_px=int(os.getenv("ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX", "1280")),
+        object_detector_jpeg_quality=int(os.getenv("ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY", "85")),
         object_focus_horizontal_fov_deg=float(os.getenv("ROBOT42_OBJECT_FOCUS_HORIZONTAL_FOV_DEG", "65")),
         object_focus_center_tolerance_norm=float(os.getenv("ROBOT42_OBJECT_FOCUS_CENTER_TOLERANCE_NORM", "0.08")),
         object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "5")),
@@ -2688,6 +2692,8 @@ def _object_detector_config(config: HomeAgentConfig) -> ObjectDetectorConfig:
         text_threshold=config.object_detector_text_threshold,
         min_confidence=config.object_detector_min_confidence,
         timeout_s=config.object_detector_timeout_s,
+        max_image_edge_px=config.object_detector_max_image_edge_px,
+        jpeg_quality=config.object_detector_jpeg_quality,
     )
 
 

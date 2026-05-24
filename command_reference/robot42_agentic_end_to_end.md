@@ -149,10 +149,14 @@ python examples/robot42_agent_backend.py \
   --object-detector-box-threshold 0.25 \
   --object-detector-text-threshold 0.25 \
   --object-detector-min-confidence 0.25 \
+  --object-detector-max-image-edge-px 1280 \
+  --object-detector-jpeg-quality 85 \
   --object-approach-target-min-m 0.35 \
   --object-approach-target-max-m 0.45 \
   --object-approach-step-m 0.08
 ```
+
+Robot42 resizes/re-encodes images sent to Replicate by default. This keeps detector calls small enough for Replicate/Cloudflare while mapping returned boxes back to the original saved RGB shot for focus and RGB-D approach.
 
 For a no-network smoke test that always returns a centered fake detection:
 

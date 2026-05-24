@@ -188,6 +188,8 @@ export ROBOT42_OBJECT_DETECTOR_BOX_THRESHOLD=0.25
 export ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD=0.25
 export ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE=0.25
 export ROBOT42_OBJECT_DETECTOR_TIMEOUT_S=90
+export ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX=1280
+export ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY=85
 ```
 
 Or CLI:
@@ -205,8 +207,12 @@ python examples/robot42_agent_backend.py \
   --object-detector-model adirik/grounding-dino \
   --object-detector-box-threshold 0.25 \
   --object-detector-text-threshold 0.25 \
-  --object-detector-min-confidence 0.25
+  --object-detector-min-confidence 0.25 \
+  --object-detector-max-image-edge-px 1280 \
+  --object-detector-jpeg-quality 85
 ```
+
+For Replicate calls, Robot42 sends a resized/re-encoded JPEG and then scales detection boxes back to the original saved RGB image. This avoids large base64 requests while keeping focus/approach geometry aligned with the original camera frame.
 
 For local dry tests without spending API calls:
 

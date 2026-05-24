@@ -45,6 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-detector-text-threshold", type=float, default=None)
     parser.add_argument("--object-detector-min-confidence", type=float, default=None)
     parser.add_argument("--object-detector-timeout-s", type=float, default=None)
+    parser.add_argument("--object-detector-max-image-edge-px", type=int, default=None)
+    parser.add_argument("--object-detector-jpeg-quality", type=int, default=None)
     parser.add_argument("--object-focus-horizontal-fov-deg", type=float, default=None)
     parser.add_argument("--object-focus-center-tolerance-norm", type=float, default=None)
     parser.add_argument("--object-focus-max-attempts", type=int, default=None)
@@ -87,6 +89,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
     print(f"Agent artifacts: {config.agent_artifacts_root}")
     print(f"Object detector: {config.object_detector_provider}")
+    if config.object_detector_provider == "replicate_grounding_dino":
+        print(
+            "Object detector image: "
+            f"max_edge={config.object_detector_max_image_edge_px}px, jpeg_quality={config.object_detector_jpeg_quality}"
+        )
     print(
         "Object approach: "
         f"target={config.object_approach_target_min_m:g}-{config.object_approach_target_max_m:g}m, "
@@ -179,6 +186,16 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.object_detector_timeout_s
             if args.object_detector_timeout_s is not None
             else config.object_detector_timeout_s
+        ),
+        object_detector_max_image_edge_px=(
+            args.object_detector_max_image_edge_px
+            if args.object_detector_max_image_edge_px is not None
+            else config.object_detector_max_image_edge_px
+        ),
+        object_detector_jpeg_quality=(
+            args.object_detector_jpeg_quality
+            if args.object_detector_jpeg_quality is not None
+            else config.object_detector_jpeg_quality
         ),
         object_focus_horizontal_fov_deg=(
             args.object_focus_horizontal_fov_deg
