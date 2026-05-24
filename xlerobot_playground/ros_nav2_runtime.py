@@ -256,6 +256,15 @@ def _camera_info_intrinsics(message: Any) -> dict[str, Any] | None:
     }
 
 
+def _snapshot_stamp_s(snapshot: Any) -> float:
+    if isinstance(snapshot, dict):
+        try:
+            return float(snapshot.get("stamp_s", 0.0) or 0.0)
+        except Exception:
+            return 0.0
+    return 0.0
+
+
 def _scaled_intrinsics_for_image(intrinsics: dict[str, Any], *, width: int, height: int) -> tuple[float, float, float, float]:
     source_width = max(float(intrinsics.get("width") or width), 1.0)
     source_height = max(float(intrinsics.get("height") or height), 1.0)
@@ -565,6 +574,7 @@ class RosRuntimeConfig:
     rgb_topic: str = "/camera/head/image_raw"
     depth_topic: str = "/camera/head/depth/image_raw"
     camera_info_topic: str = "/camera/head/camera_info"
+    rgbd_update_timeout_s: float = 0.7
     imu_topic: str = "/imu/filtered_yaw"
     cmd_vel_topic: str = "/cmd_vel"
     initial_pose_topic: str = "/initialpose"
@@ -1146,12 +1156,28 @@ class RosExplorationRuntime(Node):
         )
 
     def estimate_detection_geometry(self, payload: dict[str, Any]) -> dict[str, Any]:
+        previous_depth_stamp_s = _snapshot_stamp_s(self.latest_depth_snapshot)
+        previous_camera_info_stamp_s = _snapshot_stamp_s(self.latest_camera_info_snapshot)
         try:
             settle_s = clamp(float(payload.get("settle_s", 0.05) or 0.05), 0.0, 0.5)
         except Exception:
             settle_s = 0.05
         if settle_s > 0.0:
             self.spin_for(settle_s)
+        try:
+            rgbd_wait_s = clamp(
+                float(payload.get("rgbd_update_timeout_s", self.config.rgbd_update_timeout_s) or 0.0),
+                0.0,
+                2.0,
+            )
+        except Exception:
+            rgbd_wait_s = self.config.rgbd_update_timeout_s
+        if rgbd_wait_s > 0.0:
+            self.wait_for_rgbd_update(
+                after_depth_stamp_s=previous_depth_stamp_s,
+                after_camera_info_stamp_s=previous_camera_info_stamp_s,
+                timeout_s=rgbd_wait_s,
+            )
         bbox = _bbox_xyxy(payload.get("bbox_xyxy") or payload.get("bbox") or payload.get("detection"))
         if bbox is None:
             return {"status": "rejected", "reason": "bbox_xyxy is required to estimate object geometry."}
@@ -1334,6 +1360,27 @@ class RosExplorationRuntime(Node):
                     "encoding": depth_snapshot.get("encoding"),
                 },
             }
+        try:
+            max_depth_age_s = clamp(float(payload.get("max_depth_age_s", 2.0) or 2.0), 0.1, 10.0)
+        except Exception:
+            max_depth_age_s = 2.0
+        depth_age_s = max(time.time() - float(depth_snapshot.get("stamp_s", 0.0) or 0.0), 0.0)
+        if depth_age_s > max_depth_age_s:
+            return {
+                "status": "unavailable",
+                "reason": f"Latest depth image is stale ({depth_age_s:.2f}s old).",
+                "depth_image": {
+                    "width": depth_snapshot.get("width"),
+                    "height": depth_snapshot.get("height"),
+                    "frame_id": depth_snapshot.get("frame_id"),
+                    "encoding": depth_snapshot.get("encoding"),
+                    "age_s": round(depth_age_s, 3),
+                },
+                "camera_info": {
+                    "frame_id": camera_info.get("frame_id"),
+                    "age_s": round(max(time.time() - float(camera_info.get("stamp_s", time.time())), 0.0), 3),
+                },
+            }
         depth_height, depth_width = int(depth_m.shape[0]), int(depth_m.shape[1])
         if depth_width <= 1 or depth_height <= 1:
             return {"status": "unavailable", "reason": "Latest depth image is empty."}
@@ -1490,6 +1537,31 @@ class RosExplorationRuntime(Node):
         deadline = time.time() + duration_s
         while time.time() < deadline:
             self._spin_once(timeout_sec=0.05)
+
+    def wait_for_rgbd_update(
+        self,
+        *,
+        after_depth_stamp_s: float = 0.0,
+        after_camera_info_stamp_s: float = 0.0,
+        timeout_s: float = 0.7,
+    ) -> bool:
+        deadline = time.time() + max(float(timeout_s), 0.0)
+        while time.time() < deadline:
+            self._spin_once(timeout_sec=min(0.05, max(deadline - time.time(), 0.0)))
+            depth_stamp_s = _snapshot_stamp_s(self.latest_depth_snapshot)
+            camera_info_stamp_s = _snapshot_stamp_s(self.latest_camera_info_snapshot)
+            if (
+                isinstance(self.latest_depth_snapshot, dict)
+                and isinstance(self.latest_camera_info_snapshot, dict)
+                and depth_stamp_s > after_depth_stamp_s
+                and (after_camera_info_stamp_s <= 0.0 or camera_info_stamp_s > 0.0)
+            ):
+                return True
+        return (
+            isinstance(self.latest_depth_snapshot, dict)
+            and isinstance(self.latest_camera_info_snapshot, dict)
+            and _snapshot_stamp_s(self.latest_depth_snapshot) > after_depth_stamp_s
+        )
 
     def wait_for_map_update(self, *, after_stamp_s: float, timeout_s: float = 2.0) -> bool:
         deadline = time.time() + max(float(timeout_s), 0.0)
@@ -2231,6 +2303,10 @@ class RosExplorationRuntime(Node):
         }
 
     def snapshot(self) -> dict[str, Any]:
+        try:
+            self._spin_once(timeout_sec=0.0)
+        except Exception:
+            pass
         return {
             "module": "ros_nav2",
             "map_topic": self.config.map_topic,

@@ -4211,19 +4211,34 @@ class RosExplorationSession:
 
     def capture_rgbd_snapshot(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         rgb = self.capture_rgb_snapshot(payload)
-        snapshot = getattr(self.runtime, "latest_point_cloud_stats", None)
-        rgbd_status = "succeeded" if rgb.get("status") == "succeeded" and isinstance(snapshot, dict) else "unavailable"
+        depth_snapshot = getattr(self.runtime, "latest_depth_stats", None)
+        camera_info = getattr(self.runtime, "latest_camera_info_snapshot", None)
+        point_cloud_snapshot = getattr(self.runtime, "latest_point_cloud_stats", None)
+        rgbd_status = (
+            "succeeded"
+            if rgb.get("status") == "succeeded" and isinstance(depth_snapshot, dict) and isinstance(camera_info, dict)
+            else "unavailable"
+        )
         result = {
             **rgb,
             "status": rgbd_status,
             "reason": (
                 rgb.get("reason")
                 if rgbd_status == "succeeded"
-                else "RGB image or organized RGB-D point cloud is not available from the active ROS runtime yet."
+                else "RGB image, depth image, or camera_info is not available from the active ROS runtime yet."
             ),
             "rgbd": {
-                "status": "available" if isinstance(snapshot, dict) else "unavailable",
-                "point_cloud": snapshot if isinstance(snapshot, dict) else None,
+                "status": "available" if rgbd_status == "succeeded" else "unavailable",
+                "depth_image": depth_snapshot if isinstance(depth_snapshot, dict) else None,
+                "camera_info": (
+                    {
+                        key: camera_info.get(key)
+                        for key in ("frame_id", "width", "height", "fx", "fy", "cx", "cy", "stamp_s")
+                    }
+                    if isinstance(camera_info, dict)
+                    else None
+                ),
+                "point_cloud": point_cloud_snapshot if isinstance(point_cloud_snapshot, dict) else None,
                 "note": "Depth geometry is solved server-side with /api/nav/estimate_detection_geometry.",
             },
         }

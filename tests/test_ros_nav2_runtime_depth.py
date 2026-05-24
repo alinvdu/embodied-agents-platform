@@ -66,6 +66,12 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
         self.assertAlmostEqual(float(points[1, 1]), -0.4)
         self.assertAlmostEqual(float(points[1, 2]), 0.4)
 
+    def test_snapshot_stamp_s_handles_missing_or_invalid_values(self) -> None:
+        self.assertEqual(ros_nav2_runtime._snapshot_stamp_s(None), 0.0)
+        self.assertEqual(ros_nav2_runtime._snapshot_stamp_s({}), 0.0)
+        self.assertEqual(ros_nav2_runtime._snapshot_stamp_s({"stamp_s": "bad"}), 0.0)
+        self.assertEqual(ros_nav2_runtime._snapshot_stamp_s({"stamp_s": 123.5}), 123.5)
+
 
 if __name__ == "__main__":
     unittest.main()
