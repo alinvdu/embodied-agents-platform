@@ -52,6 +52,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-focus-max-attempts", type=int, default=None)
     parser.add_argument("--object-approach-target-min-m", type=float, default=None)
     parser.add_argument("--object-approach-target-max-m", type=float, default=None)
+    parser.add_argument("--object-approach-target-tolerance-m", type=float, default=None)
     parser.add_argument("--object-approach-step-m", type=float, default=None)
     parser.add_argument("--object-approach-max-attempts", type=int, default=None)
     parser.add_argument("--object-approach-robot-width-m", type=float, default=None)
@@ -97,6 +98,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Object approach: "
         f"target={config.object_approach_target_min_m:g}-{config.object_approach_target_max_m:g}m, "
+        f"tolerance={config.object_approach_target_tolerance_m:g}m, "
         f"step={config.object_approach_step_m:g}m, attempts={config.object_approach_max_attempts}"
     )
     if config.model.provider == "mock":
@@ -221,6 +223,11 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.object_approach_target_max_m
             if args.object_approach_target_max_m is not None
             else config.object_approach_target_max_m
+        ),
+        object_approach_target_tolerance_m=(
+            args.object_approach_target_tolerance_m
+            if args.object_approach_target_tolerance_m is not None
+            else config.object_approach_target_tolerance_m
         ),
         object_approach_step_m=(
             args.object_approach_step_m

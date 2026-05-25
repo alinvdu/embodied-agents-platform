@@ -82,6 +82,7 @@ class HomeAgentConfig:
     object_focus_max_attempts: int = 3
     object_approach_target_min_m: float = 0.35
     object_approach_target_max_m: float = 0.45
+    object_approach_target_tolerance_m: float = 0.025
     object_approach_step_m: float = 0.08
     object_approach_max_attempts: int = 10
     object_approach_robot_width_m: float = 0.459
@@ -129,6 +130,7 @@ class HomeAgentToolRuntime:
         self.stopped = False
         self.detection_tracking: dict[str, dict[str, Any]] = {}
         self.selected_detection_id: str | None = None
+        self.object_approach_state: dict[str, dict[str, Any]] = {}
 
     def preview_path_to_pose(
         self,
@@ -818,6 +820,12 @@ class HomeAgentToolRuntime:
             minimum=max(target_min_m, 0.1),
             maximum=2.5,
         )
+        target_tolerance_m = _bounded_float(
+            constraints.get("target_tolerance_m", self.config.object_approach_target_tolerance_m),
+            self.config.object_approach_target_tolerance_m,
+            minimum=0.0,
+            maximum=0.1,
+        )
         step_m = _bounded_float(
             constraints.get("step_m", self.config.object_approach_step_m),
             self.config.object_approach_step_m,
@@ -836,11 +844,31 @@ class HomeAgentToolRuntime:
             minimum=1,
             maximum=6,
         ))
+        approach_key = _object_approach_key(label)
+        approach_state = self.object_approach_state.get(approach_key, {})
+        surface_alignment_already_attempted = bool(approach_state.get("surface_alignment_attempted"))
+        allow_surface_alignment = _constraint_bool(
+            constraints,
+            "allow_surface_alignment",
+            not surface_alignment_already_attempted,
+        )
+        retry_after_surface_alignment = surface_alignment_already_attempted and not allow_surface_alignment
+        force_detector_refresh_first = (
+            surface_alignment_already_attempted
+            and _constraint_bool(constraints, "refresh_detector_on_retry", True)
+        )
         attempts: list[dict[str, Any]] = []
-        motion_steps_since_detection = 0
+        motion_steps_since_detection = redetect_after_motion_steps if force_detector_refresh_first else 0
         refresh_after_geometry_failure = False
         last_state = state
         surface_alignment_attempted = False
+        retry_policy = None
+        if surface_alignment_already_attempted:
+            retry_policy = {
+                "surface_alignment_disabled": not allow_surface_alignment,
+                "detector_refresh_forced": force_detector_refresh_first,
+                "reason": "Surface alignment was already attempted for this object in this run.",
+            }
         for attempt_index in range(1, max_attempts + 1):
             tracked = self._tracked_detection_and_capture(last_state)
             use_tracked_detection = (
@@ -899,6 +927,8 @@ class HomeAgentToolRuntime:
                 "capture": capture,
                 "detection": detection,
             }
+            if retry_policy and attempt_index == 1:
+                attempt["retry_policy"] = retry_policy
             attempts.append(attempt)
             if detection.get("status") != "matched":
                 result = {
@@ -937,7 +967,7 @@ class HomeAgentToolRuntime:
                 return result
             forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
             bearing_error_deg = float(geometry.get("bearing_error_deg", 0.0) or 0.0)
-            if _constraint_bool(constraints, "allow_surface_alignment", True) and not surface_alignment_attempted:
+            if allow_surface_alignment and not surface_alignment_attempted:
                 surface_alignment_attempted = True
                 alignment = self._maybe_align_to_object_surface(
                     object_label=label,
@@ -946,6 +976,12 @@ class HomeAgentToolRuntime:
                     target_max_m=target_max_m,
                 )
                 attempt["surface_alignment"] = alignment
+                if alignment.get("status") in {"succeeded", "partial"}:
+                    self._record_object_surface_alignment(
+                        object_label=label,
+                        detection_id=str(detection.get("selected_detection_id") or ""),
+                        alignment=alignment,
+                    )
                 if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
                     if _constraint_bool(constraints, "relocalize_after_surface_alignment", True):
                         attempt["surface_alignment_relocalization"] = self.relocalize_here()
@@ -989,7 +1025,14 @@ class HomeAgentToolRuntime:
                 motion_steps_since_detection = redetect_after_motion_steps
                 attempt["next_action"] = "refresh_detector_after_bearing_rotation"
                 continue
-            if target_min_m <= forward_m <= target_max_m:
+            if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
+                if forward_m <= target_max_m:
+                    reason = f"Object is within grasp staging range ({forward_m:.2f} m)."
+                else:
+                    reason = (
+                        f"Object is within grasp staging tolerance "
+                        f"({forward_m:.3f} m, target max {target_max_m:.3f} m)."
+                    )
                 result = {
                     "tool": "approach_detected_object",
                     "status": "succeeded",
@@ -997,9 +1040,10 @@ class HomeAgentToolRuntime:
                     "detection_id": detection.get("selected_detection_id"),
                     "selected_detection": selected,
                     "geometry": geometry,
+                    "target_tolerance_m": target_tolerance_m,
                     "attempt_count": attempt_index,
                     "attempts": attempts,
-                    "reason": f"Object is within grasp staging range ({forward_m:.2f} m).",
+                    "reason": reason,
                 }
                 self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
                 self.emit("tool_executed", "Approach Object", result["reason"], result)
@@ -1078,6 +1122,27 @@ class HomeAgentToolRuntime:
         }
         self.emit("tool_blocked", "Approach Object", result["reason"], result)
         return result
+
+    def _record_object_surface_alignment(
+        self,
+        *,
+        object_label: str,
+        detection_id: str,
+        alignment: dict[str, Any],
+    ) -> None:
+        key = _object_approach_key(object_label)
+        if not key:
+            return
+        self.object_approach_state[key] = {
+            **self.object_approach_state.get(key, {}),
+            "object_label": object_label,
+            "surface_alignment_attempted": True,
+            "surface_alignment_had_motion": bool(alignment.get("motion")),
+            "surface_alignment_status": alignment.get("status"),
+            "surface_alignment_reason": alignment.get("reason"),
+            "detection_id": detection_id,
+            "updated_at": time.time(),
+        }
 
     def _maybe_align_to_object_surface(
         self,
@@ -2163,7 +2228,7 @@ class HomeTaskAgent:
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
                 "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
                 "- After each physical forward approach step, approach_detected_object refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
-                "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once and retry approach_detected_object before giving up.",
+                "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
                 "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
@@ -2581,6 +2646,7 @@ def config_from_env() -> HomeAgentConfig:
         object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "3")),
         object_approach_target_min_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MIN_M", "0.35")),
         object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
+        object_approach_target_tolerance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_TOLERANCE_M", "0.025")),
         object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "10")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
@@ -3438,6 +3504,10 @@ def _safe_artifact_name(value: str) -> str:
     normalized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value.strip().lower())
     normalized = "_".join(part for part in normalized.split("_") if part)
     return normalized[:120] or f"capture_{int(time.time())}"
+
+
+def _object_approach_key(value: str) -> str:
+    return " ".join(str(value or "").replace("_", " ").lower().split())
 
 
 def _load_json_file(path: Path) -> Any:

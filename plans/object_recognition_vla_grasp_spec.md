@@ -435,7 +435,8 @@ Behavior:
 9. If too far, check a local swept footprint corridor from RGB-D geometry.
 10. Move forward in small increments.
 11. Refresh the detector after bearing rotations and after each physical forward step by default; use tracked bbox only before physical motion or when explicitly configured.
-12. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
+12. On a retry after support-surface alignment, refresh detection and skip another support-surface realignment unless explicitly requested.
+13. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
 
 Suggested defaults:
 
@@ -443,6 +444,7 @@ Suggested defaults:
 {
   "target_min_m": 0.35,
   "target_max_m": 0.45,
+  "target_tolerance_m": 0.025,
   "step_m": 0.08,
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
@@ -465,6 +467,7 @@ Depth sampling:
 - Filter invalid depth plus values outside the configured min/max range.
 - Project valid depth pixels using real `camera_info` or fallback-FOV intrinsics.
 - Use the median projected 3D point for `forward_m`, `lateral_m`, `vertical_m`, and map pose.
+- Treat readings just above `target_max_m` but within `target_tolerance_m` as valid grasp staging, because millimeter-scale forward steps are less reliable than the depth estimate.
 - Do not use unorganized point cloud fallback for object approach.
 
 Safety checks:
