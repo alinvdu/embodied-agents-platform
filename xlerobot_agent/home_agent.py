@@ -25,6 +25,7 @@ from .home_memory import (
     home_memory_agent_context,
     plan_region_exploration as plan_home_region_exploration,
     resolve_direct_navigation_fallback,
+    resolve_object_surface_approach_pose,
     resolve_region_navigation_goal,
     summarize_home_memory,
 )
@@ -839,6 +840,7 @@ class HomeAgentToolRuntime:
         motion_steps_since_detection = 0
         refresh_after_geometry_failure = False
         last_state = state
+        surface_alignment_attempted = False
         for attempt_index in range(1, max_attempts + 1):
             tracked = self._tracked_detection_and_capture(last_state)
             use_tracked_detection = (
@@ -935,6 +937,31 @@ class HomeAgentToolRuntime:
                 return result
             forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
             bearing_error_deg = float(geometry.get("bearing_error_deg", 0.0) or 0.0)
+            if _constraint_bool(constraints, "allow_surface_alignment", True) and not surface_alignment_attempted:
+                surface_alignment_attempted = True
+                alignment = self._maybe_align_to_object_surface(
+                    object_label=label,
+                    geometry=geometry,
+                    constraints=constraints,
+                    target_max_m=target_max_m,
+                )
+                attempt["surface_alignment"] = alignment
+                if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
+                    motion_steps_since_detection = redetect_after_motion_steps
+                    refresh_after_geometry_failure = False
+                    continue
+                if alignment.get("status") == "blocked":
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "geometry": geometry,
+                        "attempt_count": attempt_index,
+                        "attempts": attempts,
+                        "reason": alignment.get("reason") or "Surface approach alignment failed.",
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
             bearing_tolerance_deg = _bounded_float(
                 constraints.get("bearing_tolerance_deg", 6.0),
                 6.0,
@@ -1045,6 +1072,94 @@ class HomeAgentToolRuntime:
         }
         self.emit("tool_blocked", "Approach Object", result["reason"], result)
         return result
+
+    def _maybe_align_to_object_surface(
+        self,
+        *,
+        object_label: str,
+        geometry: dict[str, Any],
+        constraints: dict[str, Any],
+        target_max_m: float,
+    ) -> dict[str, Any]:
+        object_pose = _object_map_pose_from_geometry(geometry, self.current_pose)
+        if object_pose is None:
+            return {
+                "tool": "resolve_object_surface_approach_pose",
+                "status": "skipped",
+                "reason": "Object map pose is unavailable for surface approach alignment.",
+            }
+        min_clearance_m = _bounded_float(
+            constraints.get("surface_alignment_min_clearance_m", DEFAULT_NAVIGATION_CLEARANCE_M),
+            DEFAULT_NAVIGATION_CLEARANCE_M,
+            minimum=0.0,
+            maximum=1.5,
+        )
+        standoff_m = _bounded_float(
+            constraints.get("surface_alignment_standoff_m", max(target_max_m + 0.20, 0.62)),
+            max(target_max_m + 0.20, 0.62),
+            minimum=target_max_m,
+            maximum=1.5,
+        )
+        max_distance_m = _bounded_float(
+            constraints.get("surface_alignment_max_distance_m", 2.0),
+            2.0,
+            minimum=0.05,
+            maximum=3.0,
+        )
+        alignment = resolve_object_surface_approach_pose(
+            self.memory,
+            self.current_pose,
+            object_pose,
+            min_clearance_m=min_clearance_m,
+            standoff_m=standoff_m,
+            search_beyond_m=_bounded_float(
+                constraints.get("surface_alignment_search_beyond_m", 0.9),
+                0.9,
+                minimum=0.0,
+                maximum=2.5,
+            ),
+            support_radius_m=_bounded_float(
+                constraints.get("surface_alignment_support_radius_m", 0.75),
+                0.75,
+                minimum=0.2,
+                maximum=2.0,
+            ),
+            max_alignment_distance_m=max_distance_m,
+            yaw_tolerance_deg=_bounded_float(
+                constraints.get("surface_alignment_yaw_tolerance_deg", 18.0),
+                18.0,
+                minimum=1.0,
+                maximum=90.0,
+            ),
+            distance_tolerance_m=_bounded_float(
+                constraints.get("surface_alignment_distance_tolerance_m", 0.12),
+                0.12,
+                minimum=0.0,
+                maximum=0.5,
+            ),
+        )
+        if alignment.get("status") != "succeeded" or not bool(alignment.get("needs_alignment", False)):
+            return alignment
+        approach_pose = alignment.get("approach_pose") if isinstance(alignment.get("approach_pose"), dict) else None
+        if not approach_pose:
+            return {**alignment, "status": "blocked", "reason": "Surface alignment did not return an approach pose."}
+        motion = self.micro_adjust_to_pose(
+            x=float(approach_pose["x"]),
+            y=float(approach_pose["y"]),
+            yaw=float(approach_pose.get("yaw", 0.0) or 0.0),
+            max_distance_m=max(float(alignment.get("distance_m", max_distance_m) or max_distance_m) + 0.08, 0.12),
+            reason=f"Align robot body perpendicular to `{object_label}` support surface before close approach.",
+        )
+        return {
+            **alignment,
+            "motion": motion,
+            "status": "succeeded" if motion.get("status") in {"succeeded", "partial"} else "blocked",
+            "reason": (
+                "Aligned robot body to the occupied support surface; detection should be refreshed."
+                if motion.get("status") in {"succeeded", "partial"}
+                else motion.get("reason") or "Surface alignment motion failed."
+            ),
+        }
 
     def grab_object(
         self,
@@ -1961,7 +2076,7 @@ class HomeTaskAgent:
 
         @function_tool
         def focus_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
-            """Closed-loop visual servo: recapture, redetect, and rotate until the detected object is centered."""
+            """Closed-loop visual servo: reuse the tracked box when possible and rotate until the object is centered."""
             return json.dumps(
                 runtime.focus_detected_object(
                     detection_id=detection_id,
@@ -1972,7 +2087,7 @@ class HomeTaskAgent:
 
         @function_tool
         def approach_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
-            """Closed-loop RGB-D approach: redetect, solve depth, move a tiny safe step, and repeat until grasp range."""
+            """Closed-loop RGB-D approach: align to the support surface, solve depth, then move tiny safe steps."""
             return json.dumps(
                 runtime.approach_detected_object(
                     detection_id=detection_id,
@@ -2033,8 +2148,8 @@ class HomeTaskAgent:
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
-                "- focus_detected_object recaptures RGB, redetects the object, and uses bounded rotation to center it.",
-                "- approach_detected_object recaptures RGB, redetects the object, solves bbox depth with RGB-D on the backend, moves only tiny safe forward steps, and repeats until the object is 0.35-0.45m away.",
+                "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
+                "- approach_detected_object solves bbox depth with RGB-D on the backend, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
                 "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
@@ -2921,6 +3036,31 @@ def _horizontally_centered_detection(detection: dict[str, Any], capture: dict[st
     ]
     predicted["tracking_prediction"] = "horizontally_centered_after_focus_rotation"
     return predicted
+
+
+def _object_map_pose_from_geometry(geometry: dict[str, Any], current_pose: dict[str, Any]) -> dict[str, float] | None:
+    estimated_map = geometry.get("estimated_pose_map")
+    if isinstance(estimated_map, dict) and estimated_map.get("x") is not None and estimated_map.get("y") is not None:
+        try:
+            return {"x": float(estimated_map["x"]), "y": float(estimated_map["y"]), "yaw": 0.0}
+        except Exception:
+            pass
+    pose = geometry.get("current_pose") if isinstance(geometry.get("current_pose"), dict) else current_pose
+    if not isinstance(pose, dict):
+        return None
+    try:
+        x = float(pose.get("x", 0.0) or 0.0)
+        y = float(pose.get("y", 0.0) or 0.0)
+        yaw = float(pose.get("yaw", 0.0) or 0.0)
+        forward_m = float(geometry.get("forward_m"))
+        lateral_m = float(geometry.get("lateral_m", 0.0) or 0.0)
+    except Exception:
+        return None
+    return {
+        "x": round(x + math.cos(yaw) * forward_m - math.sin(yaw) * lateral_m, 3),
+        "y": round(y + math.sin(yaw) * forward_m + math.cos(yaw) * lateral_m, 3),
+        "yaw": 0.0,
+    }
 
 
 def _bbox_to_pixel_xyxy(bbox: list[float], *, image_width: float, image_height: float) -> tuple[float, float, float, float]:

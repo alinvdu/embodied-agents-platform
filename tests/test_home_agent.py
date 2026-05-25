@@ -20,6 +20,7 @@ from xlerobot_agent.home_memory import (
     home_memory_agent_context,
     plan_region_exploration,
     resolve_home_memory_target,
+    resolve_object_surface_approach_pose,
     resolve_region_navigation_goal,
 )
 
@@ -112,6 +113,24 @@ def direct_fallback_memory() -> dict:
     return memory
 
 
+def object_surface_memory() -> dict:
+    memory = sample_memory()
+    memory["occupancy"] = {
+        "resolution": 0.25,
+        "bounds": {"min_x": 0.0, "min_y": 0.0},
+        "cells": [
+            {
+                "x": x * 0.25,
+                "y": y * 0.25,
+                "state": "occupied" if y == 12 and 7 <= x <= 20 else "free",
+            }
+            for x in range(25)
+            for y in range(18)
+        ],
+    }
+    return memory
+
+
 class FakeHTTPResponse:
     def __init__(self, payload: dict) -> None:
         self.payload = payload
@@ -141,6 +160,22 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         assert target is not None
         self.assertEqual(target["label"], "kitchen")
         self.assertEqual(target["pose"]["x"], 3.1)
+
+    def test_object_surface_approach_pose_faces_occupied_support_perpendicularly(self) -> None:
+        result = resolve_object_surface_approach_pose(
+            object_surface_memory(),
+            {"x": 1.25, "y": 1.25, "yaw": 0.0},
+            {"x": 2.75, "y": 2.85},
+            min_clearance_m=0.30,
+            standoff_m=0.65,
+            max_alignment_distance_m=3.0,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["needs_alignment"])
+        self.assertAlmostEqual(result["approach_pose"]["yaw"], 1.57, delta=0.25)
+        self.assertLess(result["approach_pose"]["y"], result["support_surface"]["hit_point"]["y"])
+        self.assertGreater(result["support_surface"]["occupied_sample_count"], 1)
 
     def test_region_navigation_goal_uses_occupancy_when_no_explicit_pose(self) -> None:
         memory = sample_memory()
@@ -1149,6 +1184,104 @@ class HomeTaskAgentTests(unittest.TestCase):
             len([url for url, _body in calls if url.endswith("/api/nav/estimate_detection_geometry")]),
             1,
         )
+
+    def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=object_surface_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="surface_align_run",
+        )
+        runtime.current_pose = {"x": 1.25, "y": 1.25, "yaw": 0.0}
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [220, 120, 420, 360],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+        current_pose = dict(runtime.current_pose)
+        geometry_calls = 0
+        local_motion_bodies = []
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                forward = 0.8 if geometry_calls == 1 else 0.42
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": forward,
+                        "distance_m": forward,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_map": {"x": 2.75, "y": 2.85, "z": 0.2},
+                        "current_pose": dict(current_pose),
+                        "safety": {
+                            "safe": True,
+                            "safe_forward_step_m": 0.08 if geometry_calls == 1 else 0.0,
+                            "reason": "clear",
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                pose = body["pose"]
+                current_pose.update(pose)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "micro adjustment completed",
+                        "local_motion": {
+                            "primitive": "micro_adjust_to_pose",
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="coke can",
+                constraints={"surface_alignment_max_distance_m": 3.0},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertGreaterEqual(geometry_calls, 2)
+        self.assertTrue(local_motion_bodies)
+        alignment_pose = local_motion_bodies[0]["pose"]
+        self.assertAlmostEqual(alignment_pose["yaw"], 1.57, delta=0.3)
+        self.assertIn("surface_alignment", result["attempts"][0])
 
     def test_runtime_grab_object_is_mock_vla_entrypoint(self) -> None:
         runtime = HomeAgentToolRuntime(

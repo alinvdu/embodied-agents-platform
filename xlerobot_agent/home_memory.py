@@ -774,6 +774,158 @@ def resolve_direct_navigation_fallback(
     }
 
 
+def resolve_object_surface_approach_pose(
+    memory: dict[str, Any],
+    current_pose: dict[str, Any] | None,
+    object_pose: dict[str, Any],
+    *,
+    min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
+    standoff_m: float = 0.65,
+    search_beyond_m: float = 0.9,
+    support_radius_m: float = 0.75,
+    max_alignment_distance_m: float = 1.0,
+    yaw_tolerance_deg: float = 18.0,
+    distance_tolerance_m: float = 0.12,
+) -> dict[str, Any]:
+    """Resolve a body-friendly standoff pose perpendicular to the occupied support surface."""
+    start = _json_pose(current_pose or {})
+    try:
+        obj = {"x": float(object_pose["x"]), "y": float(object_pose["y"]), "yaw": 0.0}
+    except Exception:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "Object map pose is required for surface approach alignment.",
+            "current_pose": start,
+        }
+    grid = _memory_occupancy_grid(memory)
+    if not grid["free"] or not grid["occupied"]:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "unavailable",
+            "reason": "Home memory needs known-free and occupied cells to infer an object support surface.",
+            "current_pose": start,
+            "object_pose": obj,
+        }
+    start_cell = _cell_for_pose(start, grid)
+    if start_cell is None:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "Could not project current pose into the occupancy grid.",
+            "current_pose": start,
+            "object_pose": obj,
+        }
+    dx = obj["x"] - start["x"]
+    dy = obj["y"] - start["y"]
+    distance_to_object_m = math.hypot(dx, dy)
+    if distance_to_object_m <= 1e-6:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "Object pose overlaps current pose; cannot infer a sightline.",
+            "current_pose": start,
+            "object_pose": obj,
+        }
+    direction = (dx / distance_to_object_m, dy / distance_to_object_m)
+    ray_end = {
+        "x": start["x"] + direction[0] * (distance_to_object_m + max(float(search_beyond_m), 0.0)),
+        "y": start["y"] + direction[1] * (distance_to_object_m + max(float(search_beyond_m), 0.0)),
+    }
+    ray_end_cell = _cell_for_pose(ray_end, grid)
+    ray_cells = _bresenham_cells(start_cell, ray_end_cell) if ray_end_cell is not None else []
+    min_skip_cells = max(1, int(round(0.20 / float(grid["resolution"]))))
+    hit_cell = next((cell for index, cell in enumerate(ray_cells[min_skip_cells:], start=min_skip_cells) if cell in grid["occupied"]), None)
+    if hit_cell is None:
+        hit_cell = _nearest_occupied_cell_to_point(grid, obj["x"], obj["y"], max_radius_m=max(float(support_radius_m), float(grid["resolution"])))
+    if hit_cell is None:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "unavailable",
+            "reason": "No occupied support surface was found along the centered object sightline.",
+            "current_pose": start,
+            "object_pose": obj,
+            "ray": _path_payload(ray_cells, grid),
+        }
+
+    hit_point = _cell_center_pose(hit_cell, grid)
+    support_cells = _nearby_occupied_cells(grid, hit_cell, radius_m=max(float(support_radius_m), float(grid["resolution"]) * 2.0))
+    tangent = _fit_surface_tangent(grid, support_cells, fallback=(-direction[1], direction[0]))
+    normal_a = (-tangent[1], tangent[0])
+    to_robot = (start["x"] - hit_point["x"], start["y"] - hit_point["y"])
+    normal = normal_a if _dot2(normal_a, to_robot) >= 0.0 else (-normal_a[0], -normal_a[1])
+    normal = _normalize2(normal) or normal_a
+    tangent = _normalize2(tangent) or (1.0, 0.0)
+
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    desired_standoff_m = max(float(standoff_m), float(min_clearance_m))
+    candidate = _surface_approach_candidate(
+        grid=grid,
+        start_cell=start_cell,
+        footprint_safe_cells=footprint_safe_cells,
+        hit_point=hit_point,
+        tangent=tangent,
+        normal=normal,
+        desired_standoff_m=desired_standoff_m,
+        min_clearance_m=min_clearance_m,
+    )
+    if candidate is None:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "No footprint-clear standoff pose was found in front of the occupied support surface.",
+            "current_pose": start,
+            "object_pose": obj,
+            "support_surface": _support_surface_payload(hit_point, tangent, normal, support_cells, grid),
+            "ray": _path_payload(ray_cells, grid),
+        }
+
+    approach_pose = _json_pose(
+        {
+            "x": candidate["x"],
+            "y": candidate["y"],
+            "yaw": math.atan2(-normal[1], -normal[0]),
+        }
+    )
+    distance_m = _pose_distance_m(start, approach_pose)
+    yaw_delta_deg = math.degrees(_angle_delta_abs(float(start.get("yaw", 0.0) or 0.0), approach_pose["yaw"]))
+    max_alignment_distance_m = max(float(max_alignment_distance_m), 0.0)
+    if distance_m > max_alignment_distance_m:
+        return {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "too_far",
+            "reason": "Surface approach pose is farther than the allowed local alignment distance.",
+            "current_pose": start,
+            "object_pose": obj,
+            "approach_pose": approach_pose,
+            "distance_m": round(distance_m, 3),
+            "max_alignment_distance_m": round(max_alignment_distance_m, 3),
+            "yaw_delta_deg": round(yaw_delta_deg, 2),
+            "support_surface": _support_surface_payload(hit_point, tangent, normal, support_cells, grid),
+        }
+    needs_alignment = distance_m > float(distance_tolerance_m) or yaw_delta_deg > float(yaw_tolerance_deg)
+    return {
+        "tool": "resolve_object_surface_approach_pose",
+        "status": "succeeded",
+        "reason": (
+            "Resolved a perpendicular standoff pose from occupied support-surface geometry."
+            if needs_alignment
+            else "Current pose is already close to the perpendicular surface standoff."
+        ),
+        "needs_alignment": bool(needs_alignment),
+        "current_pose": start,
+        "object_pose": obj,
+        "approach_pose": approach_pose,
+        "distance_m": round(distance_m, 3),
+        "yaw_delta_deg": round(yaw_delta_deg, 2),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "standoff_m": round(desired_standoff_m, 3),
+        "path": _path_payload(candidate["line_cells"], grid),
+        "support_surface": _support_surface_payload(hit_point, tangent, normal, support_cells, grid),
+        "ray": _path_payload(ray_cells, grid),
+    }
+
+
 def known_home_memory_labels(memory: dict[str, Any]) -> list[str]:
     context = home_memory_agent_context(memory)
     labels: list[str] = []
@@ -937,6 +1089,10 @@ def _cell_for_pose(pose: dict[str, Any] | None, grid: dict[str, Any]) -> tuple[i
         )
     except Exception:
         return None
+
+
+def _cell_for_xy(x: float, y: float, grid: dict[str, Any]) -> tuple[int, int] | None:
+    return _cell_for_pose({"x": x, "y": y}, grid)
 
 
 def _footprint_safe_cells(grid: dict[str, Any], clearance_m: float) -> set[tuple[int, int]]:
@@ -1235,6 +1391,11 @@ def _cell_center_pose(cell: tuple[int, int], grid: dict[str, Any]) -> dict[str, 
     }
 
 
+def _cell_center_xy(cell: tuple[int, int], grid: dict[str, Any]) -> tuple[float, float]:
+    pose = _cell_center_pose(cell, grid)
+    return float(pose["x"]), float(pose["y"])
+
+
 def _path_length_m(points: list[dict[str, Any]]) -> float:
     return sum(_pose_distance_m(previous, nxt) for previous, nxt in zip(points, points[1:]))
 
@@ -1243,6 +1404,140 @@ def _pose_distance_m(a: dict[str, Any] | None, b: dict[str, Any] | None) -> floa
     if not isinstance(a, dict) or not isinstance(b, dict):
         return 0.0
     return math.hypot(float(a.get("x", 0.0) or 0.0) - float(b.get("x", 0.0) or 0.0), float(a.get("y", 0.0) or 0.0) - float(b.get("y", 0.0) or 0.0))
+
+
+def _nearest_occupied_cell_to_point(grid: dict[str, Any], x: float, y: float, *, max_radius_m: float) -> tuple[int, int] | None:
+    occupied = grid["occupied"]
+    if not occupied:
+        return None
+    max_radius_m = max(float(max_radius_m), 0.0)
+    candidates = []
+    for cell in occupied:
+        cx, cy = _cell_center_xy(cell, grid)
+        distance = math.hypot(cx - x, cy - y)
+        if distance <= max_radius_m:
+            candidates.append((distance, cell))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def _nearby_occupied_cells(grid: dict[str, Any], center: tuple[int, int], *, radius_m: float) -> list[tuple[int, int]]:
+    resolution = float(grid["resolution"])
+    radius_cells = max(1, int(math.ceil(max(float(radius_m), resolution) / resolution)))
+    occupied = grid["occupied"]
+    result = [
+        cell
+        for cell in occupied
+        if abs(cell[0] - center[0]) <= radius_cells
+        and abs(cell[1] - center[1]) <= radius_cells
+        and math.hypot(cell[0] - center[0], cell[1] - center[1]) * resolution <= radius_m + resolution
+    ]
+    return result or [center]
+
+
+def _fit_surface_tangent(
+    grid: dict[str, Any],
+    cells: list[tuple[int, int]],
+    *,
+    fallback: tuple[float, float],
+) -> tuple[float, float]:
+    if len(cells) < 2:
+        return _normalize2(fallback) or (1.0, 0.0)
+    points = [_cell_center_xy(cell, grid) for cell in cells]
+    mean_x = sum(point[0] for point in points) / len(points)
+    mean_y = sum(point[1] for point in points) / len(points)
+    sxx = sum((point[0] - mean_x) ** 2 for point in points)
+    syy = sum((point[1] - mean_y) ** 2 for point in points)
+    sxy = sum((point[0] - mean_x) * (point[1] - mean_y) for point in points)
+    if abs(sxx) + abs(syy) + abs(sxy) <= 1e-12:
+        return _normalize2(fallback) or (1.0, 0.0)
+    theta = 0.5 * math.atan2(2.0 * sxy, sxx - syy)
+    tangent = (math.cos(theta), math.sin(theta))
+    return _normalize2(tangent) or (_normalize2(fallback) or (1.0, 0.0))
+
+
+def _surface_approach_candidate(
+    *,
+    grid: dict[str, Any],
+    start_cell: tuple[int, int],
+    footprint_safe_cells: set[tuple[int, int]],
+    hit_point: dict[str, Any],
+    tangent: tuple[float, float],
+    normal: tuple[float, float],
+    desired_standoff_m: float,
+    min_clearance_m: float,
+) -> dict[str, Any] | None:
+    resolution = float(grid["resolution"])
+    standoff_values = [
+        desired_standoff_m,
+        desired_standoff_m + resolution,
+        desired_standoff_m + resolution * 2.0,
+        max(float(min_clearance_m), desired_standoff_m - resolution),
+    ]
+    offset_values = [0.0]
+    for step in (1, 2, 3):
+        offset_values.extend([resolution * step, -resolution * step])
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for standoff in standoff_values:
+        for offset in offset_values:
+            x = float(hit_point["x"]) + normal[0] * standoff + tangent[0] * offset
+            y = float(hit_point["y"]) + normal[1] * standoff + tangent[1] * offset
+            cell = _cell_for_xy(x, y, grid)
+            if cell is None or cell not in footprint_safe_cells:
+                continue
+            line_cells = _bresenham_cells(start_cell, cell)
+            unsafe = [line_cell for line_cell in line_cells[1:] if line_cell not in footprint_safe_cells]
+            if unsafe:
+                continue
+            clearance_m = _cell_clearance_m(cell, grid)
+            score = (
+                abs(standoff - desired_standoff_m)
+                + abs(offset) * 0.5
+                - min(clearance_m, desired_standoff_m) * 0.05
+            )
+            scored.append(
+                (
+                    score,
+                    {
+                        "x": round(x, 3),
+                        "y": round(y, 3),
+                        "cell": cell,
+                        "line_cells": line_cells,
+                        "clearance_m": clearance_m,
+                    },
+                )
+            )
+    if not scored:
+        return None
+    return min(scored, key=lambda item: item[0])[1]
+
+
+def _support_surface_payload(
+    hit_point: dict[str, Any],
+    tangent: tuple[float, float],
+    normal: tuple[float, float],
+    support_cells: list[tuple[int, int]],
+    grid: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "hit_point": {"x": round(float(hit_point["x"]), 3), "y": round(float(hit_point["y"]), 3)},
+        "tangent_yaw": round(math.atan2(tangent[1], tangent[0]), 3),
+        "normal_yaw": round(math.atan2(normal[1], normal[0]), 3),
+        "occupied_sample_count": len(support_cells),
+        "sample_points": _path_payload(support_cells[:32], grid),
+    }
+
+
+def _normalize2(vector: tuple[float, float]) -> tuple[float, float] | None:
+    length = math.hypot(float(vector[0]), float(vector[1]))
+    if length <= 1e-12:
+        return None
+    return (float(vector[0]) / length, float(vector[1]) / length)
+
+
+def _dot2(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return float(a[0]) * float(b[0]) + float(a[1]) * float(b[1])
 
 
 def _slug(value: str) -> str:

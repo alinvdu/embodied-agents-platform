@@ -5,7 +5,7 @@
 Add object search on top of region exploration:
 
 1. Navigate to planned observation stops inside a semantic region.
-2. Capture RGB-D shots from each planned shot cone. The current implementation captures RGB only; depth/3D target extraction is the next step.
+2. Capture RGB visual shots from each planned shot cone; use the latest live RGB-D frame for object grounding during focus/approach.
 3. Run object recognition for the user-requested target.
 4. Stop exploration as soon as a confident match is found.
 5. Center the object in the camera view.
@@ -35,6 +35,8 @@ Agent
   -> PerceptionWorker.detect_object(rgb, depth, object_label)
   -> focus_detected_object(detection)
   -> approach_detected_object(detection)
+     -> infer occupied support-surface angle from long-term memory
+     -> align body perpendicular to that surface when needed
   -> grab_object_mock(object_description, detection_context)
 ```
 
@@ -67,6 +69,7 @@ Implemented:
   - depth-image + camera_info bbox grounding for object approach
   - fallback RGB-D intrinsics from configured horizontal FOV when camera_info is slow/missing
   - tracked bbox reuse for focus and early approach
+  - occupied support-surface angle alignment before close approach
   - Replicate HTTP 429 retry/backoff
   - grab_object mock/VLA entrypoint
 
@@ -424,11 +427,14 @@ Behavior:
 1. Use the tracked bbox from the selected detection.
 2. Send the bbox to the exploration backend.
 3. The backend solves median object position from the latest aligned RGB-D depth image plus `camera_info`; if `camera_info` is slow/missing, it synthesizes intrinsics from the configured fallback horizontal FOV.
-4. If distance is already in grasp range, stop.
-5. If too far, check a local swept footprint corridor from RGB-D geometry.
-6. Move forward in small increments.
-7. Reuse the tracked bbox for short-horizon approach; refresh the detector only after a couple of physical motion steps or if bbox depth is invalid.
-8. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
+4. Project the object into the saved occupancy map and ray-cast toward nearby occupied cells to infer the support surface behind/near the object.
+5. Fit a local occupied-surface tangent, choose the normal facing the robot, and resolve a footprint-clear standoff pose perpendicular to the support surface.
+6. If the current body angle is shallow or too close to the wrong side, use `micro_adjust_to_pose` to align to that standoff before close approach.
+7. If distance is already in grasp range, stop.
+8. If too far, check a local swept footprint corridor from RGB-D geometry.
+9. Move forward in small increments.
+10. Reuse the tracked bbox for short-horizon approach; refresh the detector only after a couple of physical motion steps or if bbox depth is invalid.
+11. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
 
 Suggested defaults:
 
@@ -440,7 +446,9 @@ Suggested defaults:
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
   "max_attempts": 5,
-  "redetect_after_motion_steps": 2
+  "redetect_after_motion_steps": 2,
+  "surface_alignment_max_distance_m": 2.0,
+  "surface_alignment_standoff_m": 0.65
 }
 ```
 
@@ -449,6 +457,7 @@ Safety checks:
 - Object depth must be valid.
 - Shelf/wall must not intersect the robot body path.
 - Robot footprint corridor must be clear.
+- Support-surface alignment is allowed only when the standoff pose and path are footprint-clear in the saved occupancy map.
 - If the object appears too high/low for the arm, stop and report `not_reachable`.
 - If detection confidence drops below threshold, stop and report `object_lost`.
 
@@ -569,6 +578,7 @@ Manifest:
 - Done: synthesize fallback camera intrinsics from horizontal FOV when `camera_info` has not arrived.
 - Done: use the tracked bbox for focus and early approach instead of re-running the detector every loop.
 - Done: add a first-pass local footprint corridor safety check.
+- Done: add support-surface angle re-approach so close approach starts perpendicular to nearby occupied geometry when possible.
 
 ### Phase 4: Mock Grab
 
