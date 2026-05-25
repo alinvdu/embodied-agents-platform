@@ -90,6 +90,89 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
         self.assertEqual(intrinsics["cx"], 320.0)
         self.assertEqual(intrinsics["cy"], 240.0)
 
+    def test_detection_geometry_uses_depth_image_with_fallback_intrinsics(self) -> None:
+        np = ros_nav2_runtime.np
+
+        class Pose:
+            def to_dict(self):
+                return {"x": 0.0, "y": 0.0, "yaw": 0.0}
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.latest_depth_snapshot = {
+                    "frame_id": "head_camera_link",
+                    "width": 640,
+                    "height": 480,
+                    "encoding": "mono16",
+                    "stamp_s": ros_nav2_runtime.time.time(),
+                    "depth_m": np.full((480, 640), 0.8, dtype=np.float32),
+                }
+                self.latest_camera_info_snapshot = None
+                self.config = SimpleNamespace(
+                    rgbd_fallback_horizontal_fov_deg=64.0,
+                    base_frame="base_link",
+                    map_frame="map",
+                )
+
+            def _lookup_transform_xyz_quat(self, target_frame, source_frame):
+                return np.asarray([0.0, 0.0, 0.0], dtype=np.float32), (0.0, 0.0, 0.0, 1.0)
+
+            def current_pose(self):
+                return Pose()
+
+        result = ros_nav2_runtime.RosExplorationRuntime._estimate_detection_geometry_from_depth(
+            FakeRuntime(),
+            {
+                "image_width": 640,
+                "image_height": 480,
+                "target_max_m": 0.45,
+                "max_step_m": 0.08,
+            },
+            (300.0, 200.0, 340.0, 320.0),
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["geometry_source"], "depth_image")
+        self.assertEqual(result["camera_info"]["source"], "fallback_horizontal_fov")
+        self.assertAlmostEqual(result["forward_m"], 0.8, delta=0.02)
+        self.assertGreater(result["valid_sample_count"], 12)
+
+    def test_detection_geometry_can_disable_point_cloud_fallback(self) -> None:
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self.latest_depth_snapshot = None
+                self.latest_camera_info_snapshot = None
+                self.latest_point_cloud_snapshot = {
+                    "width": 152708,
+                    "height": 1,
+                    "frame_id": "head_camera_link",
+                }
+                self.config = SimpleNamespace(
+                    rgbd_update_timeout_s=0.0,
+                    rgbd_fallback_horizontal_fov_deg=64.0,
+                )
+
+            def spin_for(self, duration_s: float) -> None:
+                return None
+
+            def wait_for_rgbd_update(self, **kwargs) -> bool:
+                return False
+
+        result = ros_nav2_runtime.RosExplorationRuntime.estimate_detection_geometry(
+            FakeRuntime(),
+            {
+                "bbox_xyxy": [300, 200, 340, 320],
+                "rgbd_update_timeout_s": 0.0,
+                "require_depth_image": True,
+                "disable_point_cloud_fallback": True,
+            },
+        )
+
+        self.assertEqual(result["status"], "unavailable")
+        self.assertEqual(result["point_cloud_fallback"], "disabled")
+        self.assertNotIn("point_cloud", result)
+        self.assertNotIn("not organized", result["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

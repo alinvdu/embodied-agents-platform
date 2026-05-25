@@ -123,7 +123,7 @@ Object approach flow:
 - before close approach, it projects the detected object into the saved occupancy map, infers the nearby occupied support surface, and uses `micro_adjust_to_pose` to move to a perpendicular standoff when the shallow angle would make the robot body scrape a table/shelf/wall
 - after that support-surface alignment, it calls `relocalize_here` by default because object search/grab tends to accumulate odometry error from local rotations and micro-motions
 - after that alignment, it checks a small body corridor and calls `micro_adjust_to_pose` for short forward steps
-- the approach loop repeats until the object is in the configured staging range; detector refresh happens after bearing rotations, after a couple of physical forward steps, or when tracked-bbox depth fails
+- the approach loop repeats until the object is in the configured staging range; detector refresh happens after bearing rotations, after every physical forward step by default, or when tracked-bbox depth fails
 - `grab_object(object_label, detection_id, object_description)` is mocked for now; it is where the VLA grasp skill will connect
 
 For real-robot approach, the exploration backend needs these ROS topics. The defaults match `real_ros_bridge.py`:
@@ -135,7 +135,9 @@ For real-robot approach, the exploration backend needs these ROS topics. The def
 --ros-rgbd-fallback-horizontal-fov-deg 64.0
 ```
 
-The older point-cloud grounding path is only a fallback now; object approach should use RGB-D image depth directly. If `/camera/head/camera_info` is slow or missing, the backend synthesizes camera intrinsics from the depth image size and `--ros-rgbd-fallback-horizontal-fov-deg` so approach does not block just because the camera-info callback has not arrived.
+Object approach requires depth-image grounding. It uses `/camera/head/depth/image_raw` plus camera intrinsics, where intrinsics can come from `/camera/head/camera_info` or from the fallback FOV. The older point-cloud grounding path is deliberately disabled for approach because `/camera/head/points` is unorganized on this robot and cannot be indexed by bbox pixels.
+
+Distance is estimated from the inner bbox window, not the full box edge. The default `bbox_sample_inner_ratio` is `0.65`: Robot42 samples valid depth pixels in that central window, filters invalid/too-near/too-far values, projects them using the intrinsics, then uses the median 3D point as the object estimate.
 
 ### Optional Online Object Detection
 

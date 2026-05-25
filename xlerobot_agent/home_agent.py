@@ -831,8 +831,8 @@ class HomeAgentToolRuntime:
             maximum=30,
         ))
         redetect_after_motion_steps = int(_bounded_float(
-            constraints.get("redetect_after_motion_steps", 2),
-            2,
+            constraints.get("redetect_after_motion_steps", 1),
+            1,
             minimum=1,
             maximum=6,
         ))
@@ -1066,6 +1066,9 @@ class HomeAgentToolRuntime:
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
             motion_steps_since_detection += 1
+            if _constraint_bool(constraints, "refresh_detector_after_forward_motion", True):
+                motion_steps_since_detection = redetect_after_motion_steps
+                attempt["next_action"] = "refresh_detector_after_forward_motion"
         result = {
             "tool": "approach_detected_object",
             "status": "partial",
@@ -1281,6 +1284,12 @@ class HomeAgentToolRuntime:
                 "max_step_m": constraints.get("max_step_m", self.config.object_approach_step_m),
                 "robot_width_m": constraints.get("robot_width_m", self.config.object_approach_robot_width_m),
                 "clearance_m": constraints.get("clearance_m", self.config.object_approach_clearance_m),
+                "rgbd_update_timeout_s": constraints.get("rgbd_update_timeout_s", 2.0),
+                "max_depth_age_s": constraints.get("max_depth_age_s", 1.5),
+                "require_depth_image": constraints.get("require_depth_image", True),
+                "disable_point_cloud_fallback": constraints.get("disable_point_cloud_fallback", True),
+                "bbox_sample_inner_ratio": constraints.get("bbox_sample_inner_ratio", 0.65),
+                "min_valid_points": constraints.get("min_valid_points", 12),
                 "object_label": detection.get("label") or capture.get("object_label"),
                 "detection_id": detection.get("detection_id"),
             },
@@ -2152,7 +2161,8 @@ class HomeTaskAgent:
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves bbox depth with RGB-D on the backend, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
+                "- After each physical forward approach step, approach_detected_object refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once and retry approach_detected_object before giving up.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",

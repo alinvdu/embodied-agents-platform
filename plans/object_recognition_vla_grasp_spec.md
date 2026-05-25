@@ -426,7 +426,7 @@ Behavior:
 
 1. Use the tracked bbox from the selected detection.
 2. Send the bbox to the exploration backend.
-3. The backend solves median object position from the latest aligned RGB-D depth image plus `camera_info`; if `camera_info` is slow/missing, it synthesizes intrinsics from the configured fallback horizontal FOV.
+3. The backend solves median object position from the latest aligned RGB-D depth image plus intrinsics. Intrinsics come from `camera_info` when available, or from the configured fallback horizontal FOV when `camera_info` is slow/missing.
 4. Project the object into the saved occupancy map and ray-cast toward nearby occupied cells to infer the support surface behind/near the object.
 5. Fit a local occupied-surface tangent, choose the normal facing the robot, and resolve a footprint-clear standoff pose perpendicular to the support surface.
 6. If the current body angle is shallow or too close to the wrong side, use `micro_adjust_to_pose` to align to that standoff before close approach.
@@ -434,7 +434,7 @@ Behavior:
 8. If distance is already in grasp range, stop.
 9. If too far, check a local swept footprint corridor from RGB-D geometry.
 10. Move forward in small increments.
-11. Reuse the tracked bbox for short forward approach; refresh the detector after bearing rotations, after a couple of physical forward steps, or if bbox depth is invalid.
+11. Refresh the detector after bearing rotations and after each physical forward step by default; use tracked bbox only before physical motion or when explicitly configured.
 12. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
 
 Suggested defaults:
@@ -447,16 +447,30 @@ Suggested defaults:
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
   "max_attempts": 10,
-  "redetect_after_motion_steps": 2,
+  "redetect_after_motion_steps": 1,
+  "refresh_detector_after_forward_motion": true,
+  "require_depth_image": true,
+  "disable_point_cloud_fallback": true,
+  "bbox_sample_inner_ratio": 0.65,
+  "min_valid_points": 12,
   "relocalize_after_surface_alignment": true,
   "surface_alignment_max_distance_m": 2.0,
   "surface_alignment_standoff_m": 0.65
 }
 ```
 
+Depth sampling:
+
+- Use the central `bbox_sample_inner_ratio` window to avoid background/table edges.
+- Filter invalid depth plus values outside the configured min/max range.
+- Project valid depth pixels using real `camera_info` or fallback-FOV intrinsics.
+- Use the median projected 3D point for `forward_m`, `lateral_m`, `vertical_m`, and map pose.
+- Do not use unorganized point cloud fallback for object approach.
+
 Safety checks:
 
 - Object depth must be valid.
+- Depth must come from the depth image. Fallback camera intrinsics are allowed; unorganized point-cloud bbox grounding is not.
 - Shelf/wall must not intersect the robot body path.
 - Robot footprint corridor must be clear.
 - Support-surface alignment is allowed only when the standoff pose and path are footprint-clear in the saved occupancy map.

@@ -1070,6 +1070,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         current_pose = dict(runtime.current_pose)
         geometry_calls = 0
         urls = []
+        geometry_bodies = []
 
         def fake_urlopen(request, timeout=0):
             nonlocal geometry_calls
@@ -1087,6 +1088,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                 )
             if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
                 geometry_calls += 1
+                geometry_bodies.append(body)
                 forward = 0.7 if geometry_calls == 1 else 0.42
                 return FakeHTTPResponse(
                     {
@@ -1130,8 +1132,11 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["geometry"]["forward_m"], 0.42)
         self.assertEqual(geometry_calls, 2)
+        self.assertEqual(result["attempts"][1]["source"], "detector_refresh")
         self.assertTrue(any(url.endswith("/api/nav/local_motion") for url in urls))
         self.assertIn(result["detection_id"], runtime.detection_tracking)
+        self.assertTrue(all(body.get("require_depth_image") is True for body in geometry_bodies))
+        self.assertTrue(all(body.get("disable_point_cloud_fallback") is True for body in geometry_bodies))
 
     def test_runtime_approach_detected_object_reuses_tracked_bbox_for_depth(self) -> None:
         runtime = HomeAgentToolRuntime(
@@ -1184,6 +1189,11 @@ class HomeTaskAgentTests(unittest.TestCase):
             len([url for url, _body in calls if url.endswith("/api/nav/estimate_detection_geometry")]),
             1,
         )
+        geometry_body = next(body for url, body in calls if url.endswith("/api/nav/estimate_detection_geometry"))
+        self.assertTrue(geometry_body["require_depth_image"])
+        self.assertTrue(geometry_body["disable_point_cloud_fallback"])
+        self.assertEqual(geometry_body["bbox_sample_inner_ratio"], 0.65)
+        self.assertEqual(geometry_body["min_valid_points"], 12)
 
     def test_runtime_approach_refreshes_detector_after_bearing_rotation(self) -> None:
         runtime = HomeAgentToolRuntime(

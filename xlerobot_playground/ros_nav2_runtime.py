@@ -1201,7 +1201,7 @@ class RosExplorationRuntime(Node):
             rgbd_wait_s = clamp(
                 float(payload.get("rgbd_update_timeout_s", self.config.rgbd_update_timeout_s) or 0.0),
                 0.0,
-                2.0,
+                5.0,
             )
         except Exception:
             rgbd_wait_s = self.config.rgbd_update_timeout_s
@@ -1217,6 +1217,12 @@ class RosExplorationRuntime(Node):
         depth_result = self._estimate_detection_geometry_from_depth(payload, bbox)
         if depth_result.get("status") != "unavailable":
             return depth_result
+        if bool(payload.get("disable_point_cloud_fallback") or payload.get("require_depth_image")):
+            return {
+                **depth_result,
+                "point_cloud_fallback": "disabled",
+                "reason": depth_result.get("reason") or "Depth-image grounding is unavailable.",
+            }
         snapshot = self.latest_point_cloud_snapshot
         if not isinstance(snapshot, dict):
             return {
@@ -1234,6 +1240,8 @@ class RosExplorationRuntime(Node):
             return {
                 "status": "unavailable",
                 "reason": "The latest RGB-D point cloud is not organized, so bbox depth cannot be solved.",
+                "depth_image": depth_result.get("depth_image"),
+                "camera_info": depth_result.get("camera_info"),
                 "point_cloud": {
                     "width": cloud_width,
                     "height": cloud_height,
