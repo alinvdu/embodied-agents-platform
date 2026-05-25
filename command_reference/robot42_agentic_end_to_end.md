@@ -172,7 +172,7 @@ python examples/robot42_agent_backend.py \
   --object-approach-target-max-m 0.45 \
   --object-approach-target-tolerance-m 0.025 \
   --object-approach-step-m 0.08 \
-  --object-approach-max-attempts 10
+  --object-approach-max-attempts 20
 ```
 
 Robot42 resizes/re-encodes images sent to Replicate by default. This keeps detector calls small enough for Replicate/Cloudflare while mapping returned boxes back to the original saved RGB shot for focus and RGB-D approach.

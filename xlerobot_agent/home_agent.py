@@ -84,7 +84,7 @@ class HomeAgentConfig:
     object_approach_target_max_m: float = 0.45
     object_approach_target_tolerance_m: float = 0.025
     object_approach_step_m: float = 0.08
-    object_approach_max_attempts: int = 10
+    object_approach_max_attempts: int = 20
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
 
@@ -2648,7 +2648,7 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
         object_approach_target_tolerance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_TOLERANCE_M", "0.025")),
         object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
-        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "10")),
+        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
     )

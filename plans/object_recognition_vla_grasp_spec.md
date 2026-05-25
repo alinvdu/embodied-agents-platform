@@ -448,7 +448,7 @@ Suggested defaults:
   "step_m": 0.08,
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
-  "max_attempts": 10,
+  "max_attempts": 20,
   "redetect_after_motion_steps": 1,
   "refresh_detector_after_forward_motion": true,
   "require_depth_image": true,
