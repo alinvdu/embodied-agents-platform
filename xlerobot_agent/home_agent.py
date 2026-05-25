@@ -83,7 +83,7 @@ class HomeAgentConfig:
     object_approach_target_min_m: float = 0.35
     object_approach_target_max_m: float = 0.45
     object_approach_step_m: float = 0.08
-    object_approach_max_attempts: int = 5
+    object_approach_max_attempts: int = 10
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
 
@@ -947,6 +947,8 @@ class HomeAgentToolRuntime:
                 )
                 attempt["surface_alignment"] = alignment
                 if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
+                    if _constraint_bool(constraints, "relocalize_after_surface_alignment", True):
+                        attempt["surface_alignment_relocalization"] = self.relocalize_here()
                     motion_steps_since_detection = redetect_after_motion_steps
                     refresh_after_geometry_failure = False
                     continue
@@ -984,7 +986,8 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
-                motion_steps_since_detection += 1
+                motion_steps_since_detection = redetect_after_motion_steps
+                attempt["next_action"] = "refresh_detector_after_bearing_rotation"
                 continue
             if target_min_m <= forward_m <= target_max_m:
                 result = {
@@ -2149,7 +2152,8 @@ class HomeTaskAgent:
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves bbox depth with RGB-D on the backend, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
+                "- approach_detected_object solves bbox depth with RGB-D on the backend, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
+                "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once and retry approach_detected_object before giving up.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
                 "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
@@ -2568,7 +2572,7 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_target_min_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MIN_M", "0.35")),
         object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
         object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
-        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "5")),
+        object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "10")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
     )

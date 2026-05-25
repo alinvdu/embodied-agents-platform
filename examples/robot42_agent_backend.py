@@ -97,7 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Object approach: "
         f"target={config.object_approach_target_min_m:g}-{config.object_approach_target_max_m:g}m, "
-        f"step={config.object_approach_step_m:g}m"
+        f"step={config.object_approach_step_m:g}m, attempts={config.object_approach_max_attempts}"
     )
     if config.model.provider == "mock":
         print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")

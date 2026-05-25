@@ -1185,6 +1185,88 @@ class HomeTaskAgentTests(unittest.TestCase):
             1,
         )
 
+    def test_runtime_approach_refreshes_detector_after_bearing_rotation(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [220, 120, 420, 360],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+        geometry_calls = 0
+        capture_calls = 0
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls, capture_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.7 if geometry_calls == 1 else 0.42,
+                        "distance_m": 0.7 if geometry_calls == 1 else 0.42,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 10.0 if geometry_calls == 1 else 0.0,
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                self.assertEqual(body.get("primitive"), "rotate_by")
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "rotation completed",
+                        "local_motion": {
+                            "primitive": "rotate_by",
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(runtime.current_pose),
+                        },
+                        "map": {"robot_pose": dict(runtime.current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                capture_calls += 1
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(runtime.current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="coke can",
+                constraints={"allow_surface_alignment": False, "max_attempts": 3},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(geometry_calls, 2)
+        self.assertEqual(capture_calls, 1)
+        self.assertEqual(result["attempts"][1]["source"], "detector_refresh")
+
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)
@@ -1266,6 +1348,14 @@ class HomeTaskAgentTests(unittest.TestCase):
                         "image_data_url": TEST_PNG_DATA_URL,
                         "robot_pose": dict(current_pose),
                         "captured_at": 123.0,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/relocalize"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "skipped",
+                        "message": "Relocalization skipped in test.",
+                        "map": {"robot_pose": dict(current_pose)},
                     }
                 )
             raise AssertionError(f"unexpected URL {request.full_url}")

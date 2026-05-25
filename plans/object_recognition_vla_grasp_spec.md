@@ -430,11 +430,12 @@ Behavior:
 4. Project the object into the saved occupancy map and ray-cast toward nearby occupied cells to infer the support surface behind/near the object.
 5. Fit a local occupied-surface tangent, choose the normal facing the robot, and resolve a footprint-clear standoff pose perpendicular to the support surface.
 6. If the current body angle is shallow or too close to the wrong side, use `micro_adjust_to_pose` to align to that standoff before close approach.
-7. If distance is already in grasp range, stop.
-8. If too far, check a local swept footprint corridor from RGB-D geometry.
-9. Move forward in small increments.
-10. Reuse the tracked bbox for short-horizon approach; refresh the detector only after a couple of physical motion steps or if bbox depth is invalid.
-11. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
+7. Relocalize after support-surface alignment by default, because object search/grab local motions can accumulate odometry error.
+8. If distance is already in grasp range, stop.
+9. If too far, check a local swept footprint corridor from RGB-D geometry.
+10. Move forward in small increments.
+11. Reuse the tracked bbox for short forward approach; refresh the detector after bearing rotations, after a couple of physical forward steps, or if bbox depth is invalid.
+12. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
 
 Suggested defaults:
 
@@ -445,8 +446,9 @@ Suggested defaults:
   "step_m": 0.08,
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
-  "max_attempts": 5,
+  "max_attempts": 10,
   "redetect_after_motion_steps": 2,
+  "relocalize_after_surface_alignment": true,
   "surface_alignment_max_distance_m": 2.0,
   "surface_alignment_standoff_m": 0.65
 }
@@ -579,6 +581,7 @@ Manifest:
 - Done: use the tracked bbox for focus and early approach instead of re-running the detector every loop.
 - Done: add a first-pass local footprint corridor safety check.
 - Done: add support-surface angle re-approach so close approach starts perpendicular to nearby occupied geometry when possible.
+- Done: force detector refresh after bearing rotations and relocalize after support-surface alignment.
 
 ### Phase 4: Mock Grab
 
