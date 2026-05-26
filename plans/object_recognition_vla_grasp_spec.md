@@ -433,7 +433,7 @@ Behavior:
 7. Relocalize after support-surface alignment by default, because object search/grab local motions can accumulate odometry error.
 8. If distance is already in grasp range, stop.
 9. If too far, check a local swept footprint corridor from RGB-D geometry.
-10. Move forward in small increments.
+10. Move forward by a capped fraction of the remaining gap to staging, then refresh detection before the final 20%.
 11. Refresh the detector after bearing rotations and after each physical forward step by default; use tracked bbox only before physical motion or when explicitly configured.
 12. On a retry after support-surface alignment, refresh detection and skip another support-surface realignment unless explicitly requested.
 13. Stop if the object is lost, depth remains invalid after refresh, or the footprint corridor is unsafe.
@@ -445,7 +445,8 @@ Suggested defaults:
   "target_min_m": 0.35,
   "target_max_m": 0.45,
   "target_tolerance_m": 0.025,
-  "step_m": 0.08,
+  "step_m": 0.25,
+  "step_fraction": 0.8,
   "robot_width_m": 0.459,
   "clearance_m": 0.06,
   "max_attempts": 20,

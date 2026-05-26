@@ -83,7 +83,8 @@ class HomeAgentConfig:
     object_approach_target_min_m: float = 0.35
     object_approach_target_max_m: float = 0.45
     object_approach_target_tolerance_m: float = 0.025
-    object_approach_step_m: float = 0.08
+    object_approach_step_m: float = 0.25
+    object_approach_step_fraction: float = 0.8
     object_approach_max_attempts: int = 20
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
@@ -826,11 +827,17 @@ class HomeAgentToolRuntime:
             minimum=0.0,
             maximum=0.1,
         )
-        step_m = _bounded_float(
+        max_step_m = _bounded_float(
             constraints.get("step_m", self.config.object_approach_step_m),
             self.config.object_approach_step_m,
             minimum=0.02,
-            maximum=0.25,
+            maximum=0.35,
+        )
+        step_fraction = _bounded_float(
+            constraints.get("step_fraction", self.config.object_approach_step_fraction),
+            self.config.object_approach_step_fraction,
+            minimum=0.1,
+            maximum=1.0,
         )
         max_attempts = int(_bounded_float(
             constraints.get("max_attempts", self.config.object_approach_max_attempts),
@@ -947,7 +954,7 @@ class HomeAgentToolRuntime:
                 constraints={
                     **constraints,
                     "target_max_m": target_max_m,
-                    "max_step_m": step_m,
+                    "max_step_m": max_step_m,
                 },
             )
             attempt["geometry"] = geometry
@@ -1075,7 +1082,18 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
-            forward_step = min(float(safety.get("safe_forward_step_m", step_m) or 0.0), step_m, max(forward_m - target_max_m, 0.0))
+            remaining_to_staging_m = max(forward_m - target_max_m, 0.0)
+            desired_forward_step_m = remaining_to_staging_m * step_fraction
+            safe_forward_step_m = float(safety.get("safe_forward_step_m", max_step_m) or 0.0)
+            forward_step = min(safe_forward_step_m, max_step_m, desired_forward_step_m)
+            attempt["approach_step"] = {
+                "remaining_to_staging_m": round(remaining_to_staging_m, 3),
+                "step_fraction": round(step_fraction, 3),
+                "desired_forward_step_m": round(desired_forward_step_m, 3),
+                "safe_forward_step_m": round(safe_forward_step_m, 3),
+                "max_step_m": round(max_step_m, 3),
+                "chosen_forward_step_m": round(forward_step, 3),
+            }
             if forward_step <= 0.01:
                 result = {
                     "tool": "approach_detected_object",
@@ -1346,7 +1364,10 @@ class HomeAgentToolRuntime:
                 "image_width": image_width,
                 "image_height": image_height,
                 "target_max_m": constraints.get("target_max_m", self.config.object_approach_target_max_m),
-                "max_step_m": constraints.get("max_step_m", self.config.object_approach_step_m),
+                "max_step_m": constraints.get(
+                    "max_step_m",
+                    constraints.get("step_m", self.config.object_approach_step_m),
+                ),
                 "robot_width_m": constraints.get("robot_width_m", self.config.object_approach_robot_width_m),
                 "clearance_m": constraints.get("clearance_m", self.config.object_approach_clearance_m),
                 "rgbd_update_timeout_s": constraints.get("rgbd_update_timeout_s", 2.0),
@@ -2226,7 +2247,7 @@ class HomeTaskAgent:
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves only tiny safe forward steps until the object is 0.35-0.45m away.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step and RGB-D corridor safety until the object is 0.35-0.45m away.",
                 "- After each physical forward approach step, approach_detected_object refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
@@ -2647,7 +2668,8 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_target_min_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MIN_M", "0.35")),
         object_approach_target_max_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_MAX_M", "0.45")),
         object_approach_target_tolerance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_TARGET_TOLERANCE_M", "0.025")),
-        object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.08")),
+        object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.25")),
+        object_approach_step_fraction=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_FRACTION", "0.8")),
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),

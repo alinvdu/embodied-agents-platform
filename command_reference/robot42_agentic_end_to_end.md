@@ -122,7 +122,7 @@ Object approach flow:
 - `approach_detected_object(detection_id, object_label)` first asks the exploration backend to solve the tracked bbox depth from the latest aligned RGB-D depth image + camera intrinsics
 - before close approach, it projects the detected object into the saved occupancy map, infers the nearby occupied support surface, and uses `micro_adjust_to_pose` to move to a perpendicular standoff when the shallow angle would make the robot body scrape a table/shelf/wall
 - after that support-surface alignment, it calls `relocalize_here` by default because object search/grab tends to accumulate odometry error from local rotations and micro-motions
-- after that alignment, it checks a small body corridor and calls `micro_adjust_to_pose` for short forward steps
+- after that alignment, it checks a small body corridor and calls `micro_adjust_to_pose` for forward steps; each step aims for 80% of the remaining gap to the staging distance, capped by the configured max step and RGB-D corridor safety
 - the approach loop repeats until the object is in the configured staging range, with a small tolerance to avoid chasing millimeter-scale final steps; detector refresh happens after bearing rotations, after every physical forward step by default, or when tracked-bbox depth fails
 - if approach is retried after a support-surface alignment, the retry disables surface realignment by default and takes a fresh detection shot; if the object is still visible but unreachable, report that instead of restarting the full angle-alignment sequence
 - `grab_object(object_label, detection_id, object_description)` is mocked for now; it is where the VLA grasp skill will connect
@@ -171,7 +171,8 @@ python examples/robot42_agent_backend.py \
   --object-approach-target-min-m 0.35 \
   --object-approach-target-max-m 0.45 \
   --object-approach-target-tolerance-m 0.025 \
-  --object-approach-step-m 0.08 \
+  --object-approach-step-m 0.25 \
+  --object-approach-step-fraction 0.8 \
   --object-approach-max-attempts 20
 ```
 

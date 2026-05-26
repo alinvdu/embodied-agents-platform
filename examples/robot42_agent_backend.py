@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-approach-target-max-m", type=float, default=None)
     parser.add_argument("--object-approach-target-tolerance-m", type=float, default=None)
     parser.add_argument("--object-approach-step-m", type=float, default=None)
+    parser.add_argument("--object-approach-step-fraction", type=float, default=None)
     parser.add_argument("--object-approach-max-attempts", type=int, default=None)
     parser.add_argument("--object-approach-robot-width-m", type=float, default=None)
     parser.add_argument("--object-approach-clearance-m", type=float, default=None)
@@ -99,7 +100,9 @@ def main(argv: list[str] | None = None) -> int:
         "Object approach: "
         f"target={config.object_approach_target_min_m:g}-{config.object_approach_target_max_m:g}m, "
         f"tolerance={config.object_approach_target_tolerance_m:g}m, "
-        f"step={config.object_approach_step_m:g}m, attempts={config.object_approach_max_attempts}"
+        f"max_step={config.object_approach_step_m:g}m, "
+        f"step_fraction={config.object_approach_step_fraction:g}, "
+        f"attempts={config.object_approach_max_attempts}"
     )
     if config.model.provider == "mock":
         print("Mode: mock provider. The backend will resolve previews only; it will not call Nav2 or OpenAI traces.")
@@ -233,6 +236,11 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.object_approach_step_m
             if args.object_approach_step_m is not None
             else config.object_approach_step_m
+        ),
+        object_approach_step_fraction=(
+            args.object_approach_step_fraction
+            if args.object_approach_step_fraction is not None
+            else config.object_approach_step_fraction
         ),
         object_approach_max_attempts=(
             args.object_approach_max_attempts

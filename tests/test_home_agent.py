@@ -1,4 +1,5 @@
 import json
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -1140,6 +1141,99 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn(result["detection_id"], runtime.detection_tracking)
         self.assertTrue(all(body.get("require_depth_image") is True for body in geometry_bodies))
         self.assertTrue(all(body.get("disable_point_cloud_fallback") is True for body in geometry_bodies))
+
+    def test_runtime_approach_moves_fraction_of_remaining_gap(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="test_fractional_approach_run",
+        )
+        current_pose = dict(runtime.current_pose)
+        start_pose = dict(current_pose)
+        geometry_calls = 0
+        geometry_bodies = []
+        local_motion_bodies = []
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0 + geometry_calls,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                geometry_bodies.append(body)
+                forward = 0.70 if geometry_calls == 1 else 0.32
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": forward,
+                        "distance_m": forward,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_base": {"x": forward, "y": 0.0, "z": 0.0},
+                        "current_pose": dict(current_pose),
+                        "safety": {
+                            "safe": True,
+                            "safe_forward_step_m": 0.25 if geometry_calls == 1 else 0.0,
+                            "reason": "clear",
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                pose = body["pose"]
+                current_pose.update(pose)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "fractional approach step completed",
+                        "local_motion": {
+                            "primitive": "micro_adjust_to_pose",
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="coke can",
+                constraints={
+                    "allow_surface_alignment": False,
+                    "target_min_m": 0.25,
+                    "target_max_m": 0.30,
+                },
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(geometry_calls, 2)
+        self.assertEqual(geometry_bodies[0]["max_step_m"], 0.25)
+        self.assertEqual(result["attempts"][0]["approach_step"]["desired_forward_step_m"], 0.32)
+        self.assertEqual(result["attempts"][0]["approach_step"]["chosen_forward_step_m"], 0.25)
+        self.assertTrue(local_motion_bodies)
+        first_pose = local_motion_bodies[0]["pose"]
+        moved = math.hypot(first_pose["x"] - start_pose["x"], first_pose["y"] - start_pose["y"])
+        self.assertAlmostEqual(moved, 0.25, delta=0.01)
 
     def test_runtime_approach_detected_object_reuses_tracked_bbox_for_depth(self) -> None:
         runtime = HomeAgentToolRuntime(
