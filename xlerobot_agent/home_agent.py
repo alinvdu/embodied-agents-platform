@@ -1008,6 +1008,21 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
+            center = _detection_center_error(selected, capture)
+            attempt["image_center"] = center
+            center_tolerance = _bounded_float(
+                constraints.get(
+                    "approach_center_tolerance_norm",
+                    constraints.get("center_tolerance_norm", self.config.object_focus_center_tolerance_norm),
+                ),
+                self.config.object_focus_center_tolerance_norm,
+                minimum=0.01,
+                maximum=0.5,
+            )
+            should_image_center = (
+                center.get("status") == "succeeded"
+                and abs(float(center["error_norm"])) > center_tolerance
+            )
             if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
                 if forward_m <= target_max_m:
                     reason = f"Object is within grasp staging range ({forward_m:.2f} m)."
@@ -1031,32 +1046,16 @@ class HomeAgentToolRuntime:
                 self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
                 self.emit("tool_executed", "Approach Object", result["reason"], result)
                 return result
-            if forward_m < target_min_m:
-                result = {
-                    "tool": "approach_detected_object",
-                    "status": "too_close",
-                    "object_label": label,
-                    "detection_id": detection.get("selected_detection_id"),
-                    "selected_detection": selected,
-                    "geometry": geometry,
-                    "attempt_count": attempt_index,
-                    "attempts": attempts,
-                    "reason": f"Object is closer than the minimum grasp staging distance ({forward_m:.2f} m).",
+            if forward_m <= 0.0:
+                attempt["geometry_consistency"] = {
+                    "status": "invalid_forward",
+                    "forward_m": round(forward_m, 3),
+                    "reason": (
+                        "RGB-D geometry placed an image-visible detection behind the robot base frame; "
+                        "recenter or refresh before using this range estimate."
+                    ),
                 }
-                self.emit("tool_blocked", "Approach Object", result["reason"], result)
-                return result
-            center = _detection_center_error(selected, capture)
-            attempt["image_center"] = center
-            center_tolerance = _bounded_float(
-                constraints.get(
-                    "approach_center_tolerance_norm",
-                    constraints.get("center_tolerance_norm", self.config.object_focus_center_tolerance_norm),
-                ),
-                self.config.object_focus_center_tolerance_norm,
-                minimum=0.01,
-                maximum=0.5,
-            )
-            if center.get("status") == "succeeded" and abs(float(center["error_norm"])) > center_tolerance:
+            if should_image_center:
                 rotation = self.rotate_by(
                     delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
                     reason=f"Center `{label}` from image bbox before forward approach.",
@@ -1080,6 +1079,35 @@ class HomeAgentToolRuntime:
                 motion_steps_since_detection = redetect_after_motion_steps
                 attempt["next_action"] = "refresh_detector_after_image_centering_rotation"
                 continue
+            if forward_m <= 0.0:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "blocked",
+                    "object_label": label,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": (
+                        "RGB-D geometry placed the detected object behind the robot base frame; "
+                        "refresh detection or verify the head-camera transform before approaching."
+                    ),
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            if forward_m < target_min_m:
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "too_close",
+                    "object_label": label,
+                    "detection_id": detection.get("selected_detection_id"),
+                    "selected_detection": selected,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": f"Object is closer than the minimum grasp staging distance ({forward_m:.2f} m).",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
             bearing_tolerance_deg = _bounded_float(
                 constraints.get("bearing_tolerance_deg", 6.0),
                 6.0,

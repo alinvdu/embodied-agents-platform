@@ -1528,6 +1528,95 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["attempts"][0]["image_centering"]["rotation_source"], "image_bbox")
         self.assertEqual(rotation_requests, [12.0])
 
+    def test_runtime_approach_recenters_negative_forward_geometry_instead_of_too_close(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="small yellow bottle",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "small yellow bottle",
+                    "confidence": 0.93,
+                    "bbox_xyxy": [167, 180, 223, 276],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+        geometry_calls = 0
+        capture_calls = 0
+        rotation_requests = []
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls, capture_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                forward = -0.16 if geometry_calls == 1 else 0.42
+                lateral = -0.623 if geometry_calls == 1 else 0.0
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": forward,
+                        "distance_m": 0.958 if geometry_calls == 1 else 0.42,
+                        "lateral_m": lateral,
+                        "bearing_error_deg": -90.0 if geometry_calls == 1 else 0.0,
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                self.assertEqual(body.get("primitive"), "rotate_by")
+                rotation_requests.append(body.get("delta_yaw_deg"))
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "rotation completed",
+                        "local_motion": {
+                            "primitive": "rotate_by",
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(runtime.current_pose),
+                        },
+                        "map": {"robot_pose": dict(runtime.current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                capture_calls += 1
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(runtime.current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="small yellow bottle",
+                constraints={"allow_surface_alignment": False, "max_attempts": 3},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(geometry_calls, 2)
+        self.assertEqual(capture_calls, 1)
+        self.assertEqual(result["attempts"][0]["geometry_consistency"]["status"], "invalid_forward")
+        self.assertEqual(result["attempts"][0]["next_action"], "refresh_detector_after_image_centering_rotation")
+        self.assertEqual(result["attempts"][0]["image_centering"]["rotation_source"], "image_bbox")
+        self.assertEqual(rotation_requests, [12.0])
+
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

@@ -1289,6 +1289,8 @@ class RosExplorationRuntime(Node):
             points_map = (points_camera @ map_rotation.T + map_translation.reshape(1, 3)).astype(np.float32, copy=False)
 
         base_grid = points_base.reshape((cloud_height, cloud_width, 3))
+        camera_grid = points_camera.reshape((cloud_height, cloud_width, 3))
+        sample_camera = camera_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
         sample_base = base_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
         finite = np.isfinite(sample_base).all(axis=1) if sample_base.size else np.zeros((0,), dtype=bool)
         max_depth_m = clamp(float(payload.get("max_depth_m", 4.0) or 4.0), 0.2, 12.0)
@@ -1303,6 +1305,7 @@ class RosExplorationRuntime(Node):
                 cloud_height=cloud_height,
                 inner_ratio=1.0,
             )
+            sample_camera = camera_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
             sample_base = base_grid[y0 : y1 + 1, x0 : x1 + 1, :].reshape((-1, 3))
             finite = np.isfinite(sample_base).all(axis=1) if sample_base.size else np.zeros((0,), dtype=bool)
             valid = finite & (sample_base[:, 0] > 0.05) & (sample_base[:, 0] <= max_depth_m)
@@ -1317,6 +1320,7 @@ class RosExplorationRuntime(Node):
                 "valid_sample_count": valid_count,
             }
 
+        object_camera = np.median(sample_camera[valid], axis=0)
         object_base = np.median(sample_base[valid], axis=0)
         object_map = None
         if points_map is not None:
@@ -1355,6 +1359,7 @@ class RosExplorationRuntime(Node):
             },
             "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
             "valid_sample_count": valid_count,
+            "estimated_pose_camera": _point_dict(object_camera),
             "estimated_pose_base": _point_dict(object_base),
             "estimated_pose_map": None if object_map is None else _point_dict(object_map),
             "current_pose": None if current_pose is None else current_pose.to_dict(),
@@ -1491,6 +1496,7 @@ class RosExplorationRuntime(Node):
         v = rows.astype(np.float32) + float(y0)
         z = sample_depth[valid].astype(np.float32, copy=False)
         sample_camera = _project_depth_pixels_to_camera_link(u=u, v=v, depth_m=z, fx=fx, fy=fy, cx=cx, cy=cy)
+        object_camera = np.median(sample_camera, axis=0)
         base_translation, base_quaternion = base_transform
         base_rotation = _quaternion_rotation_matrix(*base_quaternion)
         sample_base = (sample_camera @ base_rotation.T + base_translation.reshape(1, 3)).astype(np.float32, copy=False)
@@ -1560,6 +1566,7 @@ class RosExplorationRuntime(Node):
             },
             "sample_window": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
             "valid_sample_count": valid_count,
+            "estimated_pose_camera": _point_dict(object_camera),
             "estimated_pose_base": _point_dict(object_base),
             "estimated_pose_map": None if object_map is None else _point_dict(object_map),
             "current_pose": None if current_pose is None else current_pose.to_dict(),
