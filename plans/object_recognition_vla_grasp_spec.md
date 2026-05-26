@@ -193,7 +193,7 @@ export ROBOT42_OBJECT_DETECTOR_PROVIDER=replicate_grounding_dino
 export ROBOT42_OBJECT_DETECTOR_MODEL=adirik/grounding-dino
 export ROBOT42_OBJECT_DETECTOR_BOX_THRESHOLD=0.25
 export ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD=0.25
-export ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE=0.25
+export ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE=0.65
 export ROBOT42_OBJECT_DETECTOR_TIMEOUT_S=90
 export ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX=1280
 export ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY=85
@@ -214,7 +214,7 @@ python examples/robot42_agent_backend.py \
   --object-detector-model adirik/grounding-dino \
   --object-detector-box-threshold 0.25 \
   --object-detector-text-threshold 0.25 \
-  --object-detector-min-confidence 0.25 \
+  --object-detector-min-confidence 0.65 \
   --object-detector-max-image-edge-px 1280 \
   --object-detector-jpeg-quality 85
 ```

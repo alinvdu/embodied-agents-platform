@@ -25,6 +25,7 @@ from .home_memory import (
     home_memory_agent_context,
     plan_region_exploration as plan_home_region_exploration,
     resolve_direct_navigation_fallback,
+    resolve_local_clearance_recovery,
     resolve_object_surface_approach_pose,
     resolve_region_navigation_goal,
     summarize_home_memory,
@@ -73,7 +74,7 @@ class HomeAgentConfig:
     object_detector_model_version: str | None = None
     object_detector_box_threshold: float = 0.25
     object_detector_text_threshold: float = 0.25
-    object_detector_min_confidence: float = 0.25
+    object_detector_min_confidence: float = 0.65
     object_detector_timeout_s: float = 90.0
     object_detector_max_image_edge_px: int = 1280
     object_detector_jpeg_quality: int = 85
@@ -1541,6 +1542,7 @@ class HomeAgentToolRuntime:
             self.emit("tool_blocked", "Waypoint Navigation", result["reason"], result)
             return result
 
+        self._refresh_current_pose_from_exploration_backend()
         pre_nav_auto_rotation = self._maybe_auto_rotate_before_waypoint(
             waypoint_id=waypoint_id,
             pose=pose,
@@ -1628,6 +1630,15 @@ class HomeAgentToolRuntime:
         rotation["bearing_error_deg"] = bearing_error_deg
         return rotation
 
+    def _refresh_current_pose_from_exploration_backend(self) -> dict[str, float] | None:
+        response = _get_exploration_backend(self.config, "/api/state")
+        current_map = response.get("current_map") if isinstance(response.get("current_map"), dict) else {}
+        robot_pose = current_map.get("robot_pose") if isinstance(current_map.get("robot_pose"), dict) else None
+        if isinstance(robot_pose, dict):
+            self.current_pose = _json_pose(robot_pose)
+            return self.current_pose
+        return None
+
     def _update_current_pose_after_navigation_result(self, result: dict[str, Any], requested_pose: dict[str, Any]) -> None:
         current_pose = result.get("current_pose")
         if isinstance(current_pose, dict):
@@ -1665,6 +1676,19 @@ class HomeAgentToolRuntime:
         )
         result["direct_fallback_plan"] = fallback_plan
         if fallback_plan.get("status") != "succeeded":
+            recovery = resolve_local_clearance_recovery(
+                self.memory,
+                start_pose,
+                pose,
+                min_clearance_m=min_clearance_m,
+                max_distance_m=float(constraints.get("local_recovery_max_distance_m", 0.45) or 0.45),
+            )
+            result["local_clearance_recovery"] = recovery
+            if recovery.get("status") == "succeeded":
+                result["failure_hint"] = (
+                    "Nav2 failed and direct fallback was not available. Use local_clearance_recovery: "
+                    "micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry navigation."
+                )
             result["fallback_navigation"] = {
                 "status": "skipped",
                 "reason": fallback_plan.get("reason"),
@@ -2285,6 +2309,7 @@ class HomeTaskAgent:
                 "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
                 f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
                 "- If Nav2 fails, navigate_to_waypoint can automatically use a short direct primitive fallback only when the saved occupancy map proves the straight corridor is footprint-clear.",
+                "- If Nav2 fails with little/no progress and direct fallback is too far or blocked, inspect local_clearance_recovery. If it contains a recovery_pose, call micro_adjust_to_pose to that pose, then relocalize_here, then retry navigation.",
                 "- Nav2 can sometimes fail to find paths toward objects or places, even when a route may exist.",
                 "- Nav2 can be noisy for pure rotations, 180-degree turns, very close targets, and recovery after failed to make progress.",
                 "- Local motion tools are bounded backend-controlled motions. Use them for orientation, tiny final corrections, or recovery, not for long navigation.",
@@ -2303,7 +2328,7 @@ class HomeTaskAgent:
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
                 "After each successful waypoint, call relocalize_here before resolving the next waypoint.",
                 "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
-                "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
+                "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, local_clearance_recovery, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "If the target is within 0.5m and only a small final correction remains, use micro_adjust_to_pose.",
                 "Do not call or describe unrelated perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
                 "Do not infer a navigation target yourself from a region shape.",
@@ -2703,7 +2728,7 @@ def config_from_env() -> HomeAgentConfig:
         object_detector_model_version=os.getenv("ROBOT42_OBJECT_DETECTOR_MODEL_VERSION"),
         object_detector_box_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_BOX_THRESHOLD", "0.25")),
         object_detector_text_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD", "0.25")),
-        object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.25")),
+        object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.65")),
         object_detector_timeout_s=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TIMEOUT_S", "90")),
         object_detector_max_image_edge_px=int(os.getenv("ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX", "1280")),
         object_detector_jpeg_quality=int(os.getenv("ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY", "85")),
@@ -2821,6 +2846,36 @@ def _post_exploration_backend(config: HomeAgentConfig, path: str, payload: dict[
         return {
             "status": "unavailable",
             "reason": f"Exploration backend is unavailable at {url}: {exc}",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {
+            "status": "failed",
+            "reason": f"Exploration backend returned non-JSON response from {url}.",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    return parsed if isinstance(parsed, dict) else {"status": "failed", "reason": "Exploration backend response was not an object."}
+
+
+def _get_exploration_backend(config: HomeAgentConfig, path: str) -> dict[str, Any]:
+    base_url = str(config.exploration_backend_url or "").rstrip("/")
+    url = f"{base_url}{path}"
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=max(float(config.backend_request_timeout_s), 1.0)) as response:
+            raw = response.read().decode("utf-8")
+    except Exception as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"Exploration backend state is unavailable at {url}: {exc}",
             "_transport_error": True,
             "_backend_url": url,
         }
@@ -3594,6 +3649,7 @@ def _region_exploration_navigation_constraints(constraints: dict[str, Any]) -> d
         "allow_direct_fallback",
         "direct_fallback_max_distance_m",
         "direct_fallback_min_clearance_m",
+        "local_recovery_max_distance_m",
     }
     return {key: constraints[key] for key in allowed if key in constraints}
 

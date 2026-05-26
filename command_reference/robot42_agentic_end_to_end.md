@@ -105,6 +105,7 @@ Navigation flow:
 - `navigate_to_waypoint(waypoint_id, x, y, yaw)`
 - `navigate_to_waypoint` may first call a backend local rotation if the waypoint is sideways/behind the robot
 - wait for the Nav2 result from the exploration backend; if Nav2 fails and the waypoint is short/direct/clear, the same tool may fall back to bounded local motion
+- if Nav2 fails with little/no progress and `local_clearance_recovery.status='succeeded'`, call `micro_adjust_to_pose` to `local_clearance_recovery.recovery_pose`, then `relocalize_here`, then retry the original navigation
 - `relocalize_here()`
 - resolve again from the updated/corrected pose if the waypoint was not final
 
@@ -166,7 +167,7 @@ python examples/robot42_agent_backend.py \
   --object-detector-model adirik/grounding-dino \
   --object-detector-box-threshold 0.25 \
   --object-detector-text-threshold 0.25 \
-  --object-detector-min-confidence 0.25 \
+  --object-detector-min-confidence 0.65 \
   --object-detector-max-image-edge-px 1280 \
   --object-detector-jpeg-quality 85 \
   --object-approach-target-min-m 0.35 \

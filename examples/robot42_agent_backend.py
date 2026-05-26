@@ -93,6 +93,12 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Object detector: {config.object_detector_provider}")
     if config.object_detector_provider == "replicate_grounding_dino":
         print(
+            "Object detector thresholds: "
+            f"box={config.object_detector_box_threshold:g}, "
+            f"text={config.object_detector_text_threshold:g}, "
+            f"min_confidence={config.object_detector_min_confidence:g}"
+        )
+        print(
             "Object detector image: "
             f"max_edge={config.object_detector_max_image_edge_px}px, jpeg_quality={config.object_detector_jpeg_quality}"
         )

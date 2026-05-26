@@ -113,6 +113,39 @@ class ObjectDetectionTest(unittest.TestCase):
 
         self.assertEqual(detections[0]["bbox_xyxy"], [80.0, 70.0, 120.0, 90.0])
 
+    def test_default_replicate_min_confidence_discards_weak_matches(self) -> None:
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/v1/models/adirik/grounding-dino"):
+                return FakeHTTPResponse({"latest_version": {"id": "version-123"}})
+            if request.full_url.endswith("/v1/predictions"):
+                return FakeHTTPResponse(
+                    {
+                        "id": "prediction-123",
+                        "status": "succeeded",
+                        "output": {
+                            "detections": [
+                                {"label": "small bottle", "score": 0.63, "bbox": [10, 20, 110, 220]},
+                            ],
+                        },
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.object_detection.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = detect_object_in_image(
+                config=ObjectDetectorConfig(
+                    provider="replicate_grounding_dino",
+                    api_key="token",
+                ),
+                image_data_url="data:image/png;base64,cG5n",
+                object_label="small bottle",
+                shot_id="shot_weak",
+            )
+
+        self.assertEqual(result["status"], "not_found")
+        self.assertEqual(result["detections"], [])
+        self.assertIn("0.65", result["reason"])
+
     def test_replicate_preprocess_resizes_image_and_maps_boxes_back_to_source_pixels(self) -> None:
         if object_detection.Image is None:
             self.skipTest("Pillow is unavailable")

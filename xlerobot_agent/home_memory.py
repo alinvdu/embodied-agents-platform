@@ -774,6 +774,96 @@ def resolve_direct_navigation_fallback(
     }
 
 
+def resolve_local_clearance_recovery(
+    memory: dict[str, Any],
+    start_pose: dict[str, Any] | None,
+    goal_pose: dict[str, Any],
+    *,
+    min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
+    max_distance_m: float = 0.45,
+) -> dict[str, Any]:
+    """Suggest a short local move to a nearby footprint-safe pose before retrying Nav2."""
+    start = _json_pose(start_pose or {})
+    goal = _json_pose(goal_pose)
+    grid = _memory_occupancy_grid(memory)
+    if not grid["free"]:
+        return {
+            "tool": "resolve_local_clearance_recovery",
+            "status": "blocked",
+            "reason": "Home memory has no known-free occupancy cells.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "min_clearance_m": round(float(min_clearance_m), 3),
+            "max_distance_m": round(float(max_distance_m), 3),
+        }
+    start_cell = _cell_for_pose(start, grid)
+    if start_cell is None:
+        return {
+            "tool": "resolve_local_clearance_recovery",
+            "status": "blocked",
+            "reason": "Could not project current pose into the occupancy grid.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "min_clearance_m": round(float(min_clearance_m), 3),
+            "max_distance_m": round(float(max_distance_m), 3),
+        }
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    resolution = float(grid["resolution"])
+    max_distance_m = max(float(max_distance_m), resolution)
+    max_radius_cells = max(1, int(math.ceil(max_distance_m / resolution)))
+    start_goal_distance = _pose_distance_m(start, goal)
+    start_clearance = _cell_clearance_m(start_cell, grid) if start_cell in grid["free"] else 0.0
+    candidates: list[tuple[float, float, float, tuple[int, int], list[tuple[int, int]]]] = []
+    for dx in range(-max_radius_cells, max_radius_cells + 1):
+        for dy in range(-max_radius_cells, max_radius_cells + 1):
+            cell = (start_cell[0] + dx, start_cell[1] + dy)
+            if cell == start_cell or cell not in footprint_safe_cells:
+                continue
+            point = _path_payload([cell], grid)[0]
+            distance_from_start = _pose_distance_m(start, point)
+            if distance_from_start > max_distance_m or distance_from_start < resolution * 0.35:
+                continue
+            line = _bresenham_cells(start_cell, cell)
+            unsafe_line = [line_cell for line_cell in line[1:] if line_cell not in footprint_safe_cells]
+            if unsafe_line:
+                continue
+            clearance = _cell_clearance_m(cell, grid)
+            progress = start_goal_distance - _pose_distance_m(point, goal)
+            score = clearance * 2.0 + max(progress, -0.25) * 0.75 - distance_from_start * 0.25
+            candidates.append((score, clearance, -distance_from_start, cell, line))
+    if not candidates:
+        return {
+            "tool": "resolve_local_clearance_recovery",
+            "status": "blocked",
+            "reason": "No nearby footprint-safe recovery pose was found in saved occupancy.",
+            "start_pose": start,
+            "goal_pose": goal,
+            "start_clearance_m": round(start_clearance, 3),
+            "min_clearance_m": round(float(min_clearance_m), 3),
+            "max_distance_m": round(max_distance_m, 3),
+        }
+    _, best_clearance, neg_distance, best_cell, best_line = max(candidates)
+    recovery_xy = _path_payload([best_cell], grid)[0]
+    recovery_yaw = math.atan2(goal["y"] - recovery_xy["y"], goal["x"] - recovery_xy["x"])
+    recovery_pose = _json_pose({**recovery_xy, "yaw": recovery_yaw})
+    return {
+        "tool": "resolve_local_clearance_recovery",
+        "status": "succeeded",
+        "reason": "Move to a nearby footprint-safe pose to gain clearance before retrying Nav2.",
+        "suggested_tool": "micro_adjust_to_pose",
+        "recovery_pose": recovery_pose,
+        "start_pose": start,
+        "goal_pose": goal,
+        "distance_m": round(-neg_distance, 3),
+        "start_clearance_m": round(start_clearance, 3),
+        "recovery_clearance_m": round(best_clearance, 3),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "max_distance_m": round(max_distance_m, 3),
+        "path": _path_payload(best_line, grid),
+        "follow_up": "Call relocalize_here, then retry the original navigate_to_waypoint or region exploration step.",
+    }
+
+
 def resolve_object_surface_approach_pose(
     memory: dict[str, Any],
     current_pose: dict[str, Any] | None,

@@ -26,7 +26,7 @@ class ObjectDetectorConfig:
     model_version: str | None = None
     box_threshold: float = 0.25
     text_threshold: float = 0.25
-    min_confidence: float = 0.25
+    min_confidence: float = 0.65
     timeout_s: float = 90.0
     max_image_edge_px: int = 1280
     jpeg_quality: int = 85

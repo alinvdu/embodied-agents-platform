@@ -649,6 +649,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["fallback_navigation"]["status"], "succeeded")
         self.assertEqual(runtime.current_pose, {"x": 1.5, "y": 1.0, "yaw": 0.0})
         self.assertEqual([call.args[0].full_url for call in mocked.call_args_list], [
+            "http://explore.local/api/state",
             "http://explore.local/api/nav/waypoint",
             "http://explore.local/api/nav/local_motion",
         ])
@@ -704,9 +705,101 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertGreater(result["pre_nav_auto_rotation"]["bearing_error_deg"], 45.0)
         self.assertEqual(runtime.current_pose, {"x": 1.0, "y": 1.5, "yaw": 1.57})
         self.assertEqual([call.args[0].full_url for call in mocked.call_args_list], [
+            "http://explore.local/api/state",
             "http://explore.local/api/nav/local_motion",
             "http://explore.local/api/nav/waypoint",
         ])
+
+    def test_runtime_navigate_to_waypoint_refreshes_pose_before_auto_rotate(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=direct_fallback_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                navigation_auto_rotate_threshold_deg=45.0,
+            ),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime.current_pose = {"x": 1.0, "y": 1.0, "yaw": 0.0}
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/state"):
+                return FakeHTTPResponse(
+                    {
+                        "current_map": {
+                            "robot_pose": {"x": 1.0, "y": 1.0, "yaw": 3.14},
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "rotated toward point",
+                        "local_motion": {
+                            "primitive": "rotate_towards_point",
+                            "status": "succeeded",
+                            "start_pose": {"x": 1.0, "y": 1.0, "yaw": 3.14},
+                            "end_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0},
+                        },
+                        "map": {"robot_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0}},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/waypoint"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "Nav2 reached the requested goal pose",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "Nav2 reached the requested goal pose",
+                            "reached_pose": {"x": 2.0, "y": 1.0, "yaw": 0.0},
+                            "plan": {"status": "succeeded", "path_length_m": 1.0},
+                            "feedback_samples": [{"remaining_distance_m": 0.0}],
+                        },
+                        "map": {"robot_pose": {"x": 2.0, "y": 1.0, "yaw": 0.0}},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.navigate_to_waypoint(waypoint_id="stale_pose_step", x=2.0, y=1.0, yaw=0.0)
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["pre_nav_auto_rotation"]["status"], "succeeded")
+        self.assertAlmostEqual(abs(result["pre_nav_auto_rotation"]["bearing_error_deg"]), 180.0, delta=0.2)
+
+    def test_runtime_navigate_to_waypoint_suggests_local_clearance_recovery(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=direct_fallback_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        nav2_payload = {
+            "status": "failed",
+            "reason": "Nav2 returned status `aborted`",
+            "nav2_result": {
+                "status": "failed",
+                "reason": "Nav2 returned status `aborted`",
+                "actual_pose_delta_m": 0.0,
+                "plan": {"status": "succeeded", "path_length_m": 1.5},
+                "feedback_samples": [{"remaining_distance_m": 1.5}],
+            },
+            "map": {"robot_pose": {"x": 1.0, "y": 1.0, "yaw": 0.0}},
+        }
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/waypoint"):
+                return FakeHTTPResponse(nav2_payload)
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.navigate_to_waypoint(waypoint_id="long_step", x=2.5, y=1.0, yaw=0.0)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["direct_fallback_plan"]["status"], "too_far")
+        self.assertEqual(result["local_clearance_recovery"]["status"], "succeeded")
+        self.assertEqual(result["local_clearance_recovery"]["suggested_tool"], "micro_adjust_to_pose")
+        self.assertIn("local_clearance_recovery", result["failure_hint"])
 
     def test_runtime_execute_region_exploration_plan_navigates_stops_and_aligns_shots(self) -> None:
         events = []
@@ -1886,7 +1979,11 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertLess(second["path_length_m"], first["path_length_m"])
         self.assertEqual(
             called_paths,
-            ["http://explore.local/api/nav/waypoint", "http://explore.local/api/nav/relocalize"],
+            [
+                "http://explore.local/api/state",
+                "http://explore.local/api/nav/waypoint",
+                "http://explore.local/api/nav/relocalize",
+            ],
         )
 
     def test_agent_instructions_include_navigation_tool_loop_examples(self) -> None:
