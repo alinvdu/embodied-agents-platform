@@ -1007,31 +1007,6 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
-            bearing_tolerance_deg = _bounded_float(
-                constraints.get("bearing_tolerance_deg", 6.0),
-                6.0,
-                minimum=1.0,
-                maximum=30.0,
-            )
-            if abs(bearing_error_deg) > bearing_tolerance_deg:
-                rotation = self.rotate_by(
-                    delta_yaw_deg=max(min(bearing_error_deg, 12.0), -12.0),
-                    reason=f"Center `{label}` from RGB-D bearing before forward approach.",
-                )
-                attempt["rotation"] = rotation
-                if rotation.get("status") not in {"succeeded", "partial"}:
-                    result = {
-                        "tool": "approach_detected_object",
-                        "status": "blocked",
-                        "object_label": label,
-                        "reason": rotation.get("reason") or "Approach bearing rotation failed.",
-                        "attempts": attempts,
-                    }
-                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
-                    return result
-                motion_steps_since_detection = redetect_after_motion_steps
-                attempt["next_action"] = "refresh_detector_after_bearing_rotation"
-                continue
             if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
                 if forward_m <= target_max_m:
                     reason = f"Object is within grasp staging range ({forward_m:.2f} m)."
@@ -1069,6 +1044,76 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
+            center = _detection_center_error(selected, capture)
+            attempt["image_center"] = center
+            center_tolerance = _bounded_float(
+                constraints.get(
+                    "approach_center_tolerance_norm",
+                    constraints.get("center_tolerance_norm", self.config.object_focus_center_tolerance_norm),
+                ),
+                self.config.object_focus_center_tolerance_norm,
+                minimum=0.01,
+                maximum=0.5,
+            )
+            if center.get("status") == "succeeded" and abs(float(center["error_norm"])) > center_tolerance:
+                rotation = self.rotate_by(
+                    delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
+                    reason=f"Center `{label}` from image bbox before forward approach.",
+                )
+                attempt["rotation"] = rotation
+                attempt["image_centering"] = {
+                    "center_error_norm": center["error_norm"],
+                    "tolerance_norm": round(center_tolerance, 3),
+                    "rotation_source": "image_bbox",
+                }
+                if rotation.get("status") not in {"succeeded", "partial"}:
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "reason": rotation.get("reason") or "Approach image-centering rotation failed.",
+                        "attempts": attempts,
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+                motion_steps_since_detection = redetect_after_motion_steps
+                attempt["next_action"] = "refresh_detector_after_image_centering_rotation"
+                continue
+            bearing_tolerance_deg = _bounded_float(
+                constraints.get("bearing_tolerance_deg", 6.0),
+                6.0,
+                minimum=1.0,
+                maximum=30.0,
+            )
+            use_geometry_bearing_correction = _constraint_bool(
+                constraints,
+                "use_geometry_bearing_correction",
+                center.get("status") != "succeeded",
+            )
+            if use_geometry_bearing_correction and abs(bearing_error_deg) > bearing_tolerance_deg:
+                rotation = self.rotate_by(
+                    delta_yaw_deg=max(min(bearing_error_deg, 12.0), -12.0),
+                    reason=f"Center `{label}` from RGB-D bearing before forward approach.",
+                )
+                attempt["rotation"] = rotation
+                attempt["geometry_bearing_correction"] = {
+                    "bearing_error_deg": round(bearing_error_deg, 3),
+                    "tolerance_deg": round(bearing_tolerance_deg, 3),
+                    "rotation_source": "rgbd_geometry",
+                }
+                if rotation.get("status") not in {"succeeded", "partial"}:
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "reason": rotation.get("reason") or "Approach bearing rotation failed.",
+                        "attempts": attempts,
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+                motion_steps_since_detection = redetect_after_motion_steps
+                attempt["next_action"] = "refresh_detector_after_geometry_bearing_rotation"
+                continue
             safety = geometry.get("safety") if isinstance(geometry.get("safety"), dict) else {}
             if not bool(safety.get("safe", False)):
                 result = {
@@ -2247,8 +2292,8 @@ class HomeTaskAgent:
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step and RGB-D corridor safety until the object is 0.35-0.45m away.",
-                "- After each physical forward approach step, approach_detected_object refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses the RGB bbox center for approach recentering, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step and RGB-D corridor safety until the object is 0.35-0.45m away.",
+                "- After each physical rotation or forward approach step, approach_detected_object refreshes detection by default so the next center/distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",

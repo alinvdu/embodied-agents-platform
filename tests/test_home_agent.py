@@ -1348,7 +1348,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["target_tolerance_m"], 0.025)
         self.assertIn("tolerance", result["reason"])
 
-    def test_runtime_approach_refreshes_detector_after_bearing_rotation(self) -> None:
+    def test_runtime_approach_refreshes_detector_after_image_centering_rotation(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=visual_sweep_memory(),
             config=HomeAgentConfig(
@@ -1366,13 +1366,14 @@ class HomeTaskAgentTests(unittest.TestCase):
                     "detection_id": "det_1",
                     "label": "coke can",
                     "confidence": 0.9,
-                    "bbox_xyxy": [220, 120, 420, 360],
+                    "bbox_xyxy": [120, 120, 220, 360],
                 },
             },
             capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
         )
         geometry_calls = 0
         capture_calls = 0
+        rotation_requests = []
 
         def fake_urlopen(request, timeout=0):
             nonlocal geometry_calls, capture_calls
@@ -1386,13 +1387,14 @@ class HomeTaskAgentTests(unittest.TestCase):
                         "forward_m": 0.7 if geometry_calls == 1 else 0.42,
                         "distance_m": 0.7 if geometry_calls == 1 else 0.42,
                         "lateral_m": 0.0,
-                        "bearing_error_deg": 10.0 if geometry_calls == 1 else 0.0,
+                        "bearing_error_deg": -90.0 if geometry_calls == 1 else 0.0,
                         "current_pose": dict(runtime.current_pose),
                         "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
                     }
                 )
             if request.full_url.endswith("/api/nav/local_motion"):
                 self.assertEqual(body.get("primitive"), "rotate_by")
+                rotation_requests.append(body.get("delta_yaw_deg"))
                 return FakeHTTPResponse(
                     {
                         "status": "succeeded",
@@ -1429,6 +1431,9 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(geometry_calls, 2)
         self.assertEqual(capture_calls, 1)
         self.assertEqual(result["attempts"][1]["source"], "detector_refresh")
+        self.assertEqual(result["attempts"][0]["next_action"], "refresh_detector_after_image_centering_rotation")
+        self.assertEqual(result["attempts"][0]["image_centering"]["rotation_source"], "image_bbox")
+        self.assertEqual(rotation_requests, [12.0])
 
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
