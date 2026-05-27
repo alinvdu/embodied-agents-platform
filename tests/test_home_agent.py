@@ -2092,6 +2092,9 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("Nav2 can sometimes fail to find paths", instructions)
         self.assertIn("constraints_json='{}'", instructions)
         self.assertIn("After each successful waypoint", instructions)
+        self.assertIn("Do not use exploration stops as a shortcut for long-distance navigation", instructions)
+        self.assertIn("Example far object-search request", instructions)
+        self.assertIn("Bad example", instructions)
 
     def test_openai_provider_applies_cli_api_key_to_agents_sdk_env(self) -> None:
         agent = HomeTaskAgent(
