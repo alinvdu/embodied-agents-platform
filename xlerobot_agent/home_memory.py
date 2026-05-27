@@ -287,6 +287,9 @@ def resolve_region_navigation_goal(
     current_pose: dict[str, Any] | None = None,
     min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
     waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
+    navigation_purpose: str = "",
+    object_label: str = "",
+    exploration_constraints: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Resolve a semantic region into a concrete known-free navigation pose."""
     region = _best_region_match(memory, name_or_label)
@@ -297,6 +300,17 @@ def resolve_region_navigation_goal(
             "target_label": name_or_label,
             "reason": "No matching region label was found in home memory.",
         }
+    if _is_object_search_navigation_purpose(navigation_purpose):
+        return _resolve_region_search_entry_navigation_goal(
+            memory,
+            region,
+            name_or_label,
+            current_pose=current_pose,
+            min_clearance_m=min_clearance_m,
+            waypoint_horizon_m=waypoint_horizon_m,
+            object_label=object_label,
+            exploration_constraints=exploration_constraints or {},
+        )
     explicit = _first_pose(region.get("default_waypoints"))
     if explicit is not None and not _is_auto_center_waypoint(region, explicit):
         return {
@@ -502,6 +516,131 @@ def resolve_region_navigation_goal(
         "goal_selection": goal_selection,
         "inside_goal_candidate_count": inside_goal_candidate_count,
         "approach_goal_candidate_count": len(approach_candidates),
+        "path_length_m": round(path_length_m, 3),
+        "path": _path_payload(path_cells, grid),
+    }
+
+
+def _resolve_region_search_entry_navigation_goal(
+    memory: dict[str, Any],
+    region: dict[str, Any],
+    name_or_label: str,
+    *,
+    current_pose: dict[str, Any] | None,
+    min_clearance_m: float,
+    waypoint_horizon_m: float,
+    object_label: str,
+    exploration_constraints: dict[str, Any],
+) -> dict[str, Any]:
+    region_label = str(region.get("label") or name_or_label)
+    plan = plan_region_exploration(
+        memory,
+        region_label,
+        fov_deg=exploration_constraints.get("fov_deg"),
+        max_stops=exploration_constraints.get("max_stops"),
+        shots_per_stop=exploration_constraints.get("shots_per_stop"),
+        min_clearance_m=min_clearance_m,
+        boundary_margin_m=_bounded_float(
+            exploration_constraints.get("boundary_margin_m"),
+            DEFAULT_REGION_EXPLORATION_BOUNDARY_MARGIN_M,
+            minimum=0.0,
+            maximum=5.0,
+        ),
+        min_stop_separation_m=exploration_constraints.get("min_stop_separation_m"),
+    )
+    stops = plan.get("stops") if isinstance(plan.get("stops"), list) else []
+    if plan.get("status") != "succeeded" or not stops or not isinstance(stops[0], dict):
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "navigation_purpose": "object_search",
+            "object_label": object_label,
+            "reason": plan.get("reason") or "No exploration stop is available for object-search navigation.",
+            "search_plan": plan,
+        }
+
+    grid = _memory_occupancy_grid(memory)
+    footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
+    if not footprint_safe_cells:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "navigation_purpose": "object_search",
+            "object_label": object_label,
+            "reason": "No known-free cells satisfy the robot footprint clearance.",
+            "search_plan": plan,
+        }
+    start_cell = _cell_for_pose(current_pose, grid) if current_pose else None
+    reachable = _reachable_cells(grid, start_cell, footprint_safe_cells) if start_cell is not None else set(footprint_safe_cells)
+
+    stop: dict[str, Any] | None = None
+    stop_index = 0
+    stop_pose: dict[str, Any] | None = None
+    goal_cell: tuple[int, int] | None = None
+    for index, candidate in enumerate(stops, start=1):
+        if not isinstance(candidate, dict):
+            continue
+        candidate_pose = candidate.get("pose") if isinstance(candidate.get("pose"), dict) else None
+        candidate_cell = _cell_for_pose(candidate_pose, grid) if candidate_pose is not None else None
+        if candidate_pose is not None and candidate_cell is not None and candidate_cell in reachable:
+            stop = candidate
+            stop_index = index
+            stop_pose = candidate_pose
+            goal_cell = candidate_cell
+            break
+
+    if stop is None or stop_pose is None or goal_cell is None:
+        return {
+            "tool": "resolve_region_navigation_goal",
+            "status": "blocked",
+            "target_label": region_label,
+            "target_type": "region",
+            "region_id": region.get("region_id"),
+            "navigation_purpose": "object_search",
+            "object_label": object_label,
+            "reason": "No exploration stop is footprint-safe and reachable from the current pose.",
+            "search_plan": plan,
+            "first_stop": stops[0],
+        }
+
+    goal_pose = _json_pose(stop_pose)
+    path_cells = _centered_path_cells(grid, start_cell, goal_cell, footprint_safe_cells) if start_cell is not None else []
+    path_clearance = min((_cell_clearance_m(cell, grid) for cell in path_cells), default=_cell_clearance_m(goal_cell, grid))
+    path_length_m = _path_length_m(_path_points_for_waypoint(path_cells, grid, current_pose, goal_pose))
+    next_waypoint = _next_waypoint_payload(
+        path_cells,
+        grid,
+        current_pose,
+        goal_pose,
+        waypoint_horizon_m,
+        target_label=region_label,
+        region_id=region.get("region_id"),
+    )
+    return {
+        "tool": "resolve_region_navigation_goal",
+        "status": "succeeded" if path_clearance >= min_clearance_m else "low_clearance",
+        "target_label": region_label,
+        "target_type": "region",
+        "region_id": region.get("region_id"),
+        "navigation_purpose": "object_search",
+        "object_label": object_label,
+        "goal_pose": goal_pose,
+        "next_waypoint": next_waypoint,
+        "source": "home_memory.region_search_entry",
+        "goal_selection": "region_search_entry",
+        "search_stop": stop,
+        "search_stop_index": stop_index,
+        "search_plan": plan,
+        "clearance_m": round(_cell_clearance_m(goal_cell, grid), 3),
+        "path_clearance_m": round(path_clearance, 3),
+        "min_clearance_m": round(float(min_clearance_m), 3),
+        "path_strategy": "footprint_eroded_centerline_weighted_grid",
         "path_length_m": round(path_length_m, 3),
         "path": _path_payload(path_cells, grid),
     }
@@ -1745,6 +1884,11 @@ def _should_use_inside_edge_region_approach_goal(
     shallow_fixture_region = area_m2 <= 2.0 and minor_length_m <= 0.95
     mostly_unsafe_small_region = area_m2 <= 2.25 and safe_ratio <= 0.12
     return shallow_fixture_region or mostly_unsafe_small_region
+
+
+def _is_object_search_navigation_purpose(value: str) -> bool:
+    normalized = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized in {"object_search", "region_object_search", "search", "search_region", "find_object", "grab_object"}
 
 
 def _inside_edge_region_approach_cells(

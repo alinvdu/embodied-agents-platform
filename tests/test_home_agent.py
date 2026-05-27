@@ -342,6 +342,32 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertFalse(waypoint["is_final_waypoint"])
         self.assertNotEqual((waypoint["x"], waypoint["y"]), (result["goal_pose"]["x"], result["goal_pose"]["y"]))
 
+    def test_region_navigation_goal_object_search_uses_first_exploration_stop(self) -> None:
+        memory = visual_sweep_memory()
+        plan = plan_region_exploration(memory, "kitchen", max_stops=1, shots_per_stop=1, min_clearance_m=0.2)
+
+        result = resolve_region_navigation_goal(
+            memory,
+            "kitchen",
+            current_pose={"x": 3.0, "y": 2.0, "yaw": 0.0},
+            min_clearance_m=0.2,
+            waypoint_horizon_m=1.0,
+            navigation_purpose="object_search",
+            object_label="coke can",
+            exploration_constraints={"max_stops": 1, "shots_per_stop": 1},
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["source"], "home_memory.region_search_entry")
+        self.assertEqual(result["goal_selection"], "region_search_entry")
+        self.assertEqual(result["navigation_purpose"], "object_search")
+        self.assertEqual(result["object_label"], "coke can")
+        self.assertEqual(result["search_stop"]["stop_id"], plan["stops"][0]["stop_id"])
+        self.assertAlmostEqual(result["goal_pose"]["x"], plan["stops"][0]["pose"]["x"], delta=1e-6)
+        self.assertAlmostEqual(result["goal_pose"]["y"], plan["stops"][0]["pose"]["y"], delta=1e-6)
+        self.assertLessEqual(result["next_waypoint"]["distance_from_start_m"], 1.0)
+        self.assertFalse(result["next_waypoint"]["is_final_waypoint"])
+
     def test_region_exploration_plan_generates_stops_and_fov_shots(self) -> None:
         result = plan_region_exploration(visual_sweep_memory(), "kitchen", min_clearance_m=0.2)
         self.assertEqual(result["status"], "succeeded")
@@ -880,7 +906,12 @@ class HomeTaskAgentTests(unittest.TestCase):
             result = runtime.execute_region_exploration_plan(
                 region_label="kitchen",
                 object_label="coke can",
-                constraints={"max_stops": 1, "shots_per_stop": 1, "allow_auto_rotate": False},
+                constraints={
+                    "max_stops": 1,
+                    "shots_per_stop": 1,
+                    "allow_auto_rotate": False,
+                    "allow_remote_region_exploration": True,
+                },
             )
 
         self.assertEqual(result["status"], "succeeded")
@@ -899,6 +930,39 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertTrue(manifest_path.exists())
         self.assertTrue(any(event["details"].get("tool") == "plan_region_exploration" for event in events))
         self.assertTrue(any(event["details"].get("tool") == "execute_region_exploration_plan" for event in events))
+
+    def test_runtime_execute_region_exploration_plan_requires_navigation_when_first_stop_remote(self) -> None:
+        events = []
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                navigation_waypoint_horizon_m=1.0,
+            ),
+            emit=lambda kind, title, summary, details=None: events.append(
+                {"kind": kind, "title": title, "summary": summary, "details": details or {}}
+            ),
+        )
+
+        def fake_urlopen(request, timeout=0):
+            raise AssertionError(f"navigation backend should not be called before search-entry navigation: {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.execute_region_exploration_plan(
+                region_label="kitchen",
+                object_label="coke can",
+                constraints={"max_stops": 1, "shots_per_stop": 1},
+            )
+
+        self.assertEqual(result["status"], "requires_navigation")
+        self.assertEqual(result["suggested_navigation"]["tool"], "resolve_navigation_to_region")
+        self.assertEqual(result["suggested_navigation"]["target_label"], "kitchen")
+        suggested_constraints = result["suggested_navigation"]["constraints"]
+        self.assertEqual(suggested_constraints["navigation_purpose"], "object_search")
+        self.assertEqual(suggested_constraints["object_label"], "coke can")
+        self.assertEqual(suggested_constraints["max_stops"], 1)
+        self.assertEqual(suggested_constraints["shots_per_stop"], 1)
+        self.assertTrue(any(event["details"].get("status") == "requires_navigation" for event in events))
 
     def test_runtime_execute_region_exploration_plan_aborts_when_detector_matches(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
@@ -969,7 +1033,12 @@ class HomeTaskAgentTests(unittest.TestCase):
             result = runtime.execute_region_exploration_plan(
                 region_label="kitchen",
                 object_label="coke can",
-                constraints={"max_stops": 1, "shots_per_stop": 2, "allow_auto_rotate": False},
+                constraints={
+                    "max_stops": 1,
+                    "shots_per_stop": 2,
+                    "allow_auto_rotate": False,
+                    "allow_remote_region_exploration": True,
+                },
             )
 
         self.assertEqual(result["status"], "object_found")
@@ -1064,7 +1133,12 @@ class HomeTaskAgentTests(unittest.TestCase):
             result = runtime.execute_region_exploration_plan(
                 region_label="kitchen",
                 object_label="coke can",
-                constraints={"max_stops": 1, "shots_per_stop": 2, "allow_auto_rotate": False},
+                constraints={
+                    "max_stops": 1,
+                    "shots_per_stop": 2,
+                    "allow_auto_rotate": False,
+                    "allow_remote_region_exploration": True,
+                },
             )
 
         self.assertEqual(result["status"], "blocked")
@@ -1967,7 +2041,12 @@ class HomeTaskAgentTests(unittest.TestCase):
             result = runtime.execute_region_exploration_plan(
                 region_label="kitchen",
                 object_label="coke can",
-                constraints={"max_stops": 1, "shots_per_stop": 1, "allow_auto_rotate": False},
+                constraints={
+                    "max_stops": 1,
+                    "shots_per_stop": 1,
+                    "allow_auto_rotate": False,
+                    "allow_remote_region_exploration": True,
+                },
             )
 
         self.assertEqual(result["status"], "blocked")
@@ -2184,6 +2263,9 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("After each successful waypoint", instructions)
         self.assertIn("Do not use exploration stops as a shortcut for long-distance navigation", instructions)
         self.assertIn("Example far object-search request", instructions)
+        self.assertIn("navigation_purpose", instructions)
+        self.assertIn("requires_navigation", instructions)
+        self.assertIn("search-entry", instructions)
         self.assertIn("Bad example", instructions)
 
     def test_openai_provider_applies_cli_api_key_to_agents_sdk_env(self) -> None:

@@ -175,6 +175,9 @@ class HomeAgentToolRuntime:
                 constraints.get("waypoint_horizon_m", self.config.navigation_waypoint_horizon_m)
                 or self.config.navigation_waypoint_horizon_m
             ),
+            navigation_purpose=str(constraints.get("navigation_purpose") or constraints.get("purpose") or ""),
+            object_label=str(constraints.get("object_label") or constraints.get("search_object_label") or ""),
+            exploration_constraints=constraints,
         )
         waypoint = result.get("next_waypoint") if isinstance(result.get("next_waypoint"), dict) else None
         if waypoint is not None and isinstance(self.current_pose, dict):
@@ -260,6 +263,50 @@ class HomeAgentToolRuntime:
             return result
 
         navigation_constraints = _region_exploration_navigation_constraints(constraints)
+        first_stop = next((stop for stop in plan.get("stops", []) if isinstance(stop, dict)), None)
+        first_stop_pose = first_stop.get("pose") if isinstance(first_stop, dict) and isinstance(first_stop.get("pose"), dict) else None
+        local_start_radius_m = _bounded_float(
+            constraints.get("local_exploration_start_radius_m", self.config.navigation_waypoint_horizon_m),
+            self.config.navigation_waypoint_horizon_m,
+            minimum=0.1,
+            maximum=5.0,
+        )
+        if (
+            first_stop is not None
+            and isinstance(first_stop_pose, dict)
+            and not _constraint_bool(constraints, "allow_remote_region_exploration", False)
+            and _pose_distance_m(self.current_pose, first_stop_pose) > local_start_radius_m
+        ):
+            suggested_constraints = {
+                "navigation_purpose": "object_search",
+                "object_label": object_label,
+                "waypoint_horizon_m": self.config.navigation_waypoint_horizon_m,
+            }
+            for key in ("max_stops", "shots_per_stop", "fov_deg", "boundary_margin_m", "min_stop_separation_m"):
+                if key in constraints:
+                    suggested_constraints[key] = constraints[key]
+            result = {
+                "tool": "execute_region_exploration_plan",
+                "status": "requires_navigation",
+                "region_label": region_label,
+                "object_label": object_label,
+                "reason": (
+                    f"First exploration stop `{first_stop.get('stop_id')}` is "
+                    f"{_pose_distance_m(self.current_pose, first_stop_pose):.2f}m away; "
+                    "navigate to the region search-entry waypoint before executing local exploration."
+                ),
+                "plan": plan,
+                "first_stop": first_stop,
+                "current_pose": dict(self.current_pose),
+                "local_exploration_start_radius_m": round(local_start_radius_m, 3),
+                "suggested_navigation": {
+                    "tool": "resolve_navigation_to_region",
+                    "target_label": region_label,
+                    "constraints": suggested_constraints,
+                },
+            }
+            self.emit("tool_blocked", "Region Exploration", result["reason"], result)
+            return result
         shot_yaw_tolerance_deg = _bounded_float(
             constraints.get("shot_yaw_tolerance_deg", 5.0),
             5.0,
@@ -2344,7 +2391,8 @@ class HomeTaskAgent:
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- execute_region_exploration_plan is for local visual search after the robot is already near the target region. Do not use exploration stops as a shortcut for long-distance navigation.",
-                "- For far regions such as kitchen from another room, first use the short-horizon navigation loop: resolve_navigation_to_region, navigate_to_waypoint, relocalize_here, then resolve again until the region/final waypoint is reached. Only then run execute_region_exploration_plan.",
+                "- For far object-search regions such as kitchen from another room, first use resolve_navigation_to_region with constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"<object>\"}'. This aims the normal short-horizon waypoint loop at the first useful search/scan stop instead of the room center.",
+                "- If execute_region_exploration_plan returns status='requires_navigation', follow its suggested_navigation by calling resolve_navigation_to_region, then navigate_to_waypoint and relocalize_here until the search-entry waypoint is reached.",
                 "- For nearby regions already within roughly one short-horizon waypoint, execute_region_exploration_plan may be used directly for search.",
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
@@ -2354,7 +2402,7 @@ class HomeTaskAgent:
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
-                "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate to the region using the short-horizon loop before any execute_region_exploration_plan call. Once near the region, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
+                "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate using resolve_navigation_to_region with navigation_purpose='object_search' before any execute_region_exploration_plan call. Once near the returned search-entry goal, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
                 f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
@@ -2375,7 +2423,7 @@ class HomeTaskAgent:
                 "6. If the waypoint failed, summarize status, reason, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "",
                 "Example custom horizon: resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"waypoint_horizon_m\": 1.5}').",
-                "Example far object-search request: for `navigate to kitchen, recognize the small yellow bottle, and move into grabbing position`, do not start with execute_region_exploration_plan if the kitchen is far. First run the navigation loop to kitchen. After the final kitchen waypoint succeeds and relocalize_here has run, call execute_region_exploration_plan(region_label='kitchen', object_label='small yellow bottle').",
+                "Example far object-search request: for `navigate to kitchen, recognize the small yellow bottle, and move into grabbing position`, do not start with execute_region_exploration_plan if the kitchen is far. First call resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"small yellow bottle\"}'), then navigate_to_waypoint and relocalize_here in the normal loop. After the final search-entry waypoint succeeds and relocalize_here has run, call execute_region_exploration_plan(region_label='kitchen', object_label='small yellow bottle').",
                 "Example nearby object-search request: if the robot is already beside the TV area and the target region is local, execute_region_exploration_plan(region_label='TV Area', object_label='small yellow bottle', constraints_json='{\"max_stops\": 2, \"shots_per_stop\": 2}') is appropriate.",
                 "Example object-grab flow after reaching the region: execute_region_exploration_plan(region_label='kitchen', object_label='coke can'), then focus_detected_object(detection_id=selected_detection_id, object_label='coke can'), then approach_detected_object(detection_id=selected_detection_id, object_label='coke can'), then grab_object(object_label='coke can', detection_id=selected_detection_id, object_description='detected coke can').",
                 "Bad example: do not respond to a far kitchen search by repeatedly using execute_region_exploration_plan, micro_adjust_to_pose, or local_clearance_recovery as the primary route. Those are local search/recovery tools; long travel must go through navigate_to_waypoint/Nav2 and relocalize_here.",
