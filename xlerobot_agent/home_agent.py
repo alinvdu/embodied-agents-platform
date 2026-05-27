@@ -984,7 +984,7 @@ class HomeAgentToolRuntime:
                     target_max_m=target_max_m,
                 )
                 attempt["surface_alignment"] = alignment
-                if alignment.get("status") in {"succeeded", "partial"}:
+                if alignment.get("status") in {"succeeded", "partial", "blocked"}:
                     self._record_object_surface_alignment(
                         object_label=label,
                         detection_id=str(detection.get("selected_detection_id") or ""),

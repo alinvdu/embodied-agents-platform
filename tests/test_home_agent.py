@@ -1810,6 +1810,96 @@ class HomeTaskAgentTests(unittest.TestCase):
             self.assertEqual(result["attempts"][0]["retry_policy"]["surface_alignment_disabled"], True)
             self.assertIn("object corridor is not clear", result["reason"])
 
+    def test_runtime_approach_blocked_surface_alignment_counts_as_retry_state(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=object_surface_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="surface_blocked_retry_run",
+        )
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "old_det",
+                "selected_detection": {
+                    "detection_id": "old_det",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [220, 120, 420, 360],
+                },
+            },
+            capture={"shot_id": "old_shot", "image_width": 640, "image_height": 480},
+        )
+        current_pose = dict(runtime.current_pose)
+        urls = []
+
+        def fake_urlopen(request, timeout=0):
+            urls.append(request.full_url)
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.8,
+                        "distance_m": 0.8,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_map": {"x": 2.75, "y": 2.85, "z": 0.2},
+                        "current_pose": dict(current_pose),
+                        "safety": {
+                            "safe": False,
+                            "safe_forward_step_m": 0.0,
+                            "reason": "object corridor is not clear",
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                raise AssertionError("blocked surface alignment should not move locally in this test")
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        blocked_alignment = {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "No footprint-clear standoff pose was found near the support surface.",
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen), patch(
+            "xlerobot_agent.home_agent.resolve_object_surface_approach_pose",
+            return_value=blocked_alignment,
+        ):
+            first = runtime.approach_detected_object(object_label="coke can")
+            first_urls = list(urls)
+            urls.clear()
+            retry = runtime.approach_detected_object(
+                object_label="coke can",
+                constraints={"allow_surface_alignment": False},
+            )
+            retry_urls = list(urls)
+
+        self.assertEqual(first["status"], "blocked")
+        self.assertEqual(runtime.object_approach_state["coke can"]["surface_alignment_status"], "blocked")
+        self.assertTrue(first_urls[0].endswith("/api/nav/estimate_detection_geometry"))
+        self.assertEqual(retry["status"], "blocked")
+        self.assertTrue(retry_urls[0].endswith("/api/nav/capture_rgb"))
+        self.assertEqual(retry["attempts"][0]["source"], "detector_refresh")
+        self.assertEqual(retry["attempts"][0]["retry_policy"]["detector_refresh_forced"], True)
+
     def test_runtime_grab_object_is_mock_vla_entrypoint(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=sample_memory(),
