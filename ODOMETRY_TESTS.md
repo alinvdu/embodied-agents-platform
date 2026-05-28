@@ -1,20 +1,28 @@
 # Real Robot Odometry Test Plan
 
-This runbook validates the current real-robot odometry stack:
+This runbook validates the selectable real-robot odometry stacks.
 
 ```text
+RGB-D/IMU mode:
 Orbbec RGB-D + IMU sidecar
   -> robot_brain_agent in-memory /rgbd + /ws/imu
   -> real_ros_bridge publishes /camera/head/*, /scan, /imu, /cmd_vel forwarding
   -> imu_yaw_filter publishes /imu/filtered_yaw
   -> rgbd_visual_odometry publishes /odom and odom -> base_link
+
+Wheel mode:
+STS3215 wheel feedback
+  -> robot_brain_agent /wheel_state
+  -> wheel_odometry publishes /odom and odom -> base_link
 ```
 
-Current odometry split:
+Current RGB-D/IMU odometry split:
 
 - RGB-D provides translation.
 - Filtered gyro/IMU yaw provides rotation.
 - Accelerometer double integration is not used for odometry position.
+
+Wheel mode replaces both RGB-D translation and IMU yaw with wheel encoder position deltas. Run exactly one `/odom` owner at a time.
 
 Run all motion tests with the robot on the floor in a clear area. Keep an emergency stop terminal ready.
 
@@ -61,6 +69,7 @@ Expected:
 
 - Logs show the HTTP agent is ready on port `8765`.
 - `/health` later reports `"motion_enabled": true`.
+- `/wheel_state` later returns `positions_raw` for `base_left_wheel` and `base_right_wheel`.
 
 ## Terminal RB-2: Orbbec RGB-D + IMU Sidecar
 
@@ -165,6 +174,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --no-laser-fill-no-return
 ```
 
+For wheel-odometry-only tests, add `--no-publish-imu` to this bridge command and skip OFF-4/OFF-5.
+
 Expected:
 
 - Logs show `IMU websocket connected`.
@@ -194,7 +205,7 @@ Expected: close to `30 Hz`.
 ros2 topic hz /imu
 ```
 
-Expected: high rate. Around `200 Hz` is the target.
+Expected in RGB-D/IMU mode: high rate. Around `200 Hz` is the target. In wheel mode with `--no-publish-imu`, skip this check.
 
 ```bash
 ros2 topic echo /camera/head/camera_info --once
@@ -273,6 +284,117 @@ Expected:
 - `/odom` exists and publishes near `30 Hz`.
 - `tf2_echo odom base_link` works.
 - While stationary, position and yaw should remain nearly stable.
+
+## Terminal OFF-5B: Wheel Odometry Alternative
+
+Use this instead of OFF-4 and OFF-5 when validating wheel encoder odometry.
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.wheel_odometry \
+  --robot-brain-url "${ROBOT_BRAIN_URL}" \
+  --wheel-state-path /wheel_state \
+  --odom-topic /odom \
+  --odom-reset-topic /xlerobot/odom/set_pose \
+  --odom-frame odom \
+  --base-frame base_link \
+  --publish-rate-hz 50 \
+  --encoder-ticks-per-revolution 4096 \
+  --wheel-radius-m 0.05 \
+  --wheel-track-width-m 0.25 \
+  --left-wheel-position-sign -1 \
+  --right-wheel-position-sign 1
+```
+
+Expected:
+
+- `/odom` exists and publishes near `50 Hz`.
+- Forward motion increases `/odom.pose.pose.position.x` when yaw is near zero.
+- A physical left/counter-clockwise spin increases odometry yaw. If not, adjust the wheel position signs before using Nav2.
+
+## Wheel Mode Smoke Tests
+
+Run these after `wheel_odometry` is publishing `/odom` and before asking Nav2 to drive to a room. In wheel-only mode, keep `real_ros_bridge` running with `--no-publish-imu`; these checks use TF/odom as the stopping source.
+
+Check that `/odom` is alive:
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 topic hz /odom
+```
+
+Short forward check:
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.ros_forward_accel_diagnostic \
+  --send-motion \
+  --duration-s 15 \
+  --sample-hz 30 \
+  --linear-m-s 0.03 \
+  --target-distance-m 0.25 \
+  --target-source tf \
+  --max-imu-staleness-s 0 \
+  --csv-out artifacts/diagnostics/wheel_forward_025m.csv \
+  --json-out artifacts/diagnostics/wheel_forward_025m_summary.json
+
+python -m json.tool artifacts/diagnostics/wheel_forward_025m_summary.json
+```
+
+Main 50 cm forward check:
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.ros_forward_accel_diagnostic \
+  --send-motion \
+  --duration-s 25 \
+  --sample-hz 30 \
+  --linear-m-s 0.03 \
+  --target-distance-m 0.50 \
+  --target-source tf \
+  --max-imu-staleness-s 0 \
+  --csv-out artifacts/diagnostics/wheel_forward_050m.csv \
+  --json-out artifacts/diagnostics/wheel_forward_050m_summary.json
+
+python -m json.tool artifacts/diagnostics/wheel_forward_050m_summary.json
+```
+
+Left rotation check:
+
+```bash
+cd "$ROBOT42"
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.ros_rotation_diagnostic \
+  --send-motion \
+  --duration-s 30 \
+  --sample-hz 20 \
+  --angular-rad-s 0.10 \
+  --target-yaw-deg 90 \
+  --target-source tf \
+  --imu-bias-calibration-s 0.0 \
+  --csv-out artifacts/diagnostics/wheel_rotate_left_90.csv \
+  --json-out artifacts/diagnostics/wheel_rotate_left_90_summary.json
+
+python -m json.tool artifacts/diagnostics/wheel_rotate_left_90_summary.json
+```
+
+Pass criteria:
+
+- The 25 cm and 50 cm tests stop with `target_tf_distance_reached`.
+- Physical travel is close to the requested distance. If both are off by the same ratio, tune `--wheel-radius-m`.
+- A physical left/counter-clockwise spin reports a positive yaw delta. If the sign is wrong, fix wheel position signs before using Nav2.
+- If straight motion curves consistently, tune `--wheel-track-width-m` or verify the left/right wheel signs.
 
 ## Safety Stop Command
 

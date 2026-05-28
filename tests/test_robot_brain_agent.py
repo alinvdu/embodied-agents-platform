@@ -20,6 +20,21 @@ class FakeResult:
         self.metadata = metadata or {}
 
 
+class FakeWheelBus:
+    def __init__(self) -> None:
+        self.reads = []
+        self.positions = {"base_left_wheel": -120, "base_right_wheel": 140}
+        self.velocities = {"base_left_wheel": -35, "base_right_wheel": 40}
+
+    def sync_read(self, data_name, motors, *, normalize=True, num_retry=0):
+        self.reads.append((data_name, tuple(motors), normalize, num_retry))
+        if data_name == "Present_Position":
+            return {motor: self.positions[motor] for motor in motors}
+        if data_name == "Present_Velocity":
+            return {motor: self.velocities[motor] for motor in motors}
+        raise ValueError(data_name)
+
+
 class FakeRuntime:
     def __init__(self) -> None:
         self.velocity_calls = []
@@ -28,6 +43,7 @@ class FakeRuntime:
         self.connected = False
         self.robot = self
         self.actions = []
+        self.bus2 = FakeWheelBus()
 
     def connect(self) -> None:
         self.connected = True
@@ -39,6 +55,9 @@ class FakeRuntime:
     def drive_velocity(self, *, linear_m_s: float, angular_rad_s: float):
         self.velocity_calls.append((linear_m_s, angular_rad_s))
         return FakeResult(metadata={"sent": True})
+
+    def _wheel_raw_to_body(self, left_wheel_speed, right_wheel_speed):
+        return {"x.vel": (float(right_wheel_speed) - float(left_wheel_speed)) / 2.0, "theta.vel": 12.5}
 
     def stop(self):
         self.stop_calls += 1
@@ -68,6 +87,8 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.camera_pan_action_key, "head_motor_1.pos")
         self.assertEqual(config.camera_pan_action_sign, 1.0)
         self.assertEqual(config.base_angular_action_sign, 1.0)
+        self.assertEqual(config.left_wheel_motor, "base_left_wheel")
+        self.assertEqual(config.right_wheel_motor, "base_right_wheel")
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -99,6 +120,19 @@ class RobotBrainAgentTests(unittest.TestCase):
 
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.velocity_calls, [(0.0, -0.08)])
+
+    def test_agent_reads_raw_wheel_feedback(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=runtime)
+
+        state = agent.wheel_state()
+
+        self.assertTrue(runtime.connected)
+        self.assertEqual(state["wheel_motors"], {"left": "base_left_wheel", "right": "base_right_wheel"})
+        self.assertEqual(state["positions_raw"], {"base_left_wheel": -120, "base_right_wheel": 140})
+        self.assertEqual(state["velocities_raw"], {"base_left_wheel": -35, "base_right_wheel": 40})
+        self.assertEqual(state["body_velocity"], {"x.vel": 37.5, "theta.vel": 12.5})
+        self.assertIn(("Present_Position", ("base_left_wheel", "base_right_wheel"), False, 1), runtime.bus2.reads)
 
     def test_agent_commands_camera_pitch_and_updates_state(self) -> None:
         runtime = FakeRuntime()

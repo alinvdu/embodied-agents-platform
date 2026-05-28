@@ -110,6 +110,7 @@ class RealRosBridgeConfig:
     camera_pan_topic: str = "/camera/head/pan_rad"
     camera_pose_poll_period_s: float = 0.2
     publish_head_camera: bool = True
+    publish_imu: bool = True
     publish_rate_hz: float = 30.0
     imu_publish_rate_hz: float = 200.0
     imu_ws_path: str = "/ws/imu"
@@ -629,7 +630,7 @@ class RealXLeRobotRosBridge(Node):
         if config.odom_source == "commanded":
             self.odom_publisher = self.create_publisher(Odometry, config.odom_topic, 10)
         self.scan_publisher = self.create_publisher(LaserScan, config.scan_topic, 10)
-        self.imu_publisher = self.create_publisher(Imu, config.imu_topic, 10)
+        self.imu_publisher = self.create_publisher(Imu, config.imu_topic, 10) if config.publish_imu else None
         self.head_rgb_publisher = None
         self.head_depth_publisher = None
         self.head_camera_info_publisher = None
@@ -669,10 +670,10 @@ class RealXLeRobotRosBridge(Node):
             callback_group=self._step_callback_group,
         )
         self.imu_timer = None
-        if brain_client is not None:
+        if config.publish_imu and brain_client is not None:
             require_aiohttp()
             self._start_imu_stream_thread(brain_client.websocket_url(config.imu_ws_path))
-        else:
+        elif config.publish_imu:
             self.imu_timer = self.create_timer(
                 1.0 / max(config.imu_publish_rate_hz, 1e-6),
                 self._poll_and_publish_imu,
@@ -683,6 +684,7 @@ class RealXLeRobotRosBridge(Node):
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
             f"cmd_vel={config.cmd_vel_topic} odom={config.odom_topic} scan={config.scan_topic} "
             f"odom_source={config.odom_source} motion_enabled={config.allow_motion_commands} "
+            f"publish_imu={config.publish_imu} "
             f"robot_brain_url={config.robot_brain_url or 'local'}"
         )
 
@@ -966,6 +968,8 @@ class RealXLeRobotRosBridge(Node):
         self.tf_broadcaster.sendTransform(transforms)
 
     def _publish_imu_sample(self, *, imu_sample: dict[str, Any]) -> None:
+        if self.imu_publisher is None:
+            return
         msg = Imu()
         imu_timestamp_s = imu_ros_timestamp_s(imu_sample)
         if imu_timestamp_s is None:
@@ -1393,6 +1397,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pan-topic", default="/camera/head/pan_rad")
     parser.add_argument("--camera-pose-poll-period-s", type=float, default=0.2)
     parser.add_argument("--publish-head-camera", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--publish-imu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Publish raw /imu from the Orbbec stream. Disable in wheel-odometry-only mode.",
+    )
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
     parser.add_argument(
         "--imu-publish-rate-hz",
@@ -1464,6 +1474,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         camera_pan_topic=args.camera_pan_topic,
         camera_pose_poll_period_s=args.camera_pose_poll_period_s,
         publish_head_camera=args.publish_head_camera,
+        publish_imu=args.publish_imu,
         publish_rate_hz=args.publish_rate_hz,
         imu_publish_rate_hz=args.imu_publish_rate_hz,
         imu_ws_path=args.imu_ws_path,
@@ -1487,7 +1498,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     require_ros_dependencies()
-    if args.robot_brain_url:
+    if args.robot_brain_url and args.publish_imu:
         require_aiohttp()
     rclpy.init()
     bridge = RealXLeRobotRosBridge(config_from_args(args))

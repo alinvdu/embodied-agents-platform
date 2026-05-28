@@ -114,6 +114,7 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.camera_z_m, 0.35)
         self.assertEqual(config.camera_pan_topic, "/camera/head/pan_rad")
         self.assertEqual(config.scan_active_topic, "/xlerobot/scan_active")
+        self.assertTrue(config.publish_imu)
 
     def test_camera_mount_arguments_are_configurable(self) -> None:
         args = build_parser().parse_args(
@@ -201,6 +202,12 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.imu_topic, "/imu")
         self.assertEqual(config.imu_ws_path, "/ws/imu")
         self.assertEqual(config.imu_ws_reconnect_delay_s, 0.5)
+
+    def test_parser_can_disable_raw_imu_for_wheel_odometry_mode(self) -> None:
+        args = build_parser().parse_args(["--no-publish-imu"])
+        config = config_from_args(args)
+
+        self.assertFalse(config.publish_imu)
 
     def test_runtime_error_formatter_includes_robot_brain_http_body(self) -> None:
         exc = HTTPError(

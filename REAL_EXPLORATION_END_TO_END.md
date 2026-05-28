@@ -183,6 +183,7 @@ Quick health checks from the robot brain:
 ```bash
 curl http://127.0.0.1:8765/health
 curl http://127.0.0.1:8765/camera/head/pose
+curl http://127.0.0.1:8765/wheel_state
 curl http://127.0.0.1:8765/rgb --output /tmp/brain_rgb.ppm
 curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
 curl http://127.0.0.1:8765/imu
@@ -237,7 +238,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --allow-motion-commands
 ```
 
-This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu`, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain.
+This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu` unless disabled, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain. In wheel-odometry-only mode, add `--no-publish-imu` to this command; Nav2 still receives `/odom` from `wheel_odometry` and the bridge still handles RGB-D, scan, TF camera frames, and `/cmd_vel`.
 
 For OctoMap camera-pan scans, keep `--head-points-mode settled` and `--scan-active-topic /xlerobot/scan_active`. Before `Start Explore`, `/camera/head/points` stays live so OctoMap can bootstrap `/projected_map` and TF can provide the first `map -> base_link` pose. After `Start Explore`, the exploration runtime controls `/camera/head/points/update_map_enabled`: it opens PointCloud2 updates only during intentional scan windows and closes them again for waypoint preview/navigation. During scans, the bridge still suppresses `/camera/head/points` while the head is moving and only resumes after robot brain reports the target head pose as settled, so OctoMap integrates stable snapshots instead of smearing point clouds during pan motion.
 
@@ -249,7 +250,7 @@ The exploration runtime also pauses `/camera/head/points` for the full duration 
 
 Keep `--no-laser-fill-no-return` for real Orbbec mapping. Missing/invalid depth should stay unknown; treating it as max-range free space creates false fan-shaped clear areas. The point-cloud occupancy mapper is intentionally conservative: it adds free space only along rays to valid points and does not clear through missing depth.
 
-`/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is now pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer.
+`/imu` is a raw `sensor_msgs/Imu` stream carrying both angular velocity and linear acceleration. In robot-brain mode it is pushed over a persistent websocket, so `/imu` is no longer capped by the old poll timer. Wheel odometry does not need `/imu`; keep it only for diagnostics or RGB-D/IMU odometry mode.
 
 ### Camera Pitch Alignment Check
 
@@ -407,7 +408,11 @@ Do not tune OctoMap until the camera pitch alignment check above passes. If the 
 
 Restarting OctoMap clears its in-memory map. RViz does not need to be restarted; toggle the `Map` and `MarkerArray` displays off/on if stale latched visuals remain.
 
-### Terminal OC-2: IMU Yaw Filter
+### Odometry Mode Choice
+
+Run exactly one `/odom` owner. For the original stack, run the IMU yaw filter plus RGB-D visual odometry below. For the wheel-encoder experiment, skip both of those and run `wheel_odometry` instead.
+
+### Terminal OC-2A: IMU Yaw Filter for RGB-D/IMU Odom
 
 ```bash
 cd /home/alin/Robot42
@@ -435,7 +440,7 @@ Quick checks:
 ros2 topic echo /imu/filtered_yaw --once
 ```
 
-### Terminal OC-3: RGB-D Visual Odometry
+### Terminal OC-3A: RGB-D Visual Odometry
 
 ```bash
 cd /home/alin/Robot42
@@ -479,6 +484,34 @@ Quick checks:
 ros2 topic echo /odom --once
 ros2 run tf2_ros tf2_echo odom base_link
 ```
+
+### Terminal OC-2B: Wheel Odometry Alternative
+
+Use this instead of OC-2A and OC-3A when testing STS3215 wheel odometry. Keep `real_ros_bridge` running with `--odom-source none`; `wheel_odometry` owns `/odom` and `odom -> base_link`.
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+python -m xlerobot_playground.wheel_odometry \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --wheel-state-path /wheel_state \
+  --odom-topic /odom \
+  --odom-reset-topic /xlerobot/odom/set_pose \
+  --odom-frame odom \
+  --base-frame base_link \
+  --publish-rate-hz 50 \
+  --encoder-ticks-per-revolution 4096 \
+  --wheel-radius-m 0.05 \
+  --wheel-track-width-m 0.25 \
+  --left-wheel-motor base_left_wheel \
+  --right-wheel-motor base_right_wheel \
+  --left-wheel-position-sign -1 \
+  --right-wheel-position-sign 1
+```
+
+The default wheel signs match the current `xlerobot_2wheels` drive code: forward motion commands the left motor in the opposite raw direction from the right motor. If a forward drive makes `/odom` move backward, flip both wheel position signs. If an in-place left turn makes `/odom` yaw decrease, flip one side or adjust the track width/signs after a 90 degree spin test.
 
 ### Terminal OC-4: Nav2 Params
 

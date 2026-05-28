@@ -69,6 +69,8 @@ class RobotBrainAgentConfig:
     camera_pan_action_units: str = "deg"
     camera_pan_action_sign: float = 1.0
     camera_pan_settle_s: float = 0.5
+    left_wheel_motor: str = "base_left_wheel"
+    right_wheel_motor: str = "base_right_wheel"
 
 
 class ImuStreamState:
@@ -334,6 +336,41 @@ class RobotBrainAgent:
                 "motion_started_s": self._camera_motion_started_s,
                 "motion_until_s": self._camera_motion_until_s,
             }
+
+    def wheel_state(self) -> dict[str, Any]:
+        """Read live differential-drive wheel feedback from the XLeRobot bus."""
+        left_motor = self.config.left_wheel_motor
+        right_motor = self.config.right_wheel_motor
+        wheel_motors = [left_motor, right_motor]
+        with self._motion_lock:
+            self.runtime.connect()
+            robot = self.runtime.robot
+            bus = getattr(robot, "bus2", None)
+            if bus is None or not hasattr(bus, "sync_read"):
+                raise RuntimeError("Robot runtime does not expose a readable wheel motor bus.")
+            positions_raw = bus.sync_read("Present_Position", wheel_motors, normalize=False, num_retry=1)
+            velocities_raw = bus.sync_read("Present_Velocity", wheel_motors, normalize=False, num_retry=1)
+
+        body_velocity = None
+        wheel_raw_to_body = getattr(robot, "_wheel_raw_to_body", None)
+        if callable(wheel_raw_to_body):
+            try:
+                converted = wheel_raw_to_body(velocities_raw[left_motor], velocities_raw[right_motor])
+                body_velocity = {key: float(value) for key, value in converted.items()}
+            except Exception:
+                body_velocity = None
+
+        return {
+            "ok": True,
+            "timestamp_s": time.time(),
+            "wheel_motors": {
+                "left": left_motor,
+                "right": right_motor,
+            },
+            "positions_raw": {key: int(value) for key, value in positions_raw.items()},
+            "velocities_raw": {key: int(value) for key, value in velocities_raw.items()},
+            "body_velocity": body_velocity,
+        }
 
     def update_camera_state(
         self,
@@ -662,6 +699,12 @@ async def _handle_camera_head_pose_get(request: web.Request) -> web.Response:
     return web.json_response(agent.camera_state())
 
 
+async def _handle_wheel_state(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    state = await asyncio.to_thread(agent.wheel_state)
+    return web.json_response(state)
+
+
 async def _handle_camera_head_pose_post(request: web.Request) -> web.Response:
     agent: RobotBrainAgent = request.app["agent"]
     raw = await request.read() if request.can_read_body else b""
@@ -811,6 +854,7 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_post("/camera/head/pose", _handle_camera_head_pose_post)
     app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
     app.router.add_post("/camera/head/pan", _handle_camera_head_pan)
+    app.router.add_get("/wheel_state", _handle_wheel_state)
     app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
@@ -916,6 +960,8 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
+    parser.add_argument("--left-wheel-motor", default="base_left_wheel")
+    parser.add_argument("--right-wheel-motor", default="base_right_wheel")
     return parser
 
 
@@ -963,6 +1009,8 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         camera_pan_action_units=args.camera_pan_action_units,
         camera_pan_action_sign=args.camera_pan_action_sign,
         camera_pan_settle_s=args.camera_pan_settle_s,
+        left_wheel_motor=args.left_wheel_motor,
+        right_wheel_motor=args.right_wheel_motor,
     )
 
 
