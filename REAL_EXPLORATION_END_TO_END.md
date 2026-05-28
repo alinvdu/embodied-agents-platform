@@ -102,6 +102,8 @@ python -m xlerobot_playground.robot_brain_agent \
   --initial-camera-pitch-deg 0
 ```
 
+For wheel-odometry-only mode, add `--no-stream-imu` to `robot_brain_agent`. That keeps robot brain from opening the Orbbec IMU UDP listener or `/ws/imu`; `/wheel_state`, camera control, RGB-D ingest, and `/cmd_vel` still work.
+
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
 
 Keep `--base-angular-action-sign 1` if positive ROS `/cmd_vel.angular.z` turns the robot left/counter-clockwise in RViz/map coordinates. If a positive angular command physically turns the robot right, restart only `robot_brain_agent` with `--base-angular-action-sign -1`.
@@ -115,6 +117,8 @@ Check the physical pan sign before trusting the 360 map. In ROS convention, posi
 If you recalibrate and the level camera position changes, update only `--camera-pitch-action-offset-deg`. For example, if the camera is level at `head_motor_2.pos = -18`, use `--camera-pitch-action-offset-deg -18`.
 
 ### Terminal RB-2: Orbbec Sidecar
+
+The command below enables RGB-D plus IMU for the RGB-D/IMU odometry stack. For wheel-odometry-only mode, remove `--enable-imu`, `--imu-aggregate-mode`, `--imu-udp-host`, `--imu-udp-port`, and `--imu-log-every`; keep the RGB-D, point-cloud, and camera HTTP flags.
 
 ```bash
 cd /Users/alin/Robot42
@@ -201,6 +205,8 @@ asyncio.run(main())
 PY
 ```
 
+In wheel mode with `--no-stream-imu`, skip the `/imu` curl and websocket check. `/health` should show `"imu_streaming": false`.
+
 The health response should include point-cloud stats after the first RGB-D frame. If `/camera/head/points` is empty on the offload computer, first confirm this sidecar command includes `--enable-point-cloud` and that the sidecar log reports nonzero point counts.
 
 `/imu` is now an in-memory debug snapshot. The high-rate IMU path is `Orbbec callback -> UDP datagram -> robot_brain_agent memory -> /ws/imu websocket`. `latest_imu.json` is no longer used in the high-rate path.
@@ -238,13 +244,13 @@ python -m xlerobot_playground.real_ros_bridge \
   --allow-motion-commands
 ```
 
-This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu` unless disabled, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain. In wheel-odometry-only mode, add `--no-publish-imu` to this command; Nav2 still receives `/odom` from `wheel_odometry` and the bridge still handles RGB-D, scan, TF camera frames, and `/cmd_vel`.
+This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu` unless disabled, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain. In wheel-odometry-only mode, add `--no-publish-imu` to this command; pair it with robot brain `--no-stream-imu` and an Orbbec sidecar started without `--enable-imu`. Nav2 still receives `/odom` from `wheel_odometry`, and the bridge still handles RGB-D, scan, TF camera frames, and `/cmd_vel`.
 
 For OctoMap camera-pan scans, keep `--head-points-mode settled` and `--scan-active-topic /xlerobot/scan_active`. Before `Start Explore`, `/camera/head/points` stays live so OctoMap can bootstrap `/projected_map` and TF can provide the first `map -> base_link` pose. After `Start Explore`, the exploration runtime controls `/camera/head/points/update_map_enabled`: it opens PointCloud2 updates only during intentional scan windows and closes them again for waypoint preview/navigation. During scans, the bridge still suppresses `/camera/head/points` while the head is moving and only resumes after robot brain reports the target head pose as settled, so OctoMap integrates stable snapshots instead of smearing point clouds during pan motion.
 
 Keep `--no-head-points-update-map-while-base-moving` for waypoint/Nav2 tests. This temporarily freezes OctoMap input while `/cmd_vel` is moving the base. It prevents base-motion TF/odometry lag from corrupting the already-built map; later live mapping can switch to `--head-points-update-map-while-base-moving` once base pose tracking is validated during motion.
 
-The exploration runtime also pauses `/camera/head/points` for the full duration of each Nav2 waypoint goal through `/camera/head/points/update_map_enabled`. This pauses only the PointCloud2 feed into OctoMap; `/odom`, TF, `/cmd_vel`, images, and IMU stay live so Nav2 and the UI can still track robot motion.
+The exploration runtime also pauses `/camera/head/points` for the full duration of each Nav2 waypoint goal through `/camera/head/points/update_map_enabled`. This pauses only the PointCloud2 feed into OctoMap; `/odom`, TF, `/cmd_vel`, and images stay live so Nav2 and the UI can still track robot motion. IMU also stays live in RGB-D/IMU mode, and is intentionally absent in wheel mode.
 
 `--camera-z-m 1.05` is the current effective camera height relative to `base_link`, validated in RViz by checking that the PointCloud2 floor remains flat against the ground grid at both `pitch_deg: 0` and `pitch_deg: 30`.
 

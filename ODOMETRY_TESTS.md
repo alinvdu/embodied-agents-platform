@@ -11,6 +11,7 @@ Orbbec RGB-D + IMU sidecar
   -> rgbd_visual_odometry publishes /odom and odom -> base_link
 
 Wheel mode:
+Orbbec RGB-D sidecar without IMU
 STS3215 wheel feedback
   -> robot_brain_agent /wheel_state
   -> wheel_odometry publishes /odom and odom -> base_link
@@ -65,6 +66,8 @@ python -m xlerobot_playground.robot_brain_agent \
   --max-angular-rad-s 0.10
 ```
 
+For wheel-odometry-only tests, add `--no-stream-imu` to this command. That keeps the robot brain from opening the IMU UDP listener or `/ws/imu`.
+
 Expected:
 
 - Logs show the HTTP agent is ready on port `8765`.
@@ -74,6 +77,8 @@ Expected:
 ## Terminal RB-2: Orbbec RGB-D + IMU Sidecar
 
 Run this on the robot brain Mac after RB-1 is running.
+
+For wheel-odometry-only tests, keep the RGB-D/camera HTTP flags but remove `--enable-imu`, `--imu-udp-host`, `--imu-udp-port`, and `--imu-log-every`. The camera still feeds RGB-D to robot brain, but no IMU frames are streamed.
 
 ```bash
 cd /Users/alin/Robot42
@@ -144,12 +149,15 @@ curl --max-time 3 "${ROBOT_BRAIN_URL}/imu" | python -m json.tool
 ls -lh /tmp/xlerobot_rgbd.bin /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
 ```
 
+In wheel mode with `--no-stream-imu`, skip the `/imu` curl; `/health` should show `"imu_streaming": false`.
+
 Expected:
 
 - Health JSON has `ok: true`.
 - Health JSON has `motion_enabled: true`.
 - Health JSON has `rgbd.ready: true`.
-- Health JSON has `imu.ready: true`.
+- In RGB-D/IMU mode, health JSON has `imu.ready: true`.
+- In wheel mode, health JSON has `imu_streaming: false`.
 - RGB and depth files are non-empty.
 
 ## Terminal OFF-2: ROS Bridge
@@ -178,7 +186,8 @@ For wheel-odometry-only tests, add `--no-publish-imu` to this bridge command and
 
 Expected:
 
-- Logs show `IMU websocket connected`.
+- In RGB-D/IMU mode, logs show `IMU websocket connected`.
+- In wheel mode, there should be no IMU websocket connection.
 - No repeated motion forwarding errors.
 
 ## Terminal OFF-3: ROS Topic Sanity

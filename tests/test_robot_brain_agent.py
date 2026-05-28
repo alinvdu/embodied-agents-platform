@@ -80,6 +80,7 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertFalse(config.debug_motion)
         self.assertTrue(config.use_degrees)
         self.assertEqual(config.calibration_prompt_response, "")
+        self.assertTrue(config.stream_imu)
         self.assertEqual(config.imu_udp_host, "127.0.0.1")
         self.assertEqual(config.imu_udp_port, 8766)
         self.assertEqual(config.camera_max_frame_bytes, 16 * 1024 * 1024)
@@ -95,6 +96,12 @@ class RobotBrainAgentTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertTrue(config.debug_motion)
+
+    def test_parser_can_disable_imu_streaming_for_wheel_odometry_mode(self) -> None:
+        args = build_parser().parse_args(["--no-stream-imu"])
+        config = config_from_args(args)
+
+        self.assertFalse(config.stream_imu)
 
     def test_parser_accepts_interactive_calibration(self) -> None:
         args = build_parser().parse_args(["--interactive-calibration"])
@@ -270,6 +277,16 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(stats["received_count"], 1)
         self.assertEqual(stats["latest_timestamp_s"], 1.25)
         self.assertIsNotNone(stats["age_s"])
+
+    def test_agent_ignores_imu_datagrams_when_streaming_disabled(self) -> None:
+        agent = RobotBrainAgent(RobotBrainAgentConfig(stream_imu=False), runtime=FakeRuntime())
+
+        agent.ingest_imu_datagram(
+            b'{"timestamp_s":1.25,"angular_velocity_rad_s":{"x":0.1,"y":0.2,"z":0.3},"linear_acceleration_m_s2":{"x":1.0,"y":2.0,"z":3.0}}'
+        )
+
+        self.assertIsNone(agent.imu_snapshot())
+        self.assertFalse(agent.imu_stream.stats()["ready"])
 
     def test_agent_keeps_latest_rgbd_in_memory(self) -> None:
         agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=FakeRuntime())

@@ -52,6 +52,7 @@ class RobotBrainAgentConfig:
     rgb_filename: str = "latest.ppm"
     depth_filename: str = "latest_depth.pgm"
     metadata_filename: str = "latest.json"
+    stream_imu: bool = True
     imu_udp_host: str = "127.0.0.1"
     imu_udp_port: int = 8766
     imu_ws_client_queue_size: int = 64
@@ -308,6 +309,8 @@ class RobotBrainAgent:
         }
 
     def ingest_imu_datagram(self, data: bytes) -> None:
+        if not self.config.stream_imu:
+            return
         sample = parse_imu_json(data)
         if sample is None:
             return
@@ -641,8 +644,9 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "ok": True,
             "robot_kind": agent.config.robot_kind,
             "motion_enabled": agent.config.allow_motion_commands,
-            "imu_udp_port": agent.config.imu_udp_port,
-            "imu_ws_path": "/ws/imu",
+            "imu_streaming": agent.config.stream_imu,
+            "imu_udp_port": agent.config.imu_udp_port if agent.config.stream_imu else None,
+            "imu_ws_path": "/ws/imu" if agent.config.stream_imu else None,
             "imu": agent.imu_stream.stats(),
             "rgbd": agent.rgbd_stream.stats(),
             "camera": agent.camera_state(),
@@ -689,6 +693,8 @@ async def _handle_rgbd_ingest(request: web.Request) -> web.Response:
 
 async def _handle_imu_snapshot(request: web.Request) -> web.Response:
     agent: RobotBrainAgent = request.app["agent"]
+    if not agent.config.stream_imu:
+        raise web.HTTPNotFound(text="IMU stream disabled")
     if agent.imu_stream.latest_json is None:
         raise web.HTTPNotFound(text="IMU sample not ready")
     return web.Response(body=agent.imu_stream.latest_json.encode("utf-8"), content_type="application/json")
@@ -796,6 +802,8 @@ async def _imu_sender(agent: RobotBrainAgent, ws: web.WebSocketResponse, queue: 
 
 async def _handle_imu_websocket(request: web.Request) -> web.WebSocketResponse:
     agent: RobotBrainAgent = request.app["agent"]
+    if not agent.config.stream_imu:
+        raise web.HTTPNotFound(text="IMU stream disabled")
     ws = web.WebSocketResponse(heartbeat=20.0)
     await ws.prepare(request)
     queue = agent.imu_stream.register_client()
@@ -820,21 +828,26 @@ async def _handle_imu_websocket(request: web.Request) -> web.WebSocketResponse:
 
 async def _runtime_context(app: web.Application) -> Any:
     agent: RobotBrainAgent = app["agent"]
-    loop = asyncio.get_running_loop()
-    transport, _protocol = await loop.create_datagram_endpoint(
-        lambda: _ImuUdpProtocol(agent),
-        local_addr=(agent.config.imu_udp_host, agent.config.imu_udp_port),
-    )
-    app["imu_udp_transport"] = transport
-    print(
-        "[robot_brain_agent] IMU UDP listener ready: "
-        f"{agent.config.imu_udp_host}:{agent.config.imu_udp_port}",
-        flush=True,
-    )
+    transport = None
+    if agent.config.stream_imu:
+        loop = asyncio.get_running_loop()
+        transport, _protocol = await loop.create_datagram_endpoint(
+            lambda: _ImuUdpProtocol(agent),
+            local_addr=(agent.config.imu_udp_host, agent.config.imu_udp_port),
+        )
+        app["imu_udp_transport"] = transport
+        print(
+            "[robot_brain_agent] IMU UDP listener ready: "
+            f"{agent.config.imu_udp_host}:{agent.config.imu_udp_port}",
+            flush=True,
+        )
+    else:
+        print("[robot_brain_agent] IMU streaming disabled; UDP/websocket paths are inactive.", flush=True)
     try:
         yield
     finally:
-        transport.close()
+        if transport is not None:
+            transport.close()
         await asyncio.to_thread(agent.close)
 
 
@@ -849,13 +862,14 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_get("/depth", _handle_static_file)
     app.router.add_get("/metadata", _handle_static_file)
     app.router.add_post("/camera/rgbd", _handle_rgbd_ingest)
-    app.router.add_get("/imu", _handle_imu_snapshot)
+    if agent.config.stream_imu:
+        app.router.add_get("/imu", _handle_imu_snapshot)
+        app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_get("/camera/head/pose", _handle_camera_head_pose_get)
     app.router.add_post("/camera/head/pose", _handle_camera_head_pose_post)
     app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
     app.router.add_post("/camera/head/pan", _handle_camera_head_pan)
     app.router.add_get("/wheel_state", _handle_wheel_state)
-    app.router.add_get("/ws/imu", _handle_imu_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
     return app
@@ -909,6 +923,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rgb-filename", default="latest.ppm")
     parser.add_argument("--depth-filename", default="latest_depth.pgm")
     parser.add_argument("--metadata-filename", default="latest.json")
+    parser.add_argument(
+        "--stream-imu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Receive and expose the Orbbec IMU UDP/websocket stream. Disable in wheel-odometry-only mode.",
+    )
     parser.add_argument("--imu-udp-host", default="127.0.0.1")
     parser.add_argument("--imu-udp-port", type=int, default=8766)
     parser.add_argument("--imu-ws-client-queue-size", type=int, default=64)
@@ -984,6 +1004,7 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         rgb_filename=args.rgb_filename,
         depth_filename=args.depth_filename,
         metadata_filename=args.metadata_filename,
+        stream_imu=args.stream_imu,
         imu_udp_host=args.imu_udp_host,
         imu_udp_port=args.imu_udp_port,
         imu_ws_client_queue_size=args.imu_ws_client_queue_size,
@@ -1023,7 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
         "Robot brain agent ready: "
         f"http://{config.host}:{config.port} robot={config.robot_kind} "
         f"motion_enabled={config.allow_motion_commands} orbbec={config.orbbec_output_dir} "
-        f"imu_udp={config.imu_udp_host}:{config.imu_udp_port} imu_ws=/ws/imu",
+        + (
+            f"imu_udp={config.imu_udp_host}:{config.imu_udp_port} imu_ws=/ws/imu"
+            if config.stream_imu
+            else "imu_stream=disabled"
+        ),
         flush=True,
     )
     web.run_app(build_app(agent), host=config.host, port=config.port, access_log=None)
