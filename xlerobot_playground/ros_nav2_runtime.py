@@ -816,7 +816,7 @@ class RosRuntimeConfig:
     robot_width_m: float = 0.459
     base_link_x_from_wheel_axle_m: float = 0.196
     base_link_y_from_wheel_axle_m: float = 0.0
-    local_rotation_safety_enabled: bool = True
+    local_rotation_safety_enabled: bool = False
     local_rotation_safety_padding_m: float = 0.03
     local_rotation_safety_yaw_sample_deg: float = 4.0
     local_rotation_safety_lookahead_s: float = 0.35
@@ -2794,7 +2794,7 @@ class RosExplorationRuntime(Node):
         return self._spin_by_delta(float(self.config.turn_scan_radians), should_cancel=should_cancel)
 
     def _local_rotation_safety_check(self, delta_yaw_rad: float) -> dict[str, Any]:
-        if not bool(getattr(self.config, "local_rotation_safety_enabled", True)):
+        if not bool(getattr(self.config, "local_rotation_safety_enabled", False)):
             return {
                 "safe": True,
                 "status": "disabled",

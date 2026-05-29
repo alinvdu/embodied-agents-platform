@@ -512,7 +512,7 @@ python -m xlerobot_playground.wheel_odometry \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0575 \
   --wheel-track-width-m 0.515 \
-  --base-link-x-from-wheel-axle-m 0.196 \
+  --base-link-x-from-wheel-axle-m 0.13 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-motor base_left_wheel \
   --right-wheel-motor base_right_wheel \
@@ -631,7 +631,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-robot-width-m 0.459 \
   --ros-base-link-x-from-wheel-axle-m 0.196 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
-  --ros-local-rotation-safety-enabled \
+  --no-ros-local-rotation-safety-enabled \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
   --pause-for-operator-approval
@@ -647,7 +647,7 @@ Click `Start Explore` in the UI. The robot should keep its base still, keep pitc
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
 
-Local rotation primitives still command normal angular velocity, but the runtime now checks the rear-axle swept rectangular footprint before each rotation slice. Keep `--ros-base-link-x-from-wheel-axle-m` aligned with the same value used by `wheel_odometry`; otherwise the safety check and the published odometry will disagree about how far the body center sweeps during a turn.
+Local rotation primitives still command normal angular velocity. The rear-axle swept rectangular footprint guard is currently disabled by default because it was too conservative in tight spaces. Re-enable it with `--ros-local-rotation-safety-enabled` only when validating that guard specifically.
 
 To test map coordinate accuracy without moving, click `Preview Path` in the Map Editing panel, then click a known free-space location in the map. The UI calls Nav2 `ComputePathToPose` and draws the planned path in orange. If the orange path is strange for a waypoint directly in front of the robot, debug Nav2 planning/costmaps before commanding motion.
 
@@ -702,7 +702,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-robot-width-m 0.459 \
   --ros-base-link-x-from-wheel-axle-m 0.196 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
-  --ros-local-rotation-safety-enabled \
+  --no-ros-local-rotation-safety-enabled \
   --max-decisions 8
 ```
 

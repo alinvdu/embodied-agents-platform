@@ -27,7 +27,7 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
         self.assertEqual(translated[translated.index("--ros-manual-spin-direction-sign") + 1], "1.0")
         self.assertEqual(translated[translated.index("--ros-base-link-x-from-wheel-axle-m") + 1], "0.196")
-        self.assertIn("--ros-local-rotation-safety-enabled", translated)
+        self.assertIn("--no-ros-local-rotation-safety-enabled", translated)
         self.assertIn("--no-ros-local-rotation-safety-block-unknown", translated)
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")

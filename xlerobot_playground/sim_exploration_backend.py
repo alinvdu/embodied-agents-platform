@@ -158,7 +158,7 @@ class SimExplorationConfig:
     ros_robot_width_m: float = 0.459
     ros_base_link_x_from_wheel_axle_m: float = 0.196
     ros_base_link_y_from_wheel_axle_m: float = 0.0
-    ros_local_rotation_safety_enabled: bool = True
+    ros_local_rotation_safety_enabled: bool = False
     ros_local_rotation_safety_padding_m: float = 0.03
     ros_local_rotation_safety_yaw_sample_deg: float = 4.0
     ros_local_rotation_safety_lookahead_s: float = 0.35
@@ -6097,7 +6097,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
     parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.196)
     parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
-    parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
     parser.add_argument("--ros-local-rotation-safety-yaw-sample-deg", type=float, default=4.0)
     parser.add_argument("--ros-local-rotation-safety-lookahead-s", type=float, default=0.35)
