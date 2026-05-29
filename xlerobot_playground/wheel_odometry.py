@@ -51,6 +51,8 @@ class WheelOdometryConfig:
     encoder_ticks_per_revolution: float = 4096.0
     wheel_radius_m: float = 0.05
     wheel_track_width_m: float = 0.25
+    base_link_x_from_wheel_axle_m: float = 0.0
+    base_link_y_from_wheel_axle_m: float = 0.0
     left_wheel_motor: str = "base_left_wheel"
     right_wheel_motor: str = "base_right_wheel"
     left_wheel_position_sign: float = -1.0
@@ -159,6 +161,32 @@ def integrate_differential_drive(
     )
 
 
+def apply_planar_offset(pose: PlanarPose, *, x_offset_m: float, y_offset_m: float) -> PlanarPose:
+    """Return the pose of a frame offset from `pose` by a body-frame x/y vector."""
+    x_offset_m = float(x_offset_m)
+    y_offset_m = float(y_offset_m)
+    cos_yaw = math.cos(pose.yaw)
+    sin_yaw = math.sin(pose.yaw)
+    return PlanarPose(
+        x=pose.x + cos_yaw * x_offset_m - sin_yaw * y_offset_m,
+        y=pose.y + sin_yaw * x_offset_m + cos_yaw * y_offset_m,
+        yaw=pose.yaw,
+    )
+
+
+def remove_planar_offset(pose: PlanarPose, *, x_offset_m: float, y_offset_m: float) -> PlanarPose:
+    """Return the pose of the parent frame when `pose` is an offset child frame."""
+    x_offset_m = float(x_offset_m)
+    y_offset_m = float(y_offset_m)
+    cos_yaw = math.cos(pose.yaw)
+    sin_yaw = math.sin(pose.yaw)
+    return PlanarPose(
+        x=pose.x - (cos_yaw * x_offset_m - sin_yaw * y_offset_m),
+        y=pose.y - (sin_yaw * x_offset_m + cos_yaw * y_offset_m),
+        yaw=pose.yaw,
+    )
+
+
 def parse_wheel_state_sample(
     payload: dict[str, Any],
     *,
@@ -252,7 +280,7 @@ class WheelOdometryNode(Node):
             path=config.wheel_state_path,
             timeout_s=config.http_timeout_s,
         )
-        self.pose = PlanarPose(0.0, 0.0, 0.0)
+        self.axle_pose = PlanarPose(0.0, 0.0, 0.0)
         self._previous_sample: WheelStateSample | None = None
         self._previous_sample_monotonic_s: float | None = None
         self._latest_forward_m_s = 0.0
@@ -269,6 +297,8 @@ class WheelOdometryNode(Node):
             f"brain={config.robot_brain_url.rstrip('/')}{config.wheel_state_path} "
             f"odom={config.odom_topic} frame={config.odom_frame}->{config.base_frame} "
             f"wheel_radius={config.wheel_radius_m:.3f}m track={config.wheel_track_width_m:.3f}m "
+            f"base_from_axle=({config.base_link_x_from_wheel_axle_m:.3f},"
+            f"{config.base_link_y_from_wheel_axle_m:.3f})m "
             f"ticks_per_rev={config.encoder_ticks_per_revolution:.1f}"
         )
 
@@ -283,7 +313,8 @@ class WheelOdometryNode(Node):
             float(pose.orientation.z),
             float(pose.orientation.w),
         )
-        self.pose = PlanarPose(float(pose.position.x), float(pose.position.y), angle_wrap(yaw))
+        base_pose = PlanarPose(float(pose.position.x), float(pose.position.y), angle_wrap(yaw))
+        self.axle_pose = self._axle_pose_from_base_pose(base_pose)
         self._previous_sample = None
         self._previous_sample_monotonic_s = None
         self._latest_forward_m_s = 0.0
@@ -292,7 +323,9 @@ class WheelOdometryNode(Node):
         self.get_logger().info(
             "Applied wheel odom pose reset "
             f"topic={self.config.odom_reset_topic} frame={message.header.frame_id or '<empty>'} "
-            f"x={self.pose.x:.3f} y={self.pose.y:.3f} yaw_deg={math.degrees(self.pose.yaw):.1f}"
+            f"base_x={base_pose.x:.3f} base_y={base_pose.y:.3f} "
+            f"axle_x={self.axle_pose.x:.3f} axle_y={self.axle_pose.y:.3f} "
+            f"yaw_deg={math.degrees(self.axle_pose.yaw):.1f}"
         )
 
     def step(self) -> None:
@@ -331,38 +364,63 @@ class WheelOdometryNode(Node):
             self._latest_yaw_rate_rad_s = 0.0
             return
         step = integrate_wheel_state_delta(
-            self.pose,
+            self.axle_pose,
             previous_sample=previous,
             current_sample=sample,
             config=self.config,
         )
-        self.pose = step.pose
+        self.axle_pose = step.pose
         self._latest_forward_m_s = step.forward_m / dt
         self._latest_yaw_rate_rad_s = step.yaw_delta_rad / dt
 
+    def _base_pose_from_axle_pose(self, axle_pose: PlanarPose) -> PlanarPose:
+        return apply_planar_offset(
+            axle_pose,
+            x_offset_m=self.config.base_link_x_from_wheel_axle_m,
+            y_offset_m=self.config.base_link_y_from_wheel_axle_m,
+        )
+
+    def _axle_pose_from_base_pose(self, base_pose: PlanarPose) -> PlanarPose:
+        return remove_planar_offset(
+            base_pose,
+            x_offset_m=self.config.base_link_x_from_wheel_axle_m,
+            y_offset_m=self.config.base_link_y_from_wheel_axle_m,
+        )
+
+    def _base_twist_from_axle_twist(self) -> tuple[float, float, float]:
+        yaw_rate_rad_s = float(self._latest_yaw_rate_rad_s)
+        linear_x_m_s = float(self._latest_forward_m_s) - yaw_rate_rad_s * float(
+            self.config.base_link_y_from_wheel_axle_m
+        )
+        linear_y_m_s = yaw_rate_rad_s * float(self.config.base_link_x_from_wheel_axle_m)
+        return linear_x_m_s, linear_y_m_s, yaw_rate_rad_s
+
     def _publish_odom(self, stamp: Any) -> None:
-        qx, qy, qz, qw = yaw_to_quaternion_xyzw(self.pose.yaw)
+        base_pose = self._base_pose_from_axle_pose(self.axle_pose)
+        linear_x_m_s, linear_y_m_s, yaw_rate_rad_s = self._base_twist_from_axle_twist()
+        qx, qy, qz, qw = yaw_to_quaternion_xyzw(base_pose.yaw)
         odom = Odometry()
         odom.header.stamp = stamp
         odom.header.frame_id = self.config.odom_frame
         odom.child_frame_id = self.config.base_frame
-        odom.pose.pose.position.x = self.pose.x
-        odom.pose.pose.position.y = self.pose.y
+        odom.pose.pose.position.x = base_pose.x
+        odom.pose.pose.position.y = base_pose.y
         odom.pose.pose.position.z = 0.0
         odom.pose.pose.orientation = _quaternion_msg(qx, qy, qz, qw)
         odom.pose.covariance[0] = float(self.config.pose_covariance_xy)
         odom.pose.covariance[7] = float(self.config.pose_covariance_xy)
         odom.pose.covariance[35] = float(self.config.pose_covariance_yaw)
-        odom.twist.twist.linear.x = float(self._latest_forward_m_s)
-        odom.twist.twist.angular.z = float(self._latest_yaw_rate_rad_s)
+        odom.twist.twist.linear.x = linear_x_m_s
+        odom.twist.twist.linear.y = linear_y_m_s
+        odom.twist.twist.angular.z = yaw_rate_rad_s
         self.odom_publisher.publish(odom)
 
         transform = TransformStamped()
         transform.header.stamp = stamp
         transform.header.frame_id = self.config.odom_frame
         transform.child_frame_id = self.config.base_frame
-        transform.transform.translation.x = self.pose.x
-        transform.transform.translation.y = self.pose.y
+        transform.transform.translation.x = base_pose.x
+        transform.transform.translation.y = base_pose.y
         transform.transform.translation.z = 0.0
         transform.transform.rotation = _quaternion_msg(qx, qy, qz, qw)
         self.tf_broadcaster.sendTransform(transform)
@@ -399,6 +457,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--encoder-ticks-per-revolution", type=float, default=4096.0)
     parser.add_argument("--wheel-radius-m", type=float, default=0.05)
     parser.add_argument("--wheel-track-width-m", "--wheelbase-m", dest="wheel_track_width_m", type=float, default=0.25)
+    parser.add_argument(
+        "--base-link-x-from-wheel-axle-m",
+        type=float,
+        default=0.0,
+        help=(
+            "Body-frame x offset from the driven wheel axle midpoint to base_link. "
+            "Positive means base_link is forward of the axle. Use this for rear-wheel cart bases."
+        ),
+    )
+    parser.add_argument(
+        "--base-link-y-from-wheel-axle-m",
+        type=float,
+        default=0.0,
+        help="Body-frame y offset from the driven wheel axle midpoint to base_link.",
+    )
     parser.add_argument("--left-wheel-motor", default="base_left_wheel")
     parser.add_argument("--right-wheel-motor", default="base_right_wheel")
     parser.add_argument("--left-wheel-position-sign", type=float, choices=(-1.0, 1.0), default=-1.0)
@@ -424,6 +497,8 @@ def config_from_args(args: argparse.Namespace) -> WheelOdometryConfig:
         encoder_ticks_per_revolution=args.encoder_ticks_per_revolution,
         wheel_radius_m=args.wheel_radius_m,
         wheel_track_width_m=args.wheel_track_width_m,
+        base_link_x_from_wheel_axle_m=args.base_link_x_from_wheel_axle_m,
+        base_link_y_from_wheel_axle_m=args.base_link_y_from_wheel_axle_m,
         left_wheel_motor=args.left_wheel_motor,
         right_wheel_motor=args.right_wheel_motor,
         left_wheel_position_sign=args.left_wheel_position_sign,

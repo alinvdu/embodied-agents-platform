@@ -7,11 +7,13 @@ from xlerobot_playground.wheel_odometry import (
     PlanarPose,
     WheelOdometryConfig,
     WheelStateSample,
+    apply_planar_offset,
     build_parser,
     config_from_args,
     integrate_differential_drive,
     integrate_wheel_state_delta,
     parse_wheel_state_sample,
+    remove_planar_offset,
     unwrap_encoder_delta_ticks,
     wheel_ticks_to_distance_m,
 )
@@ -31,6 +33,22 @@ class WheelOdometryTests(unittest.TestCase):
         self.assertEqual(config.right_wheel_position_sign, 1.0)
         self.assertFalse(config.odom_requires_nav_active)
         self.assertEqual(config.http_timeout_s, 2.0)
+        self.assertEqual(config.base_link_x_from_wheel_axle_m, 0.0)
+        self.assertEqual(config.base_link_y_from_wheel_axle_m, 0.0)
+
+    def test_parser_accepts_base_link_offset_from_wheel_axle(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--base-link-x-from-wheel-axle-m",
+                "0.196",
+                "--base-link-y-from-wheel-axle-m",
+                "0.01",
+            ]
+        )
+        config = config_from_args(args)
+
+        self.assertEqual(config.base_link_x_from_wheel_axle_m, 0.196)
+        self.assertEqual(config.base_link_y_from_wheel_axle_m, 0.01)
 
     def test_unwrap_encoder_delta_handles_single_turn_wrap(self) -> None:
         self.assertEqual(
@@ -68,7 +86,7 @@ class WheelOdometryTests(unittest.TestCase):
         self.assertAlmostEqual(step.pose.y, 0.0)
         self.assertAlmostEqual(step.pose.yaw, 0.0)
 
-    def test_opposite_wheel_distances_rotate_in_place(self) -> None:
+    def test_opposite_wheel_distances_rotate_axle_in_place(self) -> None:
         step = integrate_differential_drive(
             PlanarPose(1.0, 2.0, 0.0),
             left_distance_m=-0.05,
@@ -81,6 +99,37 @@ class WheelOdometryTests(unittest.TestCase):
         self.assertAlmostEqual(step.pose.x, 1.0)
         self.assertAlmostEqual(step.pose.y, 2.0)
         self.assertAlmostEqual(step.pose.yaw, 0.4)
+
+    def test_base_link_offset_moves_during_axle_centered_rotation(self) -> None:
+        axle_pose = PlanarPose(0.0, 0.0, math.pi / 2.0)
+
+        base_pose = apply_planar_offset(
+            axle_pose,
+            x_offset_m=0.2,
+            y_offset_m=0.0,
+        )
+
+        self.assertAlmostEqual(base_pose.x, 0.0, places=6)
+        self.assertAlmostEqual(base_pose.y, 0.2, places=6)
+        self.assertAlmostEqual(base_pose.yaw, math.pi / 2.0)
+
+    def test_base_link_offset_round_trips_to_axle_pose(self) -> None:
+        axle_pose = PlanarPose(1.0, 2.0, math.radians(30.0))
+        base_pose = apply_planar_offset(
+            axle_pose,
+            x_offset_m=0.2,
+            y_offset_m=-0.03,
+        )
+
+        recovered = remove_planar_offset(
+            base_pose,
+            x_offset_m=0.2,
+            y_offset_m=-0.03,
+        )
+
+        self.assertAlmostEqual(recovered.x, axle_pose.x)
+        self.assertAlmostEqual(recovered.y, axle_pose.y)
+        self.assertAlmostEqual(recovered.yaw, axle_pose.yaw)
 
     def test_parse_wheel_state_sample_uses_configured_motor_names(self) -> None:
         sample = parse_wheel_state_sample(

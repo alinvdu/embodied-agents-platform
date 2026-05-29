@@ -11,9 +11,12 @@ from xlerobot_playground.ros_nav2_runtime import (
     RosExplorationRuntime,
     RosOccupancyMap,
     apply_occupancy_grid_update,
+    check_rear_axle_rotation_sweep_occupancy,
     compute_turn_command,
     default_map_updates_topic,
     fuse_projected_maps,
+    rear_axle_pose_from_base_pose,
+    rear_axle_rotation_sweep_base_poses,
     remaining_turn_delta_rad,
 )
 
@@ -52,6 +55,86 @@ class RosNav2RuntimeTests(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_rear_axle_rotation_sweep_moves_base_link_in_arc(self) -> None:
+        start = Pose2D(0.2, 0.0, 0.0)
+
+        axle = rear_axle_pose_from_base_pose(start, x_offset_m=0.2, y_offset_m=0.0)
+        poses = rear_axle_rotation_sweep_base_poses(
+            start_base_pose=start,
+            delta_yaw_rad=math.pi / 2.0,
+            x_offset_m=0.2,
+            y_offset_m=0.0,
+            sample_step_rad=math.radians(10.0),
+        )
+
+        self.assertAlmostEqual(axle.x, 0.0)
+        self.assertAlmostEqual(axle.y, 0.0)
+        self.assertAlmostEqual(poses[-1].x, 0.0, places=6)
+        self.assertAlmostEqual(poses[-1].y, 0.2, places=6)
+        self.assertAlmostEqual(poses[-1].yaw, math.pi / 2.0)
+
+    def test_rear_axle_rotation_sweep_occupancy_blocks_future_body_arc(self) -> None:
+        occupancy_map = RosOccupancyMap(
+            resolution=0.05,
+            width=24,
+            height=24,
+            origin_x=-0.5,
+            origin_y=-0.5,
+            data=tuple(0 for _ in range(24 * 24)),
+        )
+        blocker_x, blocker_y = occupancy_map.world_to_cell(0.0, 0.2)
+        data = list(occupancy_map.data)
+        data[blocker_y * occupancy_map.width + blocker_x] = 100
+        blocked_map = RosOccupancyMap(
+            resolution=occupancy_map.resolution,
+            width=occupancy_map.width,
+            height=occupancy_map.height,
+            origin_x=occupancy_map.origin_x,
+            origin_y=occupancy_map.origin_y,
+            data=tuple(data),
+        )
+
+        result = check_rear_axle_rotation_sweep_occupancy(
+            blocked_map,
+            start_base_pose=Pose2D(0.2, 0.0, 0.0),
+            delta_yaw_rad=math.pi / 2.0,
+            robot_length_m=0.16,
+            robot_width_m=0.16,
+            base_link_x_from_wheel_axle_m=0.2,
+            base_link_y_from_wheel_axle_m=0.0,
+            safety_padding_m=0.0,
+            yaw_sample_step_rad=math.radians(5.0),
+        )
+
+        self.assertFalse(result["safe"])
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["first_blocker_cell"], {"x": blocker_x, "y": blocker_y})
+
+    def test_rear_axle_rotation_sweep_occupancy_allows_clear_map(self) -> None:
+        occupancy_map = RosOccupancyMap(
+            resolution=0.05,
+            width=24,
+            height=24,
+            origin_x=-0.5,
+            origin_y=-0.5,
+            data=tuple(0 for _ in range(24 * 24)),
+        )
+
+        result = check_rear_axle_rotation_sweep_occupancy(
+            occupancy_map,
+            start_base_pose=Pose2D(0.2, 0.0, 0.0),
+            delta_yaw_rad=math.pi / 2.0,
+            robot_length_m=0.16,
+            robot_width_m=0.16,
+            base_link_x_from_wheel_axle_m=0.2,
+            base_link_y_from_wheel_axle_m=0.0,
+            safety_padding_m=0.0,
+            yaw_sample_step_rad=math.radians(5.0),
+        )
+
+        self.assertTrue(result["safe"])
+        self.assertEqual(result["status"], "clear")
 
     def test_scan_active_release_waits_configured_delay(self) -> None:
         class FakeRuntime:

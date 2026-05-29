@@ -97,6 +97,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
+    parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
+    parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
+    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.196)
+    parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
+    parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
+    parser.add_argument("--ros-local-rotation-safety-yaw-sample-deg", type=float, default=4.0)
+    parser.add_argument("--ros-local-rotation-safety-lookahead-s", type=float, default=0.35)
+    parser.add_argument("--ros-local-rotation-safety-block-unknown", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
@@ -220,6 +229,20 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.ros_manual_spin_publish_hz),
         "--ros-manual-spin-direction-sign",
         str(args.ros_manual_spin_direction_sign),
+        "--ros-robot-length-m",
+        str(args.ros_robot_length_m),
+        "--ros-robot-width-m",
+        str(args.ros_robot_width_m),
+        "--ros-base-link-x-from-wheel-axle-m",
+        str(args.ros_base_link_x_from_wheel_axle_m),
+        "--ros-base-link-y-from-wheel-axle-m",
+        str(args.ros_base_link_y_from_wheel_axle_m),
+        "--ros-local-rotation-safety-padding-m",
+        str(args.ros_local_rotation_safety_padding_m),
+        "--ros-local-rotation-safety-yaw-sample-deg",
+        str(args.ros_local_rotation_safety_yaw_sample_deg),
+        "--ros-local-rotation-safety-lookahead-s",
+        str(args.ros_local_rotation_safety_lookahead_s),
         "--ros-turn-scan-mode",
         args.ros_turn_scan_mode,
         "--robot-brain-url",
@@ -302,6 +325,16 @@ def translated_args(args: argparse.Namespace) -> list[str]:
             "--ros-fuse-external-projected-map-snapshots",
             "--no-ros-fuse-external-projected-map-snapshots",
             args.ros_fuse_external_projected_map_snapshots,
+        ),
+        (
+            "--ros-local-rotation-safety-enabled",
+            "--no-ros-local-rotation-safety-enabled",
+            args.ros_local_rotation_safety_enabled,
+        ),
+        (
+            "--ros-local-rotation-safety-block-unknown",
+            "--no-ros-local-rotation-safety-block-unknown",
+            args.ros_local_rotation_safety_block_unknown,
         ),
         ("--nav2-recovery-enabled", "--no-nav2-recovery-enabled", args.nav2_recovery_enabled),
         ("--ros-allow-multiple-action-servers", "--no-ros-allow-multiple-action-servers", args.ros_allow_multiple_action_servers),

@@ -154,6 +154,15 @@ class SimExplorationConfig:
     ros_manual_spin_angular_speed_rad_s: float = 0.25
     ros_manual_spin_publish_hz: float = 20.0
     ros_manual_spin_direction_sign: float = 1.0
+    ros_robot_length_m: float = 0.3913
+    ros_robot_width_m: float = 0.459
+    ros_base_link_x_from_wheel_axle_m: float = 0.196
+    ros_base_link_y_from_wheel_axle_m: float = 0.0
+    ros_local_rotation_safety_enabled: bool = True
+    ros_local_rotation_safety_padding_m: float = 0.03
+    ros_local_rotation_safety_yaw_sample_deg: float = 4.0
+    ros_local_rotation_safety_lookahead_s: float = 0.35
+    ros_local_rotation_safety_block_unknown: bool = False
     ros_turn_scan_mode: str = "camera_pan"
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"
@@ -3367,6 +3376,15 @@ class RosExplorationSession:
                     manual_spin_angular_speed_rad_s=config.ros_manual_spin_angular_speed_rad_s,
                     manual_spin_publish_hz=config.ros_manual_spin_publish_hz,
                     manual_spin_direction_sign=config.ros_manual_spin_direction_sign,
+                    robot_length_m=config.ros_robot_length_m,
+                    robot_width_m=config.ros_robot_width_m,
+                    base_link_x_from_wheel_axle_m=config.ros_base_link_x_from_wheel_axle_m,
+                    base_link_y_from_wheel_axle_m=config.ros_base_link_y_from_wheel_axle_m,
+                    local_rotation_safety_enabled=config.ros_local_rotation_safety_enabled,
+                    local_rotation_safety_padding_m=config.ros_local_rotation_safety_padding_m,
+                    local_rotation_safety_yaw_sample_deg=config.ros_local_rotation_safety_yaw_sample_deg,
+                    local_rotation_safety_lookahead_s=config.ros_local_rotation_safety_lookahead_s,
+                    local_rotation_safety_block_unknown=config.ros_local_rotation_safety_block_unknown,
                     turn_scan_mode=config.ros_turn_scan_mode,
                     robot_brain_url=config.robot_brain_url,
                     camera_pan_action_key=config.camera_pan_action_key,
@@ -6075,6 +6093,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
     parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
+    parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
+    parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
+    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.196)
+    parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
+    parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
+    parser.add_argument("--ros-local-rotation-safety-yaw-sample-deg", type=float, default=4.0)
+    parser.add_argument("--ros-local-rotation-safety-lookahead-s", type=float, default=0.35)
+    parser.add_argument("--ros-local-rotation-safety-block-unknown", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")
@@ -6219,6 +6246,15 @@ def main(argv: list[str] | None = None) -> int:
             ros_manual_spin_angular_speed_rad_s=args.ros_manual_spin_angular_speed_rad_s,
             ros_manual_spin_publish_hz=args.ros_manual_spin_publish_hz,
             ros_manual_spin_direction_sign=args.ros_manual_spin_direction_sign,
+            ros_robot_length_m=args.ros_robot_length_m,
+            ros_robot_width_m=args.ros_robot_width_m,
+            ros_base_link_x_from_wheel_axle_m=args.ros_base_link_x_from_wheel_axle_m,
+            ros_base_link_y_from_wheel_axle_m=args.ros_base_link_y_from_wheel_axle_m,
+            ros_local_rotation_safety_enabled=args.ros_local_rotation_safety_enabled,
+            ros_local_rotation_safety_padding_m=args.ros_local_rotation_safety_padding_m,
+            ros_local_rotation_safety_yaw_sample_deg=args.ros_local_rotation_safety_yaw_sample_deg,
+            ros_local_rotation_safety_lookahead_s=args.ros_local_rotation_safety_lookahead_s,
+            ros_local_rotation_safety_block_unknown=args.ros_local_rotation_safety_block_unknown,
             ros_turn_scan_mode=args.ros_turn_scan_mode,
             robot_brain_url=args.robot_brain_url,
             camera_pan_action_key=args.camera_pan_action_key,

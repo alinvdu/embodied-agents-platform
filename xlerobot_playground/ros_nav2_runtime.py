@@ -590,6 +590,195 @@ def _select_turnaround_scan_observations(
     return [observations[index] for index in ordered]
 
 
+def rear_axle_pose_from_base_pose(
+    base_pose: Pose2D,
+    *,
+    x_offset_m: float,
+    y_offset_m: float,
+) -> Pose2D:
+    cos_yaw = math.cos(float(base_pose.yaw))
+    sin_yaw = math.sin(float(base_pose.yaw))
+    return Pose2D(
+        float(base_pose.x) - cos_yaw * float(x_offset_m) + sin_yaw * float(y_offset_m),
+        float(base_pose.y) - sin_yaw * float(x_offset_m) - cos_yaw * float(y_offset_m),
+        float(base_pose.yaw),
+    )
+
+
+def base_pose_from_rear_axle_pose(
+    axle_pose: Pose2D,
+    *,
+    x_offset_m: float,
+    y_offset_m: float,
+) -> Pose2D:
+    cos_yaw = math.cos(float(axle_pose.yaw))
+    sin_yaw = math.sin(float(axle_pose.yaw))
+    return Pose2D(
+        float(axle_pose.x) + cos_yaw * float(x_offset_m) - sin_yaw * float(y_offset_m),
+        float(axle_pose.y) + sin_yaw * float(x_offset_m) + cos_yaw * float(y_offset_m),
+        float(axle_pose.yaw),
+    )
+
+
+def rear_axle_rotation_sweep_base_poses(
+    *,
+    start_base_pose: Pose2D,
+    delta_yaw_rad: float,
+    x_offset_m: float,
+    y_offset_m: float,
+    sample_step_rad: float,
+) -> list[Pose2D]:
+    step = max(abs(float(sample_step_rad)), math.radians(1.0))
+    sample_count = max(int(math.ceil(abs(float(delta_yaw_rad)) / step)), 1)
+    axle_start = rear_axle_pose_from_base_pose(
+        start_base_pose,
+        x_offset_m=float(x_offset_m),
+        y_offset_m=float(y_offset_m),
+    )
+    poses: list[Pose2D] = []
+    for index in range(sample_count + 1):
+        fraction = index / float(sample_count)
+        yaw = float(start_base_pose.yaw) + float(delta_yaw_rad) * fraction
+        axle_pose = Pose2D(float(axle_start.x), float(axle_start.y), yaw)
+        poses.append(
+            base_pose_from_rear_axle_pose(
+                axle_pose,
+                x_offset_m=float(x_offset_m),
+                y_offset_m=float(y_offset_m),
+            )
+        )
+    return poses
+
+
+def _rectangular_footprint_world_points(
+    pose: Pose2D,
+    *,
+    length_m: float,
+    width_m: float,
+    padding_m: float,
+    sample_step_m: float,
+) -> list[tuple[float, float]]:
+    half_length = max(float(length_m) * 0.5 + float(padding_m), 0.02)
+    half_width = max(float(width_m) * 0.5 + float(padding_m), 0.02)
+    step = max(float(sample_step_m), 0.01)
+    x_count = max(int(math.ceil((half_length * 2.0) / step)), 1)
+    y_count = max(int(math.ceil((half_width * 2.0) / step)), 1)
+    cos_yaw = math.cos(float(pose.yaw))
+    sin_yaw = math.sin(float(pose.yaw))
+    points: list[tuple[float, float]] = []
+    for x_index in range(x_count + 1):
+        local_x = -half_length + (2.0 * half_length * x_index / float(x_count))
+        for y_index in range(y_count + 1):
+            local_y = -half_width + (2.0 * half_width * y_index / float(y_count))
+            points.append(
+                (
+                    float(pose.x) + cos_yaw * local_x - sin_yaw * local_y,
+                    float(pose.y) + sin_yaw * local_x + cos_yaw * local_y,
+                )
+            )
+    return points
+
+
+def check_rear_axle_rotation_sweep_occupancy(
+    occupancy_map: RosOccupancyMap,
+    *,
+    start_base_pose: Pose2D,
+    delta_yaw_rad: float,
+    robot_length_m: float,
+    robot_width_m: float,
+    base_link_x_from_wheel_axle_m: float,
+    base_link_y_from_wheel_axle_m: float,
+    safety_padding_m: float,
+    yaw_sample_step_rad: float,
+    footprint_sample_step_m: float | None = None,
+    block_unknown: bool = False,
+) -> dict[str, Any]:
+    if abs(float(delta_yaw_rad)) <= math.radians(0.25):
+        return {
+            "safe": True,
+            "status": "clear",
+            "reason": "Requested rotation is below the local sweep check threshold.",
+            "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+        }
+    cell_step = (
+        max(float(footprint_sample_step_m), 0.01)
+        if footprint_sample_step_m is not None
+        else max(float(occupancy_map.resolution) * 0.5, 0.02)
+    )
+    poses = rear_axle_rotation_sweep_base_poses(
+        start_base_pose=start_base_pose,
+        delta_yaw_rad=float(delta_yaw_rad),
+        x_offset_m=float(base_link_x_from_wheel_axle_m),
+        y_offset_m=float(base_link_y_from_wheel_axle_m),
+        sample_step_rad=float(yaw_sample_step_rad),
+    )
+    checked_cells: set[tuple[int, int]] = set()
+    unknown_count = 0
+    for pose_index, pose in enumerate(poses):
+        for world_x, world_y in _rectangular_footprint_world_points(
+            pose,
+            length_m=float(robot_length_m),
+            width_m=float(robot_width_m),
+            padding_m=float(safety_padding_m),
+            sample_step_m=cell_step,
+        ):
+            cell_x, cell_y = occupancy_map.world_to_cell(world_x, world_y)
+            cell = (cell_x, cell_y)
+            if cell in checked_cells:
+                continue
+            checked_cells.add(cell)
+            if not occupancy_map.in_bounds(cell_x, cell_y) or occupancy_map.is_occupied(cell_x, cell_y):
+                blocker_pose = occupancy_map.cell_to_pose(cell_x, cell_y)
+                return {
+                    "safe": False,
+                    "status": "blocked",
+                    "reason": "Local rotation would sweep the robot footprint into occupied space.",
+                    "blocker_type": "occupied_or_out_of_bounds",
+                    "suggested_recovery": "move_away_from_blocker_or_replan_before_retrying_rotation",
+                    "first_blocker_cell": {"x": int(cell_x), "y": int(cell_y)},
+                    "first_blocker_pose": {"x": round(blocker_pose.x, 3), "y": round(blocker_pose.y, 3)},
+                    "pose_sample_index": int(pose_index),
+                    "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+                    "sampled_pose_count": len(poses),
+                    "checked_cell_count": len(checked_cells),
+                }
+            if occupancy_map.is_unknown(cell_x, cell_y):
+                unknown_count += 1
+                if block_unknown:
+                    blocker_pose = occupancy_map.cell_to_pose(cell_x, cell_y)
+                    return {
+                        "safe": False,
+                        "status": "blocked",
+                        "reason": "Local rotation would sweep the robot footprint into unknown map space.",
+                        "blocker_type": "unknown",
+                        "suggested_recovery": "relocalize_or_map_the_unknown_space_before_retrying_rotation",
+                        "first_blocker_cell": {"x": int(cell_x), "y": int(cell_y)},
+                        "first_blocker_pose": {"x": round(blocker_pose.x, 3), "y": round(blocker_pose.y, 3)},
+                        "pose_sample_index": int(pose_index),
+                        "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+                        "sampled_pose_count": len(poses),
+                        "checked_cell_count": len(checked_cells),
+                    }
+    return {
+        "safe": True,
+        "status": "clear",
+        "reason": "Local rotation swept footprint is clear in the occupancy map.",
+        "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
+        "sampled_pose_count": len(poses),
+        "checked_cell_count": len(checked_cells),
+        "unknown_cell_count": int(unknown_count),
+        "robot_footprint": {
+            "length_m": round(float(robot_length_m), 3),
+            "width_m": round(float(robot_width_m), 3),
+            "padding_m": round(float(safety_padding_m), 3),
+        },
+        "rear_axle_offset": {
+            "x_m": round(float(base_link_x_from_wheel_axle_m), 3),
+            "y_m": round(float(base_link_y_from_wheel_axle_m), 3),
+        },
+    }
+
+
 @dataclass(frozen=True)
 class RosRuntimeConfig:
     map_topic: str = "/map"
@@ -623,6 +812,15 @@ class RosRuntimeConfig:
     manual_spin_angular_speed_rad_s: float = 0.25
     manual_spin_publish_hz: float = 20.0
     manual_spin_direction_sign: float = 1.0
+    robot_length_m: float = 0.3913
+    robot_width_m: float = 0.459
+    base_link_x_from_wheel_axle_m: float = 0.196
+    base_link_y_from_wheel_axle_m: float = 0.0
+    local_rotation_safety_enabled: bool = True
+    local_rotation_safety_padding_m: float = 0.03
+    local_rotation_safety_yaw_sample_deg: float = 4.0
+    local_rotation_safety_lookahead_s: float = 0.35
+    local_rotation_safety_block_unknown: bool = False
     turn_scan_mode: str = "camera_pan"
     robot_brain_url: str | None = "http://127.0.0.1:8765"
     camera_pan_action_key: str = "head_motor_1.pos"
@@ -2016,6 +2214,21 @@ class RosExplorationRuntime(Node):
                 self.set_local_rotation_active(False)
             if orient_event is not None:
                 events.append({"phase": "face_target", **orient_event})
+                if not bool(orient_event.get("spin_completed", False)):
+                    return self._local_motion_result(
+                        primitive="micro_adjust_to_pose",
+                        status="blocked" if orient_event.get("spin_stop_reason") == "rotation_sweep_blocked" else "partial",
+                        reason=str(orient_event.get("spin_stop_reason") or "initial yaw alignment did not complete"),
+                        start_pose=start_pose,
+                        end_pose=self.current_pose(),
+                        extra={
+                            "target_pose": target_pose.to_dict(),
+                            "distance_to_target_start_m": round(distance, 3),
+                            "distance_remaining_m": None,
+                            "max_distance_m": round(max_distance_m, 3),
+                            "events": events,
+                        },
+                    )
             drive_event = self._drive_straight_towards_pose(target_pose, should_cancel=should_cancel)
             events.append({"phase": "translate", **drive_event})
             current_pose = self.current_pose()
@@ -2039,11 +2252,25 @@ class RosExplorationRuntime(Node):
             if end_pose is not None
             else None
         )
-        status = "succeeded" if remaining is not None and remaining <= 0.08 else "partial"
+        rotation_blocked = any(
+            item.get("spin_stop_reason") == "rotation_sweep_blocked"
+            and not bool(item.get("spin_completed", False))
+            for item in events
+        )
+        status = (
+            "blocked"
+            if rotation_blocked
+            else ("succeeded" if remaining is not None and remaining <= 0.08 else "partial")
+        )
         return self._local_motion_result(
             primitive="micro_adjust_to_pose",
             status=status,
-            reason=reason or ("micro adjustment completed" if status == "succeeded" else "micro adjustment ended before reaching tolerance"),
+            reason=reason
+            or (
+                "local rotation swept footprint was blocked"
+                if status == "blocked"
+                else ("micro adjustment completed" if status == "succeeded" else "micro adjustment ended before reaching tolerance")
+            ),
             start_pose=start_pose,
             end_pose=end_pose,
             extra={
@@ -2566,6 +2793,58 @@ class RosExplorationRuntime(Node):
     def _manual_spin(self, *, should_cancel: Callable[[], bool] | None = None) -> dict[str, Any]:
         return self._spin_by_delta(float(self.config.turn_scan_radians), should_cancel=should_cancel)
 
+    def _local_rotation_safety_check(self, delta_yaw_rad: float) -> dict[str, Any]:
+        if not bool(getattr(self.config, "local_rotation_safety_enabled", True)):
+            return {
+                "safe": True,
+                "status": "disabled",
+                "reason": "Local rotation swept-footprint safety check is disabled.",
+            }
+        if abs(float(delta_yaw_rad)) <= math.radians(0.25):
+            return {
+                "safe": True,
+                "status": "clear",
+                "reason": "Requested rotation slice is below the safety check threshold.",
+            }
+        occupancy_map = self.latest_map
+        if occupancy_map is None:
+            return {
+                "safe": True,
+                "status": "unchecked",
+                "reason": "No occupancy map is available for local rotation sweep safety.",
+            }
+        map_frame_id = str(self.latest_map_header_frame_id or "")
+        if map_frame_id and map_frame_id != self.config.map_frame:
+            return {
+                "safe": True,
+                "status": "unchecked",
+                "reason": (
+                    f"Occupancy map frame `{map_frame_id}` does not match local pose frame "
+                    f"`{self.config.map_frame}`."
+                ),
+                "map_frame": map_frame_id,
+                "pose_frame": self.config.map_frame,
+            }
+        pose = self.current_pose()
+        if pose is None:
+            return {
+                "safe": True,
+                "status": "unchecked",
+                "reason": "Current robot pose is unavailable for local rotation sweep safety.",
+            }
+        return check_rear_axle_rotation_sweep_occupancy(
+            occupancy_map,
+            start_base_pose=pose,
+            delta_yaw_rad=float(delta_yaw_rad),
+            robot_length_m=float(getattr(self.config, "robot_length_m", 0.3913)),
+            robot_width_m=float(getattr(self.config, "robot_width_m", 0.459)),
+            base_link_x_from_wheel_axle_m=float(getattr(self.config, "base_link_x_from_wheel_axle_m", 0.196)),
+            base_link_y_from_wheel_axle_m=float(getattr(self.config, "base_link_y_from_wheel_axle_m", 0.0)),
+            safety_padding_m=float(getattr(self.config, "local_rotation_safety_padding_m", 0.03)),
+            yaw_sample_step_rad=math.radians(float(getattr(self.config, "local_rotation_safety_yaw_sample_deg", 4.0))),
+            block_unknown=bool(getattr(self.config, "local_rotation_safety_block_unknown", False)),
+        )
+
     def _spin_by_delta(
         self,
         target_yaw_rad: float,
@@ -2588,6 +2867,7 @@ class RosExplorationRuntime(Node):
         timed_fallback_deadline = start_time + fallback_duration_s
         last_feedback_yaw = start_yaw
         last_relative_yaw = 0.0
+        safety_events: list[dict[str, Any]] = []
         while time.time() < deadline:
             if should_cancel is not None and should_cancel():
                 stop_reason = "canceled"
@@ -2601,6 +2881,28 @@ class RosExplorationRuntime(Node):
             if target_reached:
                 stop_reason = "target_yaw_reached"
                 break
+            achieved_yaw = feedback_yaw_rad if feedback_yaw_rad is not None else last_relative_yaw
+            remaining_yaw = remaining_turn_delta_rad(
+                desired_total_yaw_rad=target_yaw_rad,
+                achieved_total_yaw_rad=achieved_yaw,
+            )
+            if abs(remaining_yaw) > math.radians(0.25):
+                lookahead_yaw = min(
+                    abs(remaining_yaw),
+                    max(
+                        abs(float(twist.angular.z)) * max(
+                            float(getattr(self.config, "local_rotation_safety_lookahead_s", 0.35)),
+                            step_s,
+                        ),
+                        math.radians(float(getattr(self.config, "local_rotation_safety_yaw_sample_deg", 4.0))),
+                    ),
+                )
+                safety = self._local_rotation_safety_check(math.copysign(lookahead_yaw, remaining_yaw))
+                if len(safety_events) < 3 or not bool(safety.get("safe", True)):
+                    safety_events.append(safety)
+                if not bool(safety.get("safe", True)):
+                    stop_reason = "rotation_sweep_blocked"
+                    break
             self._cmd_vel_pub.publish(twist)
             self._spin_once(timeout_sec=0.0)
             self._refresh_scan_active_heartbeat()
@@ -2642,6 +2944,7 @@ class RosExplorationRuntime(Node):
             "actual_unwrapped_yaw_delta_rad": round(last_relative_yaw, 3) if used_feedback else None,
             "spin_command_angular_speed_rad_s": round(command_direction * max_command_speed, 3),
             "spin_timeout_s": round(timeout_s, 3),
+            "rotation_safety": safety_events[-1] if safety_events else None,
         }
 
     def _rotate_toward_pose_xy(
@@ -2707,8 +3010,12 @@ class RosExplorationRuntime(Node):
                         "remaining_distance_m": round(distance, 3),
                         "bearing_error_deg": round(math.degrees(bearing_error), 2),
                         "spin_stop_reason": correction.get("spin_stop_reason"),
+                        "rotation_safety": correction.get("rotation_safety"),
                     }
                 )
+                if not bool(correction.get("spin_completed", False)):
+                    stop_reason = str(correction.get("spin_stop_reason") or "bearing_correction_failed")
+                    break
                 continue
             twist = Twist()
             twist.linear.x = min(max_speed_m_s, max(0.025, distance * 0.35))

@@ -512,13 +512,17 @@ python -m xlerobot_playground.wheel_odometry \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0575 \
   --wheel-track-width-m 0.515 \
+  --base-link-x-from-wheel-axle-m 0.196 \
+  --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-motor base_left_wheel \
   --right-wheel-motor base_right_wheel \
   --left-wheel-position-sign -1 \
   --right-wheel-position-sign 1
 ```
 
-The default wheel signs match the current `xlerobot_2wheels` drive code: forward motion commands the left motor in the opposite raw direction from the right motor. If a forward drive makes `/odom` move backward, flip both wheel position signs. If an in-place left turn makes `/odom` yaw decrease, flip one side or adjust the track width/signs after a 90 degree spin test.
+The `base-link-x-from-wheel-axle` offset matters for the IKEA-cart geometry: the rear driven axle is not at the cart center. Wheel encoders integrate the rear axle midpoint, while Nav2 and object approach reason about `base_link` at the body center. Start with `0.196 m`, half of the `0.3913 m` Nav2 footprint length, then tune it if the physical axle is inset from the rear footprint edge.
+
+The default wheel signs match the current `xlerobot_2wheels` drive code: forward motion commands the left motor in the opposite raw direction from the right motor. If a forward drive makes `/odom` move backward, flip both wheel position signs. If a left turn makes `/odom` yaw decrease, flip one side or adjust the track width/signs after a 90 degree spin test. With the rear-axle offset enabled, `base_link` should also move along a body-center arc during that turn; near-zero translation during a spin usually means the offset is missing or too small.
 
 ### Terminal OC-4: Nav2 Params
 
@@ -623,6 +627,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --camera-pan-compute-s 1.5 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --ros-manual-spin-direction-sign 1 \
+  --ros-robot-length-m 0.3913 \
+  --ros-robot-width-m 0.459 \
+  --ros-base-link-x-from-wheel-axle-m 0.196 \
+  --ros-base-link-y-from-wheel-axle-m 0.0 \
+  --ros-local-rotation-safety-enabled \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
   --pause-for-operator-approval
@@ -637,6 +646,8 @@ http://OFFLOAD_IP:8770
 Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head in 60 degree stops (`0 -> 60 -> 120 -> 180 -> 0 -> -60 -> -120`), wait `1.5s` for the motor at each stop, wait for a fresh `/camera/head/points` sample, then give OctoMap `2.0s` of compute time before the next pan move. It should then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--pause-for-operator-approval` is enabled, it should pause after the initial scan while keeping the live ROS session available for waypoint testing.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
+
+Local rotation primitives still command normal angular velocity, but the runtime now checks the rear-axle swept rectangular footprint before each rotation slice. Keep `--ros-base-link-x-from-wheel-axle-m` aligned with the same value used by `wheel_odometry`; otherwise the safety check and the published odometry will disagree about how far the body center sweeps during a turn.
 
 To test map coordinate accuracy without moving, click `Preview Path` in the Map Editing panel, then click a known free-space location in the map. The UI calls Nav2 `ComputePathToPose` and draws the planned path in orange. If the orange path is strange for a waypoint directly in front of the robot, debug Nav2 planning/costmaps before commanding motion.
 
@@ -687,6 +698,11 @@ python -m xlerobot_playground.real_agentic_exploration \
   --camera-pan-compute-s 0.8 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --ros-manual-spin-direction-sign 1 \
+  --ros-robot-length-m 0.3913 \
+  --ros-robot-width-m 0.459 \
+  --ros-base-link-x-from-wheel-axle-m 0.196 \
+  --ros-base-link-y-from-wheel-axle-m 0.0 \
+  --ros-local-rotation-safety-enabled \
   --max-decisions 8
 ```
 
