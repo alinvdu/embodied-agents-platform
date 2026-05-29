@@ -1,23 +1,23 @@
 # Real Robot Odometry Test Plan
 
-This runbook validates the selectable real-robot odometry stacks.
+This runbook defaults to the wheel-encoder odometry stack. The older RGB-D/IMU stack is kept as an optional comparison path.
 
 ```text
-RGB-D/IMU mode:
+Default wheel mode:
+Orbbec RGB-D sidecar without IMU
+STS3215 wheel feedback
+  -> robot_brain_agent /wheel_state
+  -> wheel_odometry publishes /odom and odom -> base_link
+
+Optional RGB-D/IMU mode:
 Orbbec RGB-D + IMU sidecar
   -> robot_brain_agent in-memory /rgbd + /ws/imu
   -> real_ros_bridge publishes /camera/head/*, /scan, /imu, /cmd_vel forwarding
   -> imu_yaw_filter publishes /imu/filtered_yaw
   -> rgbd_visual_odometry publishes /odom and odom -> base_link
-
-Wheel mode:
-Orbbec RGB-D sidecar without IMU
-STS3215 wheel feedback
-  -> robot_brain_agent /wheel_state
-  -> wheel_odometry publishes /odom and odom -> base_link
 ```
 
-Current RGB-D/IMU odometry split:
+Optional RGB-D/IMU odometry split:
 
 - RGB-D provides translation.
 - Filtered gyro/IMU yaw provides rotation.
@@ -33,7 +33,6 @@ On the offload machine:
 
 ```bash
 export ROBOT_BRAIN_IP=192.168.1.133
-export ROBOT_BRAIN_URL=http://${ROBOT_BRAIN_IP}:8765
 export ROBOT42=/home/alin/Robot42
 ```
 
@@ -62,11 +61,12 @@ python -m xlerobot_playground.robot_brain_agent \
   --robot-kind xlerobot_2wheels \
   --port1 /dev/tty.usbmodem5B140330101 \
   --port2 /dev/tty.usbmodem5B140332271 \
-  --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10
+  --max-linear-m-s 0.05 \
+  --max-angular-rad-s 0.15 \
+  --no-stream-imu
 ```
 
-For wheel-odometry-only tests, add `--no-stream-imu` to this command. That keeps the robot brain from opening the IMU UDP listener or `/ws/imu`.
+`--no-stream-imu` keeps the robot brain from opening the IMU UDP listener or `/ws/imu`.
 
 Expected:
 
@@ -74,11 +74,11 @@ Expected:
 - `/health` later reports `"motion_enabled": true`.
 - `/wheel_state` later returns `positions_raw` for `base_left_wheel` and `base_right_wheel`.
 
-## Terminal RB-2: Orbbec RGB-D + IMU Sidecar
+## Terminal RB-2: Orbbec RGB-D Sidecar
 
 Run this on the robot brain Mac after RB-1 is running.
 
-For wheel-odometry-only tests, keep the RGB-D/camera HTTP flags but remove `--enable-imu`, `--imu-udp-host`, `--imu-udp-port`, and `--imu-log-every`. The camera still feeds RGB-D to robot brain, but no IMU frames are streamed.
+This wheel-odometry test path keeps RGB-D/camera HTTP live but does not stream IMU. The camera still feeds RGB-D to robot brain, while `/odom` comes from wheel encoders.
 
 ```bash
 cd /Users/alin/Robot42
@@ -93,16 +93,12 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --no-file-output \
   --enable-depth \
   --enable-depth-registration \
-  --enable-imu \
-  --imu-udp-host 127.0.0.1 \
-  --imu-udp-port 8766 \
   --camera-http-enable \
   --camera-http-host 127.0.0.1 \
   --camera-http-port 8765 \
   --camera-http-path /camera/rgbd \
   --camera-http-timeout-ms 100 \
-  --log-every 30 \
-  --imu-log-every 200
+  --log-every 30
 ```
 
 If the default aligned depth profile is too heavy, use the listed Gemini 2 `Y16 640x400@30` depth source profile:
@@ -113,19 +109,15 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --no-file-output \
   --enable-depth \
   --enable-depth-registration \
-  --enable-imu \
   --depth-width 640 \
   --depth-height 400 \
   --depth-fps 30 \
-  --imu-udp-host 127.0.0.1 \
-  --imu-udp-port 8766 \
   --camera-http-enable \
   --camera-http-host 127.0.0.1 \
   --camera-http-port 8765 \
   --camera-http-path /camera/rgbd \
   --camera-http-timeout-ms 100 \
-  --log-every 30 \
-  --imu-log-every 200
+  --log-every 30
 ```
 
 Expected:
@@ -141,23 +133,19 @@ Run on the offload machine.
 ```bash
 cd "$ROBOT42"
 
-curl --max-time 3 "${ROBOT_BRAIN_URL}/health" | python -m json.tool
-curl --max-time 3 "${ROBOT_BRAIN_URL}/rgbd" --output /tmp/xlerobot_rgbd.bin
-curl --max-time 3 "${ROBOT_BRAIN_URL}/rgb" --output /tmp/xlerobot_rgb.ppm
-curl --max-time 3 "${ROBOT_BRAIN_URL}/depth" --output /tmp/xlerobot_depth.pgm
-curl --max-time 3 "${ROBOT_BRAIN_URL}/imu" | python -m json.tool
+curl --max-time 3 "http://${ROBOT_BRAIN_IP}:8765/health" | python -m json.tool
+curl --max-time 3 "http://${ROBOT_BRAIN_IP}:8765/rgbd" --output /tmp/xlerobot_rgbd.bin
+curl --max-time 3 "http://${ROBOT_BRAIN_IP}:8765/rgb" --output /tmp/xlerobot_rgb.ppm
+curl --max-time 3 "http://${ROBOT_BRAIN_IP}:8765/depth" --output /tmp/xlerobot_depth.pgm
 ls -lh /tmp/xlerobot_rgbd.bin /tmp/xlerobot_rgb.ppm /tmp/xlerobot_depth.pgm
 ```
-
-In wheel mode with `--no-stream-imu`, skip the `/imu` curl; `/health` should show `"imu_streaming": false`.
 
 Expected:
 
 - Health JSON has `ok: true`.
 - Health JSON has `motion_enabled: true`.
 - Health JSON has `rgbd.ready: true`.
-- In RGB-D/IMU mode, health JSON has `imu.ready: true`.
-- In wheel mode, health JSON has `imu_streaming: false`.
+- Health JSON has `imu_streaming: false`.
 - RGB and depth files are non-empty.
 
 ## Terminal OFF-2: ROS Bridge
@@ -170,7 +158,7 @@ source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_ros_bridge \
-  --robot-brain-url "${ROBOT_BRAIN_URL}" \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --publish-rate-hz 30 \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.03 \
@@ -179,15 +167,15 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0 \
+  --no-publish-imu \
   --no-laser-fill-no-return
 ```
 
-For wheel-odometry-only tests, add `--no-publish-imu` to this bridge command and skip OFF-4/OFF-5.
+This bridge command intentionally does not publish `/imu`; wheel odometry owns `/odom`, and the bridge only handles RGB-D, scan, camera TF/topics, and `/cmd_vel` forwarding.
 
 Expected:
 
-- In RGB-D/IMU mode, logs show `IMU websocket connected`.
-- In wheel mode, there should be no IMU websocket connection.
+- There should be no IMU websocket connection.
 - No repeated motion forwarding errors.
 
 ## Terminal OFF-3: ROS Topic Sanity
@@ -211,12 +199,6 @@ ros2 topic hz /camera/head/depth/image_raw
 Expected: close to `30 Hz`.
 
 ```bash
-ros2 topic hz /imu
-```
-
-Expected in RGB-D/IMU mode: high rate. Around `200 Hz` is the target. In wheel mode with `--no-publish-imu`, skip this check.
-
-```bash
 ros2 topic echo /camera/head/camera_info --once
 ros2 topic echo /scan --once
 ```
@@ -226,7 +208,9 @@ Expected:
 - `camera_info.width` and `camera_info.height` match the active depth/RGB-D stream used by the bridge.
 - `/scan` has non-empty ranges.
 
-## Terminal OFF-4: Filtered IMU Yaw
+## Optional Terminal OFF-4: Filtered IMU Yaw for RGB-D/IMU Odom
+
+Skip this in the default wheel-odometry path. Use it only when comparing against the older RGB-D/IMU stack, with robot brain IMU streaming and bridge `/imu` publishing enabled. That comparison mode requires removing `--no-stream-imu` from RB-1, starting RB-2 with Orbbec IMU flags, and running OFF-2 with `--publish-imu`.
 
 Keep the robot still during startup/bias calibration.
 
@@ -260,7 +244,9 @@ Expected:
 - Orientation covariance is non-negative.
 - Rate is high enough for yaw integration. Ideally it follows `/imu`.
 
-## Terminal OFF-5: RGB-D Visual Odometry
+## Optional Terminal OFF-5: RGB-D Visual Odometry
+
+Skip this in the default wheel-odometry path. Run it only with OFF-4 when comparing the older RGB-D/IMU odometry stack.
 
 ```bash
 cd "$ROBOT42"
@@ -294,9 +280,9 @@ Expected:
 - `tf2_echo odom base_link` works.
 - While stationary, position and yaw should remain nearly stable.
 
-## Terminal OFF-5B: Wheel Odometry Alternative
+## Terminal OFF-5B: Wheel Odometry
 
-Use this instead of OFF-4 and OFF-5 when validating wheel encoder odometry.
+Use this as the default `/odom` owner for wheel encoder odometry. Do not run OFF-4 or OFF-5 at the same time.
 
 ```bash
 cd "$ROBOT42"
@@ -304,16 +290,17 @@ source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.wheel_odometry \
-  --robot-brain-url "${ROBOT_BRAIN_URL}" \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --wheel-state-path /wheel_state \
   --odom-topic /odom \
   --odom-reset-topic /xlerobot/odom/set_pose \
   --odom-frame odom \
   --base-frame base_link \
   --publish-rate-hz 50 \
+  --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
-  --wheel-radius-m 0.05 \
-  --wheel-track-width-m 0.25 \
+  --wheel-radius-m 0.0575 \
+  --wheel-track-width-m 0.515 \
   --left-wheel-position-sign -1 \
   --right-wheel-position-sign 1
 ```
@@ -326,7 +313,8 @@ Expected:
 
 ## Wheel Mode Smoke Tests
 
-Run these after `wheel_odometry` is publishing `/odom` and before asking Nav2 to drive to a room. In wheel-only mode, keep `real_ros_bridge` running with `--no-publish-imu`; these checks use TF/odom as the stopping source.
+Run these after `wheel_odometry` is publishing `/odom` and before asking Nav2 to drive to a room. These checks use TF/odom as the stopping source.
+The rotation diagnostics pass `--imu-bias-calibration-s 0.0`, and the forward diagnostics pass `--max-imu-staleness-s 0`, because the default wheel path does not publish `/imu`.
 
 Check that `/odom` is alive:
 
@@ -429,7 +417,6 @@ mkdir -p artifacts/diagnostics
 python -m xlerobot_playground.ros_rotation_diagnostic \
   --duration-s 60 \
   --sample-hz 10 \
-  --imu-topic /imu/filtered_yaw \
   --imu-bias-calibration-s 0.0 \
   --target-source tf \
   --csv-out artifacts/diagnostics/stationary_yaw.csv \
@@ -442,7 +429,7 @@ Pass criteria:
 
 - `tf.translation_drift_m` should be small, target below `0.03 m`.
 - `tf.unwrapped_yaw_delta_deg` should be small, target below `3 deg`.
-- If yaw drifts more than this while stationary, fix IMU yaw before moving.
+- If yaw drifts more than this while stationary, inspect wheel odom, TF ownership, and duplicate `/odom` publishers before moving.
 
 ## Test 1: 90 Degree Head Pan Command
 
@@ -462,6 +449,7 @@ python -m xlerobot_playground.ros_rotation_diagnostic \
   --head-pan-deg -90 \
   --head-pan-settle-s 1.0 \
   --duration-s 3 \
+  --imu-bias-calibration-s 0.0 \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-topic /camera/head/pan_rad
 
@@ -477,6 +465,7 @@ python -m xlerobot_playground.ros_rotation_diagnostic \
   --head-pan-deg 0 \
   --head-pan-settle-s 1.0 \
   --duration-s 3 \
+  --imu-bias-calibration-s 0.0 \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-topic /camera/head/pan_rad \
   --csv-out artifacts/diagnostics/head_pan_0.csv \
@@ -493,7 +482,7 @@ Important: this validates command path, units, sign, and published pan state. If
 
 ## Test 2: 90 Degree Left Rotation
 
-Purpose: validate authoritative IMU yaw through `/odom` and `odom -> base_link`.
+Purpose: validate wheel-odom yaw through `/odom` and `odom -> base_link`.
 
 This command publishes `/cmd_vel` until TF reports a 90 degree yaw change, or until the safety timeout.
 
@@ -509,7 +498,6 @@ python -m xlerobot_playground.ros_rotation_diagnostic \
   --angular-rad-s 0.10 \
   --target-yaw-deg 90 \
   --target-source tf \
-  --imu-topic /imu/filtered_yaw \
   --imu-bias-calibration-s 0.0 \
   --csv-out artifacts/diagnostics/rotate_left_90.csv \
   --json-out artifacts/diagnostics/rotate_left_90_summary.json
@@ -545,7 +533,6 @@ python -m xlerobot_playground.ros_rotation_diagnostic \
   --angular-rad-s -0.10 \
   --target-yaw-deg 90 \
   --target-source tf \
-  --imu-topic /imu/filtered_yaw \
   --imu-bias-calibration-s 0.0 \
   --csv-out artifacts/diagnostics/rotate_right_90.csv \
   --json-out artifacts/diagnostics/rotate_right_90_summary.json
@@ -580,10 +567,8 @@ python -m xlerobot_playground.ros_forward_accel_diagnostic \
   --linear-m-s 0.03 \
   --target-distance-m 0.25 \
   --target-source tf \
-  --imu-topic /imu/filtered_yaw \
-  --imu-frame-convention base_link \
   --accel-bias-calibration-s 0.0 \
-  --max-imu-staleness-s 0.5 \
+  --max-imu-staleness-s 0 \
   --csv-out artifacts/diagnostics/forward_025m.csv \
   --json-out artifacts/diagnostics/forward_025m_summary.json
 
@@ -604,7 +589,7 @@ Pass criteria:
 
 ## Test 5: Forward 1.0 m
 
-Purpose: validate RGB-D translation over a useful distance.
+Purpose: validate wheel-odom translation over a useful distance.
 
 Use only after the 0.25 m test passes.
 
@@ -620,10 +605,8 @@ python -m xlerobot_playground.ros_forward_accel_diagnostic \
   --linear-m-s 0.03 \
   --target-distance-m 1.0 \
   --target-source tf \
-  --imu-topic /imu/filtered_yaw \
-  --imu-frame-convention base_link \
   --accel-bias-calibration-s 0.0 \
-  --max-imu-staleness-s 0.5 \
+  --max-imu-staleness-s 0 \
   --csv-out artifacts/diagnostics/forward_1m.csv \
   --json-out artifacts/diagnostics/forward_1m_summary.json
 
@@ -633,8 +616,8 @@ python -m json.tool artifacts/diagnostics/forward_1m_summary.json
 Expected:
 
 - Robot moves forward and stops around 1 m according to TF.
-- RGB-D VO should produce continuous forward odom movement.
-- Yaw should remain close to the starting yaw because IMU yaw is authoritative.
+- Wheel odom should produce continuous forward odom movement.
+- Yaw should remain close to the starting yaw.
 
 Pass criteria:
 
@@ -642,7 +625,7 @@ Pass criteria:
 - Lateral drift is below `0.10 m`.
 - Yaw drift is below `5 deg`.
 
-If the robot physically travels much less or much more than `/odom`, the odometry scale or RGB-D alignment is wrong.
+If the robot physically travels much less or much more than `/odom`, tune `--wheel-radius-m`.
 
 ## Test 6: Square Path Consistency
 
@@ -664,10 +647,8 @@ for i in 1 2 3 4; do
     --linear-m-s 0.03 \
     --target-distance-m 0.5 \
     --target-source tf \
-    --imu-topic /imu/filtered_yaw \
-    --imu-frame-convention base_link \
     --accel-bias-calibration-s 0.0 \
-    --max-imu-staleness-s 0.5 \
+    --max-imu-staleness-s 0 \
     --csv-out "artifacts/diagnostics/square_forward_${i}.csv" \
     --json-out "artifacts/diagnostics/square_forward_${i}_summary.json"
 
@@ -679,7 +660,6 @@ for i in 1 2 3 4; do
     --angular-rad-s 0.10 \
     --target-yaw-deg 90 \
     --target-source tf \
-    --imu-topic /imu/filtered_yaw \
     --imu-bias-calibration-s 0.0 \
     --csv-out "artifacts/diagnostics/square_rotate_${i}.csv" \
     --json-out "artifacts/diagnostics/square_rotate_${i}_summary.json"
@@ -696,8 +676,8 @@ ros2 run tf2_ros tf2_echo odom base_link
 Pass criteria:
 
 - Final yaw should be close to the starting yaw.
-- Final position should be roughly near the starting position, allowing real wheel slip and visual drift.
-- If yaw is good but position is bad, focus on RGB-D registration, frame sync, feature quality, and camera intrinsics.
+- Final position should be roughly near the starting position, allowing real wheel slip.
+- If yaw is good but position is bad, tune `--wheel-radius-m`; if position is good but yaw is bad, tune `--wheel-track-width-m`.
 
 ## Optional: Raw Open-Loop Commands
 
@@ -749,7 +729,7 @@ source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.real_nav2_smoke_test \
-  --robot-brain-url "${ROBOT_BRAIN_URL}" \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --odom-topic /odom \
   --scan-topic /scan \
   --cmd-vel-topic /cmd_vel \
@@ -784,26 +764,25 @@ python -m json.tool artifacts/diagnostics/forward_1m_summary.json
 If `/camera/head/*` is not 30 Hz:
 
 - Check RB-2 sidecar logs for HTTP publish warnings.
-- Check `curl ${ROBOT_BRAIN_URL}/health`; `rgbd.age_s` should stay low.
+- Check `curl http://${ROBOT_BRAIN_IP}:8765/health`; `rgbd.age_s` should stay low.
 - Raw RGB-D over per-frame HTTP may be too heavy; the next transport improvement is a persistent socket or compression.
 
 If rotation direction is wrong:
 
-- Check `imu_yaw_filter --yaw-source`.
-- For Gemini 2, current runbook uses `--yaw-source gyro_y`.
-- Re-run the 90 degree tests before testing translation.
+- Check `--left-wheel-position-sign` and `--right-wheel-position-sign` in `wheel_odometry`.
+- A physical left/counter-clockwise spin should produce positive yaw in `/odom`.
+- Re-run the 90 degree tests before testing translation or Nav2.
 
 If yaw is stable but forward odometry is bad:
 
-- Check RGB/depth resolution and registration.
-- Check that `/camera/head/image_raw` and `/camera/head/depth/image_raw` are both live.
-- Check that the scene has visible features; blank walls/floors are poor for ORB matching.
-- Check camera intrinsics. Current camera info is synthetic from horizontal FOV.
+- Check that `/wheel_state` positions change while the robot moves.
+- Tune `--wheel-radius-m` using a measured straight-line run.
+- Confirm only `wheel_odometry` publishes `/odom`.
 
 If forward test stops early:
 
 - Inspect `motion_blocked_reason` or `stop_reason` in the summary JSON.
-- If IMU is stale, check `/imu`, `/imu/filtered_yaw`, and the websocket connection in `real_ros_bridge`.
+- In default wheel mode, commands should use `--max-imu-staleness-s 0` so missing `/imu` never blocks motion.
 
 If the robot does not move:
 

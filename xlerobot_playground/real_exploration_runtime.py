@@ -81,7 +81,6 @@ class RealXLeRobotDirectRuntime:
 
     def connect(self) -> None:
         if self._connected:
-            self._debug("connect skipped; already marked connected")
             return
         try:
             self._debug("connect start")

@@ -47,7 +47,7 @@ class WheelOdometryConfig:
     nav_active_topic: str = "/xlerobot/nav_active"
     odom_requires_nav_active: bool = False
     publish_rate_hz: float = 50.0
-    http_timeout_s: float = 0.25
+    http_timeout_s: float = 2.0
     encoder_ticks_per_revolution: float = 4096.0
     wheel_radius_m: float = 0.05
     wheel_track_width_m: float = 0.25
@@ -224,7 +224,7 @@ def integrate_wheel_state_delta(
 
 
 class RobotBrainWheelStateClient:
-    def __init__(self, base_url: str, *, path: str = "/wheel_state", timeout_s: float = 0.25) -> None:
+    def __init__(self, base_url: str, *, path: str = "/wheel_state", timeout_s: float = 2.0) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.path = path
         self.timeout_s = float(timeout_s)
@@ -395,7 +395,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only integrate wheel deltas while nav_active is true. Default false keeps local/manual wheel motion visible.",
     )
     parser.add_argument("--publish-rate-hz", type=float, default=50.0)
-    parser.add_argument("--http-timeout-s", type=float, default=0.25)
+    parser.add_argument("--http-timeout-s", type=float, default=2.0)
     parser.add_argument("--encoder-ticks-per-revolution", type=float, default=4096.0)
     parser.add_argument("--wheel-radius-m", type=float, default=0.05)
     parser.add_argument("--wheel-track-width-m", "--wheelbase-m", dest="wheel_track_width_m", type=float, default=0.25)

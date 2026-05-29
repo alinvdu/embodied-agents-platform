@@ -30,6 +30,7 @@ class WheelOdometryTests(unittest.TestCase):
         self.assertEqual(config.left_wheel_position_sign, -1.0)
         self.assertEqual(config.right_wheel_position_sign, 1.0)
         self.assertFalse(config.odom_requires_nav_active)
+        self.assertEqual(config.http_timeout_s, 2.0)
 
     def test_unwrap_encoder_delta_handles_single_turn_wrap(self) -> None:
         self.assertEqual(

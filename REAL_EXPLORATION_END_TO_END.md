@@ -99,7 +99,8 @@ python -m xlerobot_playground.robot_brain_agent \
   --camera-pitch-action-sign 1 \
   --camera-pitch-action-offset-deg -28 \
   --camera-pitch-settle-s 0.5 \
-  --initial-camera-pitch-deg 0
+  --initial-camera-pitch-deg 0 \
+  --no-stream-imu
 ```
 
 For wheel-odometry-only mode, add `--no-stream-imu` to `robot_brain_agent`. That keeps robot brain from opening the Orbbec IMU UDP listener or `/ws/imu`; `/wheel_state`, camera control, RGB-D ingest, and `/cmd_vel` still work.
@@ -139,7 +140,6 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
   --point-cloud-max-points 200000 \
   --point-cloud-min-z-m 0.25 \
   --point-cloud-max-z-m 4.0 \
-  --enable-imu \
   --imu-aggregate-mode any \
   --imu-udp-host 127.0.0.1 \
   --imu-udp-port 8766 \
@@ -508,9 +508,10 @@ python -m xlerobot_playground.wheel_odometry \
   --odom-frame odom \
   --base-frame base_link \
   --publish-rate-hz 50 \
+  --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
-  --wheel-radius-m 0.05 \
-  --wheel-track-width-m 0.25 \
+  --wheel-radius-m 0.0575 \
+  --wheel-track-width-m 0.515 \
   --left-wheel-motor base_left_wheel \
   --right-wheel-motor base_right_wheel \
   --left-wheel-position-sign -1 \
