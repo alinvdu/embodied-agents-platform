@@ -170,8 +170,8 @@ python examples/robot42_agent_backend.py \
   --object-detector-min-confidence 0.65 \
   --object-detector-max-image-edge-px 1280 \
   --object-detector-jpeg-quality 85 \
-  --object-approach-target-min-m 0.35 \
-  --object-approach-target-max-m 0.45 \
+  --object-approach-target-min-m 0.2 \
+  --object-approach-target-max-m 0.3 \
   --object-approach-target-tolerance-m 0.025 \
   --object-approach-step-m 0.25 \
   --object-approach-step-fraction 0.8 \

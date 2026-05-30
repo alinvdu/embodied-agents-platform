@@ -456,7 +456,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--http-timeout-s", type=float, default=2.0)
     parser.add_argument("--encoder-ticks-per-revolution", type=float, default=4096.0)
     parser.add_argument("--wheel-radius-m", type=float, default=0.0604)
-    parser.add_argument("--wheel-track-width-m", "--wheelbase-m", dest="wheel_track_width_m", type=float, default=0.535)
+    parser.add_argument("--wheel-track-width-m", "--wheelbase-m", dest="wheel_track_width_m", type=float, default=0.51)
     parser.add_argument(
         "--base-link-x-from-wheel-axle-m",
         type=float,

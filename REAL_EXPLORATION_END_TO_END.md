@@ -513,7 +513,7 @@ python -m xlerobot_playground.wheel_odometry \
   --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0604 \
-  --wheel-track-width-m 0.535 \
+  --wheel-track-width-m 0.51 \
   --base-link-x-from-wheel-axle-m 0.0 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-motor base_left_wheel \
