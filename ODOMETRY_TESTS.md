@@ -161,8 +161,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --publish-rate-hz 30 \
   --cmd-vel-timeout-s 0.5 \
-  --max-linear-m-s 0.03 \
-  --max-angular-rad-s 0.10 \
+  --max-linear-m-s 0.1 \
+  --max-angular-rad-s 0.50 \
   --camera-x-m 0.0 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
@@ -296,12 +296,12 @@ python -m xlerobot_playground.wheel_odometry \
   --odom-reset-topic /xlerobot/odom/set_pose \
   --odom-frame odom \
   --base-frame base_link \
-  --publish-rate-hz 50 \
+  --publish-rate-hz 120 \
   --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
-  --wheel-radius-m 0.0575 \
-  --wheel-track-width-m 0.515 \
-  --base-link-x-from-wheel-axle-m 0.196 \
+  --wheel-radius-m 0.0604 \
+  --wheel-track-width-m 0.535 \
+  --base-link-x-from-wheel-axle-m 0.03 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-position-sign -1 \
   --right-wheel-position-sign 1
@@ -357,10 +357,10 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 python -m xlerobot_playground.ros_forward_accel_diagnostic \
   --send-motion \
-  --duration-s 25 \
+  --duration-s 35 \
   --sample-hz 30 \
-  --linear-m-s 0.03 \
-  --target-distance-m 0.50 \
+  --linear-m-s 0.1 \
+  --target-distance-m 1 \
   --target-source tf \
   --max-imu-staleness-s 0 \
   --csv-out artifacts/diagnostics/wheel_forward_050m.csv \
@@ -380,7 +380,7 @@ python -m xlerobot_playground.ros_rotation_diagnostic \
   --send-motion \
   --duration-s 30 \
   --sample-hz 20 \
-  --angular-rad-s 0.10 \
+  --angular-rad-s 0.50 \
   --target-yaw-deg 90 \
   --target-source tf \
   --imu-bias-calibration-s 0.0 \

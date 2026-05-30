@@ -242,7 +242,8 @@ python -m xlerobot_playground.real_ros_bridge \
   --camera-pan-topic /camera/head/pan_rad \
   --no-laser-fill-no-return \
   --allow-motion-commands \
-  --no-publish-imu
+  --no-publish-imu \
+  --odom-source none
 ```
 
 This publishes camera images, `/camera/head/points`, depth-derived `/scan`, `/imu` unless disabled, camera pan/pitch topics, camera transforms, and forwards ROS `/cmd_vel` to the robot brain. In wheel-odometry-only mode, add `--no-publish-imu` to this command; pair it with robot brain `--no-stream-imu` and an Orbbec sidecar started without `--enable-imu`. Nav2 still receives `/odom` from `wheel_odometry`, and the bridge still handles RGB-D, scan, TF camera frames, and `/cmd_vel`.
@@ -511,8 +512,8 @@ python -m xlerobot_playground.wheel_odometry \
   --publish-rate-hz 50 \
   --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
-  --wheel-radius-m 0.058 \
-  --wheel-track-width-m 0.51 \
+  --wheel-radius-m 0.0604 \
+  --wheel-track-width-m 0.535 \
   --base-link-x-from-wheel-axle-m 0.03 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-motor base_left_wheel \
