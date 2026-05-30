@@ -1974,6 +1974,62 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(retry["attempts"][0]["source"], "detector_refresh")
         self.assertEqual(retry["attempts"][0]["retry_policy"]["detector_refresh_forced"], True)
 
+    def test_runtime_approach_continues_when_surface_standoff_is_blocked(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=object_surface_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="coke can",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "coke can",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [220, 120, 420, 360],
+                },
+            },
+            capture={"shot_id": "old_shot", "image_width": 640, "image_height": 480},
+        )
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.42,
+                        "distance_m": 0.42,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_map": {"x": 2.75, "y": 2.85, "z": 0.2},
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "not used"},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        blocked_alignment = {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "blocked",
+            "reason": "No footprint-clear standoff pose was found near the support surface.",
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen), patch(
+            "xlerobot_agent.home_agent.resolve_object_surface_approach_pose",
+            return_value=blocked_alignment,
+        ):
+            result = runtime.approach_detected_object(object_label="coke can")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["attempts"][0]["surface_alignment"]["status"], "blocked")
+        self.assertEqual(
+            result["attempts"][0]["surface_alignment_fallback"]["status"],
+            "continuing_without_surface_alignment",
+        )
+
     def test_runtime_grab_object_is_mock_vla_entrypoint(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=sample_memory(),
