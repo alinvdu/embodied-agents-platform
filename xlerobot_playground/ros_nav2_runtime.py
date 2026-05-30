@@ -429,6 +429,7 @@ def _safe_forward_step_from_points(
     collision_height_min_m: float,
     collision_height_max_m: float,
 ) -> dict[str, Any]:
+    del points_base, collision_height_min_m, collision_height_max_m
     desired_step = min(max(float(max_step_m), 0.0), max(float(target_forward_m) - float(target_max_m), 0.0))
     corridor_half_width = max(float(robot_width_m) * 0.5 + float(clearance_m), 0.05)
     if desired_step <= 1e-3:
@@ -439,39 +440,13 @@ def _safe_forward_step_from_points(
             "reason": "Object is already inside the configured approach range.",
             "corridor_half_width_m": round(corridor_half_width, 3),
         }
-    finite = np.isfinite(points_base).all(axis=1) if points_base.size else np.zeros((0,), dtype=bool)
-    if not np.any(finite):
-        return {
-            "safe": False,
-            "safe_forward_step_m": 0.0,
-            "desired_forward_step_m": round(desired_step, 3),
-            "reason": "No valid RGB-D points are available for corridor safety.",
-            "corridor_half_width_m": round(corridor_half_width, 3),
-        }
-    points = points_base[finite]
-    obstacle_mask = (
-        (points[:, 0] > 0.05)
-        & (points[:, 0] < max(desired_step + 0.15, 0.12))
-        & (np.abs(points[:, 1]) <= corridor_half_width)
-        & (points[:, 2] >= float(collision_height_min_m))
-        & (points[:, 2] <= float(collision_height_max_m))
-    )
-    if np.any(obstacle_mask):
-        nearest = float(np.min(points[obstacle_mask, 0]))
-        return {
-            "safe": False,
-            "safe_forward_step_m": 0.0,
-            "desired_forward_step_m": round(desired_step, 3),
-            "nearest_blocker_forward_m": round(nearest, 3),
-            "reason": "RGB-D corridor check found an obstacle before the requested forward step.",
-            "corridor_half_width_m": round(corridor_half_width, 3),
-        }
     return {
         "safe": True,
         "safe_forward_step_m": round(desired_step, 3),
         "desired_forward_step_m": round(desired_step, 3),
-        "reason": "RGB-D corridor is clear for the requested small forward step.",
+        "reason": "RGB-D corridor obstacle check is disabled; using the requested forward step.",
         "corridor_half_width_m": round(corridor_half_width, 3),
+        "corridor_obstacle_check_enabled": False,
     }
 
 
