@@ -156,8 +156,10 @@ class SimExplorationConfig:
     ros_manual_spin_direction_sign: float = 1.0
     ros_robot_length_m: float = 0.3913
     ros_robot_width_m: float = 0.459
-    ros_base_link_x_from_wheel_axle_m: float = 0.196
+    ros_base_link_x_from_wheel_axle_m: float = 0.0
     ros_base_link_y_from_wheel_axle_m: float = 0.0
+    ros_camera_center_forward_m: float = 0.23
+    ros_camera_center_lateral_m: float = 0.0
     ros_local_rotation_safety_enabled: bool = False
     ros_local_rotation_safety_padding_m: float = 0.03
     ros_local_rotation_safety_yaw_sample_deg: float = 4.0
@@ -3380,6 +3382,8 @@ class RosExplorationSession:
                     robot_width_m=config.ros_robot_width_m,
                     base_link_x_from_wheel_axle_m=config.ros_base_link_x_from_wheel_axle_m,
                     base_link_y_from_wheel_axle_m=config.ros_base_link_y_from_wheel_axle_m,
+                    camera_center_forward_m=config.ros_camera_center_forward_m,
+                    camera_center_lateral_m=config.ros_camera_center_lateral_m,
                     local_rotation_safety_enabled=config.ros_local_rotation_safety_enabled,
                     local_rotation_safety_padding_m=config.ros_local_rotation_safety_padding_m,
                     local_rotation_safety_yaw_sample_deg=config.ros_local_rotation_safety_yaw_sample_deg,
@@ -4115,6 +4119,17 @@ class RosExplorationSession:
                     result = rotate(
                         delta_yaw_rad=delta_yaw_rad,
                         reason=str(payload.get("reason") or "agent requested bounded rotation"),
+                        rotation_scope=str(payload.get("rotation_scope") or "rear_drive"),
+                        camera_center_forward_m=(
+                            float(payload["camera_center_forward_m"])
+                            if payload.get("camera_center_forward_m") is not None
+                            else None
+                        ),
+                        camera_center_lateral_m=(
+                            float(payload["camera_center_lateral_m"])
+                            if payload.get("camera_center_lateral_m") is not None
+                            else None
+                        ),
                     )
                 elif primitive == "rotate_towards_point":
                     rotate_towards = getattr(self.runtime, "rotate_towards_point", None)
@@ -6095,8 +6110,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
-    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.196)
+    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.0)
     parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
+    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.23)
+    parser.add_argument("--ros-camera-center-lateral-m", type=float, default=0.0)
     parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
     parser.add_argument("--ros-local-rotation-safety-yaw-sample-deg", type=float, default=4.0)
@@ -6250,6 +6267,8 @@ def main(argv: list[str] | None = None) -> int:
             ros_robot_width_m=args.ros_robot_width_m,
             ros_base_link_x_from_wheel_axle_m=args.ros_base_link_x_from_wheel_axle_m,
             ros_base_link_y_from_wheel_axle_m=args.ros_base_link_y_from_wheel_axle_m,
+            ros_camera_center_forward_m=args.ros_camera_center_forward_m,
+            ros_camera_center_lateral_m=args.ros_camera_center_lateral_m,
             ros_local_rotation_safety_enabled=args.ros_local_rotation_safety_enabled,
             ros_local_rotation_safety_padding_m=args.ros_local_rotation_safety_padding_m,
             ros_local_rotation_safety_yaw_sample_deg=args.ros_local_rotation_safety_yaw_sample_deg,

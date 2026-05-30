@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import unittest
 
+from xlerobot_playground.nav2_params import asymmetric_rectangular_footprint
 from xlerobot_playground.real_nav2_config import build_parser
 
 
 class RealNav2ConfigTests(unittest.TestCase):
+    def test_asymmetric_footprint_places_base_link_near_rear_axle(self) -> None:
+        self.assertEqual(
+            asymmetric_rectangular_footprint(front_m=0.45, rear_m=0.08, width_m=0.54),
+            "[[0.45, 0.27], [0.45, -0.27], [-0.08, -0.27], [-0.08, 0.27]]",
+        )
+
     def test_parser_defaults_are_real_robot_safe(self) -> None:
         args = build_parser().parse_args([])
 
@@ -13,6 +20,8 @@ class RealNav2ConfigTests(unittest.TestCase):
         self.assertEqual(args.map_frame, "map")
         self.assertEqual(args.odom_frame, "odom")
         self.assertEqual(args.base_frame, "base_link")
+        self.assertIsNone(args.robot_footprint_front_m)
+        self.assertIsNone(args.robot_footprint_rear_m)
         self.assertEqual(args.max_linear_velocity, 0.03)
         self.assertEqual(args.max_angular_velocity, 0.18)
         self.assertEqual(args.min_linear_velocity_threshold, 0.01)

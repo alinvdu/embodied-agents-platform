@@ -25,6 +25,26 @@ def rectangular_footprint(
     return "[" + ", ".join(f"[{x}, {y}]" for x, y in points) + "]"
 
 
+def asymmetric_rectangular_footprint(
+    *,
+    front_m: float,
+    rear_m: float,
+    width_m: float,
+    center_y_m: float = 0.0,
+) -> str:
+    front = max(float(front_m), 0.0)
+    rear = max(float(rear_m), 0.0)
+    half_width = max(float(width_m), 0.0) / 2.0
+    center_y = float(center_y_m)
+    points = [
+        (round(front, 4), round(center_y + half_width, 4)),
+        (round(front, 4), round(center_y - half_width, 4)),
+        (round(-rear, 4), round(center_y - half_width, 4)),
+        (round(-rear, 4), round(center_y + half_width, 4)),
+    ]
+    return "[" + ", ".join(f"[{x}, {y}]" for x, y in points) + "]"
+
+
 def load_yaml(path: str | Path) -> dict[str, Any]:
     with Path(path).expanduser().open("r", encoding="utf-8") as handle:
         data = yaml.safe_load(handle) or {}

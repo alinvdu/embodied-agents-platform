@@ -24,6 +24,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-laser-range", type=float, default=6.0)
     parser.add_argument("--robot-length-m", type=float, default=0.3913)
     parser.add_argument("--robot-width-m", type=float, default=0.459)
+    parser.add_argument(
+        "--robot-footprint-front-m",
+        type=float,
+        default=None,
+        help=(
+            "Distance from base_link to the front footprint edge. If set, Nav2 uses an asymmetric "
+            "rectangular footprint around base_link instead of a centered rectangle."
+        ),
+    )
+    parser.add_argument(
+        "--robot-footprint-rear-m",
+        type=float,
+        default=None,
+        help=(
+            "Distance from base_link to the rear footprint edge. If only this is set, the front edge "
+            "is computed as robot-length-m minus this rear distance."
+        ),
+    )
     parser.add_argument("--max-linear-velocity", type=float, default=0.03)
     parser.add_argument("--max-angular-velocity", type=float, default=0.18)
     parser.add_argument(
@@ -118,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     from xlerobot_playground.nav2_params import (
+        asymmetric_rectangular_footprint,
         dump_yaml,
         load_yaml,
         patch_nav2_params,
@@ -141,7 +160,24 @@ def main(argv: list[str] | None = None) -> int:
     dump_yaml(slam_path, slam_params)
 
     base_nav2 = load_yaml(args.base_nav2_params)
-    footprint = rectangular_footprint(length_m=args.robot_length_m, width_m=args.robot_width_m)
+    if args.robot_footprint_front_m is not None or args.robot_footprint_rear_m is not None:
+        rear_m = float(
+            args.robot_footprint_rear_m
+            if args.robot_footprint_rear_m is not None
+            else max(float(args.robot_length_m) * 0.5, 0.0)
+        )
+        front_m = float(
+            args.robot_footprint_front_m
+            if args.robot_footprint_front_m is not None
+            else max(float(args.robot_length_m) - rear_m, 0.0)
+        )
+        footprint = asymmetric_rectangular_footprint(
+            front_m=front_m,
+            rear_m=rear_m,
+            width_m=args.robot_width_m,
+        )
+    else:
+        footprint = rectangular_footprint(length_m=args.robot_length_m, width_m=args.robot_width_m)
     nav2_params = patch_nav2_params(
         base_nav2,
         use_sim_time=False,

@@ -301,19 +301,19 @@ python -m xlerobot_playground.wheel_odometry \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0604 \
   --wheel-track-width-m 0.535 \
-  --base-link-x-from-wheel-axle-m 0.03 \
+  --base-link-x-from-wheel-axle-m 0.0 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-position-sign -1 \
   --right-wheel-position-sign 1
 ```
 
-`--base-link-x-from-wheel-axle-m 0.196` models the IKEA-cart layout where the driven wheel axle is near the rear of the `0.3913 m` Nav2 footprint and `base_link` is the cart/body center. With this offset, an encoder "spin" around the rear axle correctly moves `base_link` through an arc instead of pretending the cart center rotated in place. Tune this value if the physical axle is not exactly at the rear footprint edge.
+Use `--base-link-x-from-wheel-axle-m 0.0` as the default. Wheel odometry should publish the driven axle midpoint as `base_link`; Nav2 should model the cart body with an asymmetric rectangular footprint. Do not inject the cart body offset into `/odom`, because yaw wobble then appears as sideways base motion.
 
 Expected:
 
 - `/odom` exists and publishes near `50 Hz`.
 - Forward motion increases `/odom.pose.pose.position.x` when yaw is near zero.
-- A physical left/counter-clockwise spin increases odometry yaw and moves `base_link` along the expected body-center arc. If yaw sign is wrong, adjust the wheel position signs before using Nav2.
+- A physical left/counter-clockwise spin increases odometry yaw while `base_link` stays near the driven axle midpoint. If yaw sign is wrong, adjust the wheel position signs before using Nav2.
 
 ## Wheel Mode Smoke Tests
 
@@ -514,12 +514,12 @@ Expected:
 - Robot rotates left around the rear driven axle and stops around 90 degrees.
 - `stop_reason` is `target_tf_yaw_reached`.
 - `tf.unwrapped_yaw_delta_deg` is near `+90`.
-- `base_link` translation during the turn is expected. With `base-link-x-from-wheel-axle=0.196`, a 90 degree axle-centered turn moves the body center about `0.28 m`.
+- `base_link` translation during a pure spin should be small; the rectangular body sweep is represented by the Nav2 footprint, not by offsetting `/odom`.
 
 Pass criteria:
 
 - Yaw error from 90 degrees is below `5 deg`.
-- Body-center translation roughly matches the wheel-axle offset arc. If yaw is right but translation is near zero, the base-link offset is not being applied.
+- Base-link translation remains small while yaw changes cleanly.
 
 ## Test 3: 90 Degree Right Rotation
 

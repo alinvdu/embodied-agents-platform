@@ -463,7 +463,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.0,
         help=(
             "Body-frame x offset from the driven wheel axle midpoint to base_link. "
-            "Positive means base_link is forward of the axle. Use this for rear-wheel cart bases."
+            "Positive means base_link is forward of the axle. Keep 0.0 for Nav2 axle-centered wheel odom; "
+            "model cart body extent with the Nav2 footprint instead."
         ),
     )
     parser.add_argument(

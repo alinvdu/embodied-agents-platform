@@ -99,8 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
-    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.196)
+    parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.0)
     parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
+    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.23)
+    parser.add_argument("--ros-camera-center-lateral-m", type=float, default=0.0)
     parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
     parser.add_argument("--ros-local-rotation-safety-yaw-sample-deg", type=float, default=4.0)
@@ -237,6 +239,10 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         str(args.ros_base_link_x_from_wheel_axle_m),
         "--ros-base-link-y-from-wheel-axle-m",
         str(args.ros_base_link_y_from_wheel_axle_m),
+        "--ros-camera-center-forward-m",
+        str(args.ros_camera_center_forward_m),
+        "--ros-camera-center-lateral-m",
+        str(args.ros_camera_center_lateral_m),
         "--ros-local-rotation-safety-padding-m",
         str(args.ros_local_rotation_safety_padding_m),
         "--ros-local-rotation-safety-yaw-sample-deg",

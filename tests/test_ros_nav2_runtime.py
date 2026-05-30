@@ -17,6 +17,7 @@ from xlerobot_playground.ros_nav2_runtime import (
     fuse_projected_maps,
     rear_axle_pose_from_base_pose,
     rear_axle_rotation_sweep_base_poses,
+    rear_drive_camera_center_shift,
     remaining_turn_delta_rad,
 )
 
@@ -26,8 +27,19 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertEqual(RosRuntimeConfig().manual_spin_direction_sign, 1.0)
         self.assertEqual(RosRuntimeConfig().local_rotation_active_topic, "/xlerobot/local_rotation_active")
         self.assertFalse(RosRuntimeConfig().local_rotation_safety_enabled)
+        self.assertAlmostEqual(RosRuntimeConfig().base_link_x_from_wheel_axle_m, 0.0)
         self.assertGreaterEqual(RosRuntimeConfig().rgbd_update_timeout_s, 0.5)
         self.assertAlmostEqual(RosRuntimeConfig().rgbd_fallback_horizontal_fov_deg, 64.0)
+        self.assertAlmostEqual(RosRuntimeConfig().camera_center_forward_m, 0.23)
+
+    def test_rear_drive_camera_center_shift_reports_unavoidable_arc(self) -> None:
+        shift = rear_drive_camera_center_shift(
+            delta_yaw_rad=math.radians(12.0),
+            camera_forward_m=0.23,
+        )
+
+        self.assertAlmostEqual(shift["distance_m"], 0.0481, places=4)
+        self.assertGreater(shift["lateral_m"], 0.0)
 
     def test_compute_turn_command_stops_at_target(self) -> None:
         command, done = compute_turn_command(

@@ -514,7 +514,7 @@ python -m xlerobot_playground.wheel_odometry \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0604 \
   --wheel-track-width-m 0.535 \
-  --base-link-x-from-wheel-axle-m 0.03 \
+  --base-link-x-from-wheel-axle-m 0.0 \
   --base-link-y-from-wheel-axle-m 0.0 \
   --left-wheel-motor base_left_wheel \
   --right-wheel-motor base_right_wheel \
@@ -522,9 +522,9 @@ python -m xlerobot_playground.wheel_odometry \
   --right-wheel-position-sign 1
 ```
 
-The `base-link-x-from-wheel-axle` offset matters for the IKEA-cart geometry: the rear driven axle is not at the cart center. Wheel encoders integrate the rear axle midpoint, while Nav2 and object approach reason about `base_link` at the body center. Start with `0.196 m`, half of the `0.3913 m` Nav2 footprint length, then tune it if the physical axle is inset from the rear footprint edge.
+Keep `base-link-x-from-wheel-axle` at `0.0` for wheel odometry. The encoder odom frame should stay at the driven axle midpoint; Nav2 gets the cart geometry from an asymmetric rectangular footprint instead of a lateral-velocity offset in `/odom`.
 
-The default wheel signs match the current `xlerobot_2wheels` drive code: forward motion commands the left motor in the opposite raw direction from the right motor. If a forward drive makes `/odom` move backward, flip both wheel position signs. If a left turn makes `/odom` yaw decrease, flip one side or adjust the track width/signs after a 90 degree spin test. With the rear-axle offset enabled, `base_link` should also move along a body-center arc during that turn; near-zero translation during a spin usually means the offset is missing or too small.
+The default wheel signs match the current `xlerobot_2wheels` drive code: forward motion commands the left motor in the opposite raw direction from the right motor. If a forward drive makes `/odom` move backward, flip both wheel position signs. If a left turn makes `/odom` yaw decrease, flip one side or adjust the track width/signs after a 90 degree spin test.
 
 ### Terminal OC-4: Nav2 Params
 
@@ -543,6 +543,10 @@ python -m xlerobot_playground.real_nav2_config \
   --map-frame map \
   --odom-frame odom \
   --base-frame base_link \
+  --robot-length-m 0.3913 \
+  --robot-width-m 0.459 \
+  --robot-footprint-front-m 0.3613 \
+  --robot-footprint-rear-m 0.03 \
   --max-laser-range 4.0 \
   --max-linear-velocity 0.08 \
   --max-angular-velocity 0.30 \
@@ -631,8 +635,10 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-manual-spin-direction-sign 1 \
   --ros-robot-length-m 0.3913 \
   --ros-robot-width-m 0.459 \
-  --ros-base-link-x-from-wheel-axle-m 0.03 \
+  --ros-base-link-x-from-wheel-axle-m 0.0 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
+  --ros-camera-center-forward-m 0.23 \
+  --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8 \
   --ros-imu-topic /imu/filtered_yaw \
@@ -702,8 +708,10 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-manual-spin-direction-sign 1 \
   --ros-robot-length-m 0.3913 \
   --ros-robot-width-m 0.459 \
-  --ros-base-link-x-from-wheel-axle-m 0.03 \
+  --ros-base-link-x-from-wheel-axle-m 0.0 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
+  --ros-camera-center-forward-m 0.23 \
+  --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8
 ```

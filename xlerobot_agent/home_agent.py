@@ -89,6 +89,9 @@ class HomeAgentConfig:
     object_approach_max_attempts: int = 20
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
+    object_alignment_rotation_scope: str = "camera_center"
+    object_alignment_camera_center_forward_m: float = 0.23
+    object_alignment_camera_center_lateral_m: float = 0.0
 
 
 @dataclass
@@ -712,6 +715,7 @@ class HomeAgentToolRuntime:
             rotation = self.rotate_by(
                 delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
                 reason=f"Center `{label}` from tracked bbox before approach.",
+                **_object_alignment_rotation_kwargs(constraints, self.config),
             )
             attempt["rotation"] = rotation
             if rotation.get("status") not in {"succeeded", "partial"}:
@@ -817,6 +821,7 @@ class HomeAgentToolRuntime:
             rotation = self.rotate_by(
                 delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
                 reason=f"Center `{label}` in the camera before approach.",
+                **_object_alignment_rotation_kwargs(constraints, self.config),
             )
             attempt["rotation"] = rotation
             if rotation.get("status") not in {"succeeded", "partial"}:
@@ -1106,6 +1111,7 @@ class HomeAgentToolRuntime:
                 rotation = self.rotate_by(
                     delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
                     reason=f"Center `{label}` from image bbox before forward approach.",
+                    **_object_alignment_rotation_kwargs(constraints, self.config),
                 )
                 attempt["rotation"] = rotation
                 attempt["image_centering"] = {
@@ -1170,6 +1176,7 @@ class HomeAgentToolRuntime:
                 rotation = self.rotate_by(
                     delta_yaw_deg=max(min(bearing_error_deg, 12.0), -12.0),
                     reason=f"Center `{label}` from RGB-D bearing before forward approach.",
+                    **_object_alignment_rotation_kwargs(constraints, self.config),
                 )
                 attempt["rotation"] = rotation
                 attempt["geometry_bearing_correction"] = {
@@ -1820,14 +1827,28 @@ class HomeAgentToolRuntime:
         )
         return result
 
-    def rotate_by(self, *, delta_yaw_deg: float, reason: str = "") -> dict[str, Any]:
+    def rotate_by(
+        self,
+        *,
+        delta_yaw_deg: float,
+        reason: str = "",
+        rotation_scope: str = "rear_drive",
+        camera_center_forward_m: float | None = None,
+        camera_center_lateral_m: float | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "primitive": "rotate_by",
+            "delta_yaw_deg": float(delta_yaw_deg),
+            "reason": reason,
+            "rotation_scope": rotation_scope,
+        }
+        if camera_center_forward_m is not None:
+            payload["camera_center_forward_m"] = float(camera_center_forward_m)
+        if camera_center_lateral_m is not None:
+            payload["camera_center_lateral_m"] = float(camera_center_lateral_m)
         return self._local_motion(
             title="Local Rotate",
-            payload={
-                "primitive": "rotate_by",
-                "delta_yaw_deg": float(delta_yaw_deg),
-                "reason": reason,
-            },
+            payload=payload,
         )
 
     def rotate_towards_point(self, *, x: float, y: float, reason: str = "") -> dict[str, Any]:
@@ -2294,9 +2315,15 @@ class HomeTaskAgent:
             return json.dumps(runtime.relocalize_here())
 
         @function_tool
-        def rotate_by(delta_yaw_deg: float, reason: str = "") -> str:
-            """Run a bounded backend-controlled in-place rotation, in degrees."""
-            return json.dumps(runtime.rotate_by(delta_yaw_deg=delta_yaw_deg, reason=reason))
+        def rotate_by(delta_yaw_deg: float, reason: str = "", rotation_scope: str = "rear_drive") -> str:
+            """Run a bounded backend-controlled rotation; use rear_drive for navigation and camera_center for camera/object alignment."""
+            return json.dumps(
+                runtime.rotate_by(
+                    delta_yaw_deg=delta_yaw_deg,
+                    reason=reason,
+                    rotation_scope=rotation_scope,
+                )
+            )
 
         @function_tool
         def rotate_towards_point(x: float, y: float, reason: str = "") -> str:
@@ -2388,6 +2415,7 @@ class HomeTaskAgent:
                 "- Nav2 can sometimes fail to find paths toward objects or places, even when a route may exist.",
                 "- Nav2 can be noisy for pure rotations, 180-degree turns, very close targets, and recovery after failed to make progress.",
                 "- Local motion tools are bounded backend-controlled motions. Use them for orientation, tiny final corrections, or recovery, not for long navigation.",
+                "- rotate_by has rotation_scope='rear_drive' for navigation/body alignment and rotation_scope='camera_center' for camera/object alignment. Use rear_drive when aiming the robot body or a waypoint; use camera_center only when the goal is to center what the head camera sees. The object focus/approach tools choose camera_center internally.",
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
                 "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
                 "- execute_region_exploration_plan is for local visual search after the robot is already near the target region. Do not use exploration stops as a shortcut for long-distance navigation.",
@@ -2825,6 +2853,13 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
+        object_alignment_rotation_scope=os.getenv("ROBOT42_OBJECT_ALIGNMENT_ROTATION_SCOPE", "camera_center"),
+        object_alignment_camera_center_forward_m=float(
+            os.getenv("ROBOT42_OBJECT_ALIGNMENT_CAMERA_CENTER_FORWARD_M", "0.23")
+        ),
+        object_alignment_camera_center_lateral_m=float(
+            os.getenv("ROBOT42_OBJECT_ALIGNMENT_CAMERA_CENTER_LATERAL_M", "0.0")
+        ),
     )
 
 
@@ -3224,6 +3259,36 @@ def _bounded_float(value: Any, fallback: float, *, minimum: float, maximum: floa
     except Exception:
         result = float(fallback)
     return min(max(result, minimum), maximum)
+
+
+def _object_alignment_rotation_kwargs(
+    constraints: dict[str, Any],
+    config: HomeAgentConfig,
+) -> dict[str, Any]:
+    scope = str(
+        constraints.get(
+            "object_alignment_rotation_scope",
+            constraints.get("rotation_scope", config.object_alignment_rotation_scope),
+        )
+        or "camera_center"
+    ).strip().lower().replace("-", "_")
+    if scope not in {"camera_center", "rear_drive"}:
+        scope = "camera_center"
+    return {
+        "rotation_scope": scope,
+        "camera_center_forward_m": _bounded_float(
+            constraints.get("camera_center_forward_m", config.object_alignment_camera_center_forward_m),
+            config.object_alignment_camera_center_forward_m,
+            minimum=0.0,
+            maximum=1.0,
+        ),
+        "camera_center_lateral_m": _bounded_float(
+            constraints.get("camera_center_lateral_m", config.object_alignment_camera_center_lateral_m),
+            config.object_alignment_camera_center_lateral_m,
+            minimum=-1.0,
+            maximum=1.0,
+        ),
+    }
 
 
 def _agent_artifacts_root(config: HomeAgentConfig) -> Path:

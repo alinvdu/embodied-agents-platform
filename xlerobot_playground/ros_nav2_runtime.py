@@ -620,6 +620,32 @@ def base_pose_from_rear_axle_pose(
     )
 
 
+def normalized_rotation_scope(value: str | None) -> str:
+    normalized = str(value or "rear_drive").strip().lower().replace("-", "_")
+    if normalized in {"camera", "camera_center", "camera_centred", "sensor", "sensor_center"}:
+        return "camera_center"
+    return "rear_drive"
+
+
+def rear_drive_camera_center_shift(
+    *,
+    delta_yaw_rad: float,
+    camera_forward_m: float,
+    camera_lateral_m: float = 0.0,
+) -> dict[str, Any]:
+    camera_x = float(camera_forward_m)
+    camera_y = float(camera_lateral_m)
+    cos_delta = math.cos(float(delta_yaw_rad))
+    sin_delta = math.sin(float(delta_yaw_rad))
+    shift_x = cos_delta * camera_x - sin_delta * camera_y - camera_x
+    shift_y = sin_delta * camera_x + cos_delta * camera_y - camera_y
+    return {
+        "forward_m": round(shift_x, 4),
+        "lateral_m": round(shift_y, 4),
+        "distance_m": round(math.hypot(shift_x, shift_y), 4),
+    }
+
+
 def rear_axle_rotation_sweep_base_poses(
     *,
     start_base_pose: Pose2D,
@@ -814,8 +840,10 @@ class RosRuntimeConfig:
     manual_spin_direction_sign: float = 1.0
     robot_length_m: float = 0.3913
     robot_width_m: float = 0.459
-    base_link_x_from_wheel_axle_m: float = 0.196
+    base_link_x_from_wheel_axle_m: float = 0.0
     base_link_y_from_wheel_axle_m: float = 0.0
+    camera_center_forward_m: float = 0.23
+    camera_center_lateral_m: float = 0.0
     local_rotation_safety_enabled: bool = False
     local_rotation_safety_padding_m: float = 0.03
     local_rotation_safety_yaw_sample_deg: float = 4.0
@@ -2106,6 +2134,9 @@ class RosExplorationRuntime(Node):
         *,
         delta_yaw_rad: float,
         reason: str = "",
+        rotation_scope: str = "rear_drive",
+        camera_center_forward_m: float | None = None,
+        camera_center_lateral_m: float | None = None,
         should_cancel: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         start_pose = self.current_pose()
@@ -2121,6 +2152,32 @@ class RosExplorationRuntime(Node):
                     "request_reason": reason,
                 },
             )
+        scope = normalized_rotation_scope(rotation_scope)
+        camera_center: dict[str, Any] | None = None
+        if scope == "camera_center":
+            camera_forward = (
+                float(camera_center_forward_m)
+                if camera_center_forward_m is not None
+                else float(getattr(self.config, "camera_center_forward_m", 0.23))
+            )
+            camera_lateral = (
+                float(camera_center_lateral_m)
+                if camera_center_lateral_m is not None
+                else float(getattr(self.config, "camera_center_lateral_m", 0.0))
+            )
+            camera_center = {
+                "forward_m": round(camera_forward, 3),
+                "lateral_m": round(camera_lateral, 3),
+                "estimated_rear_drive_shift": rear_drive_camera_center_shift(
+                    delta_yaw_rad=float(delta_yaw_rad),
+                    camera_forward_m=camera_forward,
+                    camera_lateral_m=camera_lateral,
+                ),
+                "model": (
+                    "Differential drive cannot keep a forward camera point stationary during yaw; "
+                    "rear-drive spin is the minimum final camera displacement for the requested yaw."
+                ),
+            }
         self.set_point_cloud_map_updates_enabled(False)
         self.set_nav_active(True)
         self.set_local_rotation_active(True)
@@ -2142,6 +2199,8 @@ class RosExplorationRuntime(Node):
             extra={
                 "requested_delta_yaw_deg": round(math.degrees(float(delta_yaw_rad)), 2),
                 "request_reason": reason,
+                "rotation_scope": scope,
+                **({"camera_center": camera_center} if camera_center is not None else {}),
                 "spin": event,
             },
         )
@@ -2838,7 +2897,7 @@ class RosExplorationRuntime(Node):
             delta_yaw_rad=float(delta_yaw_rad),
             robot_length_m=float(getattr(self.config, "robot_length_m", 0.3913)),
             robot_width_m=float(getattr(self.config, "robot_width_m", 0.459)),
-            base_link_x_from_wheel_axle_m=float(getattr(self.config, "base_link_x_from_wheel_axle_m", 0.196)),
+            base_link_x_from_wheel_axle_m=float(getattr(self.config, "base_link_x_from_wheel_axle_m", 0.0)),
             base_link_y_from_wheel_axle_m=float(getattr(self.config, "base_link_y_from_wheel_axle_m", 0.0)),
             safety_padding_m=float(getattr(self.config, "local_rotation_safety_padding_m", 0.03)),
             yaw_sample_step_rad=math.radians(float(getattr(self.config, "local_rotation_safety_yaw_sample_deg", 4.0))),
