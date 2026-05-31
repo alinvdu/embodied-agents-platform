@@ -248,7 +248,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.1 \
   --max-angular-rad-s 0.50 \
-  --camera-x-m 0.0 \
+  --camera-x-m 0.24 \
   --camera-y-m 0.0 \
   --camera-z-m 1.05 \
   --camera-yaw-rad 0.0 \
@@ -653,7 +653,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-robot-width-m 0.459 \
   --ros-base-link-x-from-wheel-axle-m 0.0 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
-  --ros-camera-center-forward-m 0.23 \
+  --ros-camera-center-forward-m 0.24 \
   --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8 \
@@ -726,7 +726,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-robot-width-m 0.459 \
   --ros-base-link-x-from-wheel-axle-m 0.0 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
-  --ros-camera-center-forward-m 0.23 \
+  --ros-camera-center-forward-m 0.24 \
   --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8

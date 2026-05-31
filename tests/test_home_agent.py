@@ -905,6 +905,20 @@ class HomeTaskAgentTests(unittest.TestCase):
                         "map": {"robot_pose": dict(current_pose)},
                     }
                 )
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "camera pan reached target",
+                        "camera_pan": {
+                            "status": "succeeded",
+                            "pan_rad": body.get("pan_rad"),
+                            "pan_deg": round(math.degrees(float(body.get("pan_rad", 0.0) or 0.0)), 2),
+                        },
+                        "robot_pose": dict(current_pose),
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
             if request.full_url.endswith("/api/nav/capture_rgb"):
                 return FakeHTTPResponse(
                     {
@@ -936,8 +950,10 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["detection_status"], "not_configured")
         self.assertEqual(result["stops"][0]["navigation"]["status"], "succeeded")
         self.assertEqual(result["stops"][0]["shots"][0]["capture"]["status"], "succeeded")
+        self.assertEqual(result["stops"][0]["shots"][0]["alignment"]["alignment_mode"], "head_pan")
         self.assertEqual(result["stops"][0]["shots"][0]["detection"]["object_label"], "coke can")
         self.assertTrue(any(url.endswith("/api/nav/waypoint") for url, _body in calls))
+        self.assertTrue(any(url.endswith("/api/nav/camera_pan") for url, _body in calls))
         self.assertTrue(any(url.endswith("/api/nav/capture_rgb") for url, _body in calls))
         image_path = Path(result["stops"][0]["shots"][0]["capture"]["image_path"])
         manifest_path = Path(result["stops"][0]["shots"][0]["capture"]["manifest_path"])
@@ -1029,6 +1045,20 @@ class HomeTaskAgentTests(unittest.TestCase):
                             "status": "succeeded",
                             "end_pose": dict(current_pose),
                         },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "camera pan reached target",
+                        "camera_pan": {
+                            "status": "succeeded",
+                            "pan_rad": body.get("pan_rad"),
+                            "pan_deg": round(math.degrees(float(body.get("pan_rad", 0.0) or 0.0)), 2),
+                        },
+                        "robot_pose": dict(current_pose),
                         "map": {"robot_pose": dict(current_pose)},
                     }
                 )
@@ -1129,6 +1159,21 @@ class HomeTaskAgentTests(unittest.TestCase):
                             "status": "succeeded",
                             "end_pose": dict(current_pose),
                         },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                pan_rad = float(body.get("pan_rad", 0.0) or 0.0)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "camera pan reached target",
+                        "camera_pan": {
+                            "status": "succeeded",
+                            "pan_rad": pan_rad,
+                            "pan_deg": round(math.degrees(pan_rad), 2),
+                        },
+                        "robot_pose": dict(current_pose),
                         "map": {"robot_pose": dict(current_pose)},
                     }
                 )
@@ -2262,6 +2307,15 @@ class HomeTaskAgentTests(unittest.TestCase):
                         "map": {"robot_pose": dict(current_pose)},
                     }
                 )
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "failed",
+                        "reason": "camera pan did not complete",
+                        "robot_pose": dict(current_pose),
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
             if request.full_url.endswith("/api/nav/capture_rgb"):
                 raise AssertionError("capture should not run after failed shot alignment")
             raise AssertionError(f"unexpected URL {request.full_url}")
@@ -2275,6 +2329,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                     "shots_per_stop": 1,
                     "allow_auto_rotate": False,
                     "allow_remote_region_exploration": True,
+                    "allow_base_rotation_fallback_for_shots": False,
                 },
             )
 

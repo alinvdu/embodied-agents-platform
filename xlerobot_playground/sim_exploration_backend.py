@@ -158,7 +158,7 @@ class SimExplorationConfig:
     ros_robot_width_m: float = 0.459
     ros_base_link_x_from_wheel_axle_m: float = 0.0
     ros_base_link_y_from_wheel_axle_m: float = 0.0
-    ros_camera_center_forward_m: float = 0.23
+    ros_camera_center_forward_m: float = 0.24
     ros_camera_center_lateral_m: float = 0.0
     ros_local_rotation_safety_enabled: bool = False
     ros_local_rotation_safety_padding_m: float = 0.03
@@ -4199,6 +4199,49 @@ class RosExplorationSession:
                 "map": self._build_map_payload(),
             }
 
+    def set_camera_pan(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        payload = payload or {}
+        with self._lock:
+            self.last_error = None
+            set_pan = getattr(self.runtime, "set_camera_pan", None)
+            if not callable(set_pan):
+                return {
+                    "status": "unavailable",
+                    "reason": "The active ROS runtime does not support camera pan commands.",
+                }
+            try:
+                result = set_pan(
+                    pan_rad=float(payload.get("pan_rad", 0.0) or 0.0),
+                    reason=str(payload.get("reason") or "agent requested camera pan"),
+                    settle_s=(
+                        float(payload["settle_s"])
+                        if payload.get("settle_s") is not None
+                        else None
+                    ),
+                )
+            except Exception as exc:
+                result = {
+                    "status": "failed",
+                    "reason": str(exc),
+                }
+            pose = self.runtime.current_pose()
+            if pose is not None:
+                self._update_pose_history(pose)
+            status = str(result.get("status") or "failed")
+            self.status = f"camera_pan_{status}"
+            self.guardrail_events.append({"type": "camera_pan", "result": result})
+            self._push_progress_update(
+                message=f"Camera pan {status}: {result.get('reason') or ''}".strip(),
+                frontier_id=None,
+            )
+            return {
+                "status": status,
+                "reason": result.get("reason"),
+                "camera_pan": result,
+                "robot_pose": None if pose is None else pose.to_dict(),
+                "map": self._build_map_payload(),
+            }
+
     def capture_rgb_snapshot(self, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         payload = payload or {}
         with self._lock:
@@ -5683,6 +5726,7 @@ class _GatedExplorationUIController(LocalExplorationUIController):
         scan_performer: Callable[[], dict[str, Any]] | None = None,
         relocalizer: Callable[[], dict[str, Any]] | None = None,
         local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        camera_pan_setter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgbd_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         detection_geometry_estimator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -5696,6 +5740,7 @@ class _GatedExplorationUIController(LocalExplorationUIController):
             scan_performer=scan_performer,
             relocalizer=relocalizer,
             local_motion_executor=local_motion_executor,
+            camera_pan_setter=camera_pan_setter,
             rgb_capturer=rgb_capturer,
             rgbd_capturer=rgbd_capturer,
             detection_geometry_estimator=detection_geometry_estimator,
@@ -6112,7 +6157,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
     parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.0)
     parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
-    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.23)
+    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.24)
     parser.add_argument("--ros-camera-center-lateral-m", type=float, default=0.0)
     parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)
@@ -6317,6 +6362,7 @@ def main(argv: list[str] | None = None) -> int:
                 scan_performer=runner.perform_manual_scan,
                 relocalizer=runner.relocalize_here,
                 local_motion_executor=runner.execute_local_motion,
+                camera_pan_setter=runner.set_camera_pan,
                 rgb_capturer=runner.capture_rgb_snapshot,
                 rgbd_capturer=runner.capture_rgbd_snapshot,
                 detection_geometry_estimator=runner.estimate_detection_geometry,
@@ -6331,6 +6377,7 @@ def main(argv: list[str] | None = None) -> int:
                 scan_performer=runner.perform_manual_scan,
                 relocalizer=runner.relocalize_here,
                 local_motion_executor=runner.execute_local_motion,
+                camera_pan_setter=runner.set_camera_pan,
                 rgb_capturer=runner.capture_rgb_snapshot,
                 rgbd_capturer=runner.capture_rgbd_snapshot,
                 detection_geometry_estimator=runner.estimate_detection_geometry,

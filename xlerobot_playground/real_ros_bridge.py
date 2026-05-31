@@ -101,7 +101,7 @@ class RealRosBridgeConfig:
     head_points_only_during_scan: bool = False
     scan_active_topic: str = "/xlerobot/scan_active"
     head_laser_frame: str = "head_laser"
-    camera_x_m: float = 0.0
+    camera_x_m: float = 0.24
     camera_y_m: float = 0.0
     camera_z_m: float = 0.35
     camera_yaw_rad: float = 0.0
@@ -1388,7 +1388,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--head-laser-frame", default="head_laser")
-    parser.add_argument("--camera-x-m", type=float, default=0.0)
+    parser.add_argument("--camera-x-m", type=float, default=0.24)
     parser.add_argument("--camera-y-m", type=float, default=0.0)
     parser.add_argument("--camera-z-m", type=float, default=0.35)
     parser.add_argument("--camera-yaw-rad", type=float, default=0.0)

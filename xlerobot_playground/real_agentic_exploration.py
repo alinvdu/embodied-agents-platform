@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)
     parser.add_argument("--ros-base-link-x-from-wheel-axle-m", type=float, default=0.0)
     parser.add_argument("--ros-base-link-y-from-wheel-axle-m", type=float, default=0.0)
-    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.23)
+    parser.add_argument("--ros-camera-center-forward-m", type=float, default=0.24)
     parser.add_argument("--ros-camera-center-lateral-m", type=float, default=0.0)
     parser.add_argument("--ros-local-rotation-safety-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--ros-local-rotation-safety-padding-m", type=float, default=0.03)

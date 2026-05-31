@@ -196,6 +196,21 @@ class RemoteRosExplorationRuntime:
         event["observation_stop_index"] = int(payload.get("observation_stop_index", 0))
         return event
 
+    def set_camera_pan(
+        self,
+        *,
+        pan_rad: float,
+        reason: str = "",
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "pan_rad": float(pan_rad),
+            "reason": reason,
+        }
+        if settle_s is not None:
+            payload["settle_s"] = float(settle_s)
+        return self._request_json("/api/runtime/camera_pan", payload)
+
     def scan_observation_count(self) -> int:
         payload = self._request_json("/api/runtime/scan_count", {}, method="GET")
         return int(payload.get("count", 0))
@@ -400,6 +415,18 @@ class RosNav2AdapterServer:
                                 "runtime_state": outer._runtime_state_payload(),
                             }
                         )
+                        return
+                    if path == "/api/runtime/camera_pan":
+                        result = outer.runtime.set_camera_pan(
+                            pan_rad=float(payload.get("pan_rad", 0.0) or 0.0),
+                            reason=str(payload.get("reason") or "remote camera pan"),
+                            settle_s=(
+                                float(payload["settle_s"])
+                                if payload.get("settle_s") is not None
+                                else None
+                            ),
+                        )
+                        self._send_json({"status": result.get("status"), "camera_pan": result, "runtime_state": outer._runtime_state_payload()})
                         return
                     if path == "/api/runtime/drain_scan_observations":
                         observations, stop_index = outer.runtime.drain_scan_observations(

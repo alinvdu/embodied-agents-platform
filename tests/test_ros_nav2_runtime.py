@@ -30,15 +30,15 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(RosRuntimeConfig().base_link_x_from_wheel_axle_m, 0.0)
         self.assertGreaterEqual(RosRuntimeConfig().rgbd_update_timeout_s, 0.5)
         self.assertAlmostEqual(RosRuntimeConfig().rgbd_fallback_horizontal_fov_deg, 64.0)
-        self.assertAlmostEqual(RosRuntimeConfig().camera_center_forward_m, 0.23)
+        self.assertAlmostEqual(RosRuntimeConfig().camera_center_forward_m, 0.24)
 
     def test_rear_drive_camera_center_shift_reports_unavoidable_arc(self) -> None:
         shift = rear_drive_camera_center_shift(
             delta_yaw_rad=math.radians(12.0),
-            camera_forward_m=0.23,
+            camera_forward_m=0.24,
         )
 
-        self.assertAlmostEqual(shift["distance_m"], 0.0481, places=4)
+        self.assertAlmostEqual(shift["distance_m"], 0.0502, places=4)
         self.assertGreater(shift["lateral_m"], 0.0)
 
     def test_compute_turn_command_stops_at_target(self) -> None:

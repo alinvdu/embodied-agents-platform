@@ -817,7 +817,7 @@ class RosRuntimeConfig:
     robot_width_m: float = 0.459
     base_link_x_from_wheel_axle_m: float = 0.0
     base_link_y_from_wheel_axle_m: float = 0.0
-    camera_center_forward_m: float = 0.23
+    camera_center_forward_m: float = 0.24
     camera_center_lateral_m: float = 0.0
     local_rotation_safety_enabled: bool = False
     local_rotation_safety_padding_m: float = 0.03
@@ -2133,7 +2133,7 @@ class RosExplorationRuntime(Node):
             camera_forward = (
                 float(camera_center_forward_m)
                 if camera_center_forward_m is not None
-                else float(getattr(self.config, "camera_center_forward_m", 0.23))
+                else float(getattr(self.config, "camera_center_forward_m", 0.24))
             )
             camera_lateral = (
                 float(camera_center_lateral_m)
@@ -2633,6 +2633,41 @@ class RosExplorationRuntime(Node):
             "pan_rad": float(pan_rad),
             "response": result,
         }
+
+    def set_camera_pan(
+        self,
+        *,
+        pan_rad: float,
+        reason: str = "",
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        try:
+            command = self._command_camera_pan(
+                float(pan_rad),
+                robot_brain_url=self.config.robot_brain_url,
+                action_key=self.config.camera_pan_action_key,
+                settle_s=settle_s,
+            )
+            try:
+                self.spin_for(max(float(self.config.camera_pan_settle_s if settle_s is None else settle_s), 0.0))
+            except Exception:
+                pass
+            pose = self.current_pose()
+            return {
+                "status": "succeeded",
+                "reason": reason or "Camera pan target reached.",
+                "pan_rad": round(float(pan_rad), 4),
+                "pan_deg": round(math.degrees(float(pan_rad)), 2),
+                "command": command,
+                "current_pose": None if pose is None else pose.to_dict(),
+            }
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "reason": str(exc),
+                "pan_rad": round(float(pan_rad), 4),
+                "pan_deg": round(math.degrees(float(pan_rad)), 2),
+            }
 
     def snapshot(self) -> dict[str, Any]:
         try:

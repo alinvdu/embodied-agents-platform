@@ -105,6 +105,9 @@ class ExplorationUIController(Protocol):
     def execute_local_motion(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         ...
 
+    def set_camera_pan(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        ...
+
     def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         ...
 
@@ -125,6 +128,7 @@ class LocalExplorationUIController:
         scan_performer: Callable[[], dict[str, Any]] | None = None,
         relocalizer: Callable[[], dict[str, Any]] | None = None,
         local_motion_executor: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        camera_pan_setter: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgb_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         rgbd_capturer: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
         detection_geometry_estimator: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
@@ -137,6 +141,7 @@ class LocalExplorationUIController:
         self.scan_performer = scan_performer
         self.relocalizer = relocalizer
         self.local_motion_executor = local_motion_executor
+        self.camera_pan_setter = camera_pan_setter
         self.rgb_capturer = rgb_capturer
         self.rgbd_capturer = rgbd_capturer
         self.detection_geometry_estimator = detection_geometry_estimator
@@ -263,6 +268,11 @@ class LocalExplorationUIController:
             return {"status": "unavailable", "reason": "No live navigation session is attached to the review UI."}
         return self.local_motion_executor(payload)
 
+    def set_camera_pan(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.camera_pan_setter is None:
+            return {"status": "unavailable", "reason": "No live camera pan controller is attached to the review UI."}
+        return self.camera_pan_setter(payload)
+
     def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         if self.rgb_capturer is None:
             return {"status": "unavailable", "reason": "No live RGB camera stream is attached to the review UI."}
@@ -383,6 +393,9 @@ class RemoteExplorationUIController:
 
     def execute_local_motion(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote local motion is not implemented yet."}
+
+    def set_camera_pan(self, *, payload: dict[str, Any]) -> dict[str, Any]:
+        return {"status": "unavailable", "reason": "Remote camera pan is not implemented yet."}
 
     def capture_rgb_snapshot(self, *, payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "unavailable", "reason": "Remote RGB capture is not implemented yet."}
@@ -1530,6 +1543,9 @@ class ExplorationReviewServer:
                     return
                 if self.path == "/api/nav/local_motion":
                     self._send_json(controller.execute_local_motion(payload=payload))
+                    return
+                if self.path == "/api/nav/camera_pan":
+                    self._send_json(controller.set_camera_pan(payload=payload))
                     return
                 if self.path == "/api/nav/capture_rgb":
                     self._send_json(controller.capture_rgb_snapshot(payload=payload))

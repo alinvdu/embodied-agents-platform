@@ -132,7 +132,7 @@ source /opt/ros/humble/setup.bash
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url http://ROBOT_BRAIN_IP:8765 \
   --publish-rate-hz 30 \
-  --camera-x-m 0.0 \
+  --camera-x-m 0.24 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0

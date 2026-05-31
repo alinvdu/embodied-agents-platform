@@ -92,8 +92,11 @@ class HomeAgentConfig:
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
     object_alignment_rotation_scope: str = "camera_center"
-    object_alignment_camera_center_forward_m: float = 0.23
+    object_alignment_camera_center_forward_m: float = 0.24
     object_alignment_camera_center_lateral_m: float = 0.0
+    region_exploration_use_head_pan_for_shots: bool = True
+    region_exploration_head_pan_limit_deg: float = 180.0
+    region_exploration_head_pan_settle_s: float = 0.25
 
 
 @dataclass
@@ -327,6 +330,22 @@ class HomeAgentToolRuntime:
                 continue
             stop_id = str(stop.get("stop_id") or f"{region_label}_stop_{stop_index}")
             pose = _json_pose(stop["pose"])
+            pre_navigation_camera_pan: dict[str, Any] | None = None
+            if _constraint_bool(
+                constraints,
+                "use_head_pan_for_shots",
+                self.config.region_exploration_use_head_pan_for_shots,
+            ):
+                pre_navigation_camera_pan = self.set_camera_pan(
+                    pan_rad=0.0,
+                    reason=f"Face head camera forward before navigating to exploration stop `{stop_id}`.",
+                    settle_s=_bounded_float(
+                        constraints.get("head_pan_settle_s", self.config.region_exploration_head_pan_settle_s),
+                        self.config.region_exploration_head_pan_settle_s,
+                        minimum=0.0,
+                        maximum=3.0,
+                    ),
+                )
             navigation = self.navigate_to_waypoint(
                 waypoint_id=stop_id,
                 x=pose["x"],
@@ -340,6 +359,8 @@ class HomeAgentToolRuntime:
                 "navigation": navigation,
                 "shots": [],
             }
+            if pre_navigation_camera_pan is not None:
+                stop_execution["pre_navigation_camera_pan"] = pre_navigation_camera_pan
             executed_stops.append(stop_execution)
             if navigation.get("status") != "succeeded":
                 result = {
@@ -366,6 +387,7 @@ class HomeAgentToolRuntime:
                     stop_id=stop_id,
                     shot=shot,
                     tolerance_deg=shot_yaw_tolerance_deg,
+                    constraints=constraints,
                 )
                 shot_execution = {
                     "shot_id": shot_id,
@@ -543,14 +565,49 @@ class HomeAgentToolRuntime:
         stop_id: str,
         shot: dict[str, Any],
         tolerance_deg: float,
+        constraints: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        constraints = constraints or {}
         target_yaw = _bounded_float(shot.get("yaw"), float(self.current_pose.get("yaw", 0.0) or 0.0), minimum=-math.pi, maximum=math.pi)
         delta_yaw_deg = _yaw_delta_deg(float(self.current_pose.get("yaw", 0.0) or 0.0), target_yaw)
+        use_head_pan = _constraint_bool(
+            constraints,
+            "use_head_pan_for_shots",
+            self.config.region_exploration_use_head_pan_for_shots,
+        )
+        head_pan_limit_deg = _bounded_float(
+            constraints.get("head_pan_limit_deg", self.config.region_exploration_head_pan_limit_deg),
+            self.config.region_exploration_head_pan_limit_deg,
+            minimum=0.0,
+            maximum=180.0,
+        )
+        if use_head_pan and abs(delta_yaw_deg) <= head_pan_limit_deg:
+            result = self.set_camera_pan(
+                pan_rad=math.radians(delta_yaw_deg),
+                reason=f"Aim head camera for region exploration shot `{shot.get('shot_id') or stop_id}`.",
+                settle_s=_bounded_float(
+                    constraints.get("head_pan_settle_s", self.config.region_exploration_head_pan_settle_s),
+                    self.config.region_exploration_head_pan_settle_s,
+                    minimum=0.0,
+                    maximum=3.0,
+                ),
+            )
+            result["alignment_mode"] = "head_pan"
+            result["stop_id"] = stop_id
+            result["target_yaw"] = round(target_yaw, 3)
+            result["delta_yaw_deg_requested"] = delta_yaw_deg
+            result["head_pan_deg_requested"] = round(delta_yaw_deg, 3)
+            result["head_pan_limit_deg"] = round(head_pan_limit_deg, 3)
+            if result.get("status") in {"succeeded", "partial"}:
+                return result
+            if not _constraint_bool(constraints, "allow_base_rotation_fallback_for_shots", True):
+                return result
         if abs(delta_yaw_deg) <= tolerance_deg:
             return {
                 "tool": "rotate_by",
                 "status": "skipped",
                 "reason": "Current yaw is already inside shot tolerance.",
+                "alignment_mode": "base_yaw",
                 "stop_id": stop_id,
                 "target_yaw": round(target_yaw, 3),
                 "delta_yaw_deg": delta_yaw_deg,
@@ -561,6 +618,7 @@ class HomeAgentToolRuntime:
             delta_yaw_deg=delta_yaw_deg,
             reason=f"Align to region exploration shot `{shot.get('shot_id') or stop_id}`.",
         )
+        result["alignment_mode"] = "base_yaw"
         result["target_yaw"] = round(target_yaw, 3)
         result["delta_yaw_deg_requested"] = delta_yaw_deg
         result["tolerance_deg"] = tolerance_deg
@@ -2015,6 +2073,52 @@ class HomeAgentToolRuntime:
             payload=payload,
         )
 
+    def set_camera_pan(
+        self,
+        *,
+        pan_rad: float,
+        reason: str = "",
+        settle_s: float | None = None,
+    ) -> dict[str, Any]:
+        if not self.config.exploration_backend_url:
+            result = {
+                "tool": "set_camera_pan",
+                "status": "unavailable",
+                "reason": "No exploration backend URL is configured for camera pan control.",
+            }
+            self.emit("tool_blocked", "Camera Pan", result["reason"], result)
+            return result
+        payload: dict[str, Any] = {
+            "pan_rad": float(pan_rad),
+            "reason": reason,
+        }
+        if settle_s is not None:
+            payload["settle_s"] = float(settle_s)
+        response = _post_exploration_backend(self.config, "/api/nav/camera_pan", payload)
+        result = {
+            "tool": "set_camera_pan",
+            "status": str(response.get("status") or "failed"),
+            "reason": response.get("reason"),
+            "backend_url": self.config.exploration_backend_url,
+            "requested_pan_rad": round(float(pan_rad), 4),
+            "requested_pan_deg": round(math.degrees(float(pan_rad)), 2),
+            "camera_pan": response.get("camera_pan") if isinstance(response.get("camera_pan"), dict) else None,
+            "raw": response,
+        }
+        pose = response.get("robot_pose") if isinstance(response.get("robot_pose"), dict) else None
+        if pose is None and isinstance(response.get("map"), dict):
+            pose = response["map"].get("robot_pose") if isinstance(response["map"].get("robot_pose"), dict) else None
+        if isinstance(pose, dict):
+            self.current_pose = _json_pose(pose)
+            result["current_pose"] = _json_pose(pose)
+        self.emit(
+            "tool_executed" if result.get("status") in {"succeeded", "partial"} else "tool_blocked",
+            "Camera Pan",
+            f"Camera pan returned `{result.get('status')}`: {result.get('reason') or ''}".strip(),
+            result,
+        )
+        return result
+
     def rotate_towards_point(self, *, x: float, y: float, reason: str = "") -> dict[str, Any]:
         return self._local_motion(
             title="Local Rotate Toward Point",
@@ -2451,7 +2555,7 @@ class HomeTaskAgent:
             object_label: str = "",
             constraints_json: str = "{}",
         ) -> str:
-            """Navigate visual-search stops and align the robot to each planned shot cone."""
+            """Navigate visual-search stops and aim the head camera for each planned shot cone."""
             return json.dumps(
                 runtime.execute_region_exploration_plan(
                     region_label=region_label,
@@ -2581,7 +2685,7 @@ class HomeTaskAgent:
                 "- Local motion tools are bounded backend-controlled motions. Use them for orientation, tiny final corrections, or recovery, not for long navigation.",
                 "- rotate_by has rotation_scope='rear_drive' for navigation/body alignment and rotation_scope='camera_center' for camera/object alignment. Use rear_drive when aiming the robot body or a waypoint; use camera_center only when the goal is to center what the head camera sees. The object focus/approach tools choose camera_center internally.",
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
-                "- execute_region_exploration_plan runs that region search motion: it navigates to each inspection stop, rotates to each shot yaw, saves RGB debug shots, and runs object detection when a detector provider is configured.",
+                "- execute_region_exploration_plan runs that region search motion: it navigates the base to each inspection stop, aims the head camera for each shot yaw when possible, saves RGB debug shots, and runs object detection when a detector provider is configured. It uses base rotation for shots only as a fallback when head pan is unavailable or outside limits.",
                 "- execute_region_exploration_plan is for local visual search after the robot is already near the target region. Do not use exploration stops as a shortcut for long-distance navigation.",
                 "- For far object-search regions such as kitchen from another room, first use resolve_navigation_to_region with constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"<object>\"}'. This aims the normal short-horizon waypoint loop at the first useful search/scan stop instead of the room center.",
                 "- If execute_region_exploration_plan returns status='requires_navigation', follow its suggested_navigation by calling resolve_navigation_to_region, then navigate_to_waypoint and relocalize_here until the search-entry waypoint is reached.",
@@ -3025,10 +3129,17 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
         object_alignment_rotation_scope=os.getenv("ROBOT42_OBJECT_ALIGNMENT_ROTATION_SCOPE", "camera_center"),
         object_alignment_camera_center_forward_m=float(
-            os.getenv("ROBOT42_OBJECT_ALIGNMENT_CAMERA_CENTER_FORWARD_M", "0.23")
+            os.getenv("ROBOT42_OBJECT_ALIGNMENT_CAMERA_CENTER_FORWARD_M", "0.24")
         ),
         object_alignment_camera_center_lateral_m=float(
             os.getenv("ROBOT42_OBJECT_ALIGNMENT_CAMERA_CENTER_LATERAL_M", "0.0")
+        ),
+        region_exploration_use_head_pan_for_shots=_env_bool("ROBOT42_REGION_EXPLORATION_USE_HEAD_PAN_FOR_SHOTS", True),
+        region_exploration_head_pan_limit_deg=float(
+            os.getenv("ROBOT42_REGION_EXPLORATION_HEAD_PAN_LIMIT_DEG", "180")
+        ),
+        region_exploration_head_pan_settle_s=float(
+            os.getenv("ROBOT42_REGION_EXPLORATION_HEAD_PAN_SETTLE_S", "0.25")
         ),
     )
 

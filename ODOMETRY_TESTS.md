@@ -166,7 +166,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.1 \
   --max-angular-rad-s 0.50 \
-  --camera-x-m 0.0 \
+  --camera-x-m 0.24 \
   --camera-y-m 0.0 \
   --camera-z-m 0.35 \
   --camera-yaw-rad 0.0 \
