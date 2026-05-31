@@ -621,6 +621,23 @@ def rear_drive_camera_center_shift(
     }
 
 
+def _transform_summary(
+    *,
+    target_frame: str,
+    source_frame: str,
+    translation: Any,
+    quaternion_xyzw: tuple[float, float, float, float],
+) -> dict[str, Any]:
+    yaw_rad = yaw_from_quaternion_xyzw(*quaternion_xyzw)
+    return {
+        "target_frame": target_frame,
+        "source_frame": source_frame,
+        "translation": _point_dict(translation),
+        "yaw_rad": round(yaw_rad, 4),
+        "yaw_deg": round(math.degrees(yaw_rad), 2),
+    }
+
+
 def rear_axle_rotation_sweep_base_poses(
     *,
     start_base_pose: Pose2D,
@@ -1563,6 +1580,12 @@ class RosExplorationRuntime(Node):
             "estimated_pose_camera": _point_dict(object_camera),
             "estimated_pose_base": _point_dict(object_base),
             "estimated_pose_map": None if object_map is None else _point_dict(object_map),
+            "base_from_camera_transform": _transform_summary(
+                target_frame=self.config.base_frame,
+                source_frame=frame_id,
+                translation=base_translation,
+                quaternion_xyzw=base_quaternion,
+            ),
             "current_pose": None if current_pose is None else current_pose.to_dict(),
             "distance_m": round(range_m, 3),
             "forward_m": round(forward_m, 3),
@@ -1770,6 +1793,12 @@ class RosExplorationRuntime(Node):
             "estimated_pose_camera": _point_dict(object_camera),
             "estimated_pose_base": _point_dict(object_base),
             "estimated_pose_map": None if object_map is None else _point_dict(object_map),
+            "base_from_camera_transform": _transform_summary(
+                target_frame=self.config.base_frame,
+                source_frame=frame_id,
+                translation=base_translation,
+                quaternion_xyzw=base_quaternion,
+            ),
             "current_pose": None if current_pose is None else current_pose.to_dict(),
             "distance_m": round(range_m, 3),
             "forward_m": round(forward_m, 3),

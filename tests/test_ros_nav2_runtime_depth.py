@@ -134,6 +134,9 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(result["geometry_source"], "depth_image")
         self.assertEqual(result["camera_info"]["source"], "fallback_horizontal_fov")
+        self.assertEqual(result["base_from_camera_transform"]["target_frame"], "base_link")
+        self.assertEqual(result["base_from_camera_transform"]["source_frame"], "head_camera_link")
+        self.assertAlmostEqual(result["base_from_camera_transform"]["yaw_deg"], 0.0, delta=0.01)
         self.assertAlmostEqual(result["forward_m"], 0.8, delta=0.02)
         self.assertGreater(result["valid_sample_count"], 12)
 

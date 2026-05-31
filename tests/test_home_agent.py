@@ -1753,6 +1753,63 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual([request["primitive"] for request in local_motion_requests[:2]], ["rotate_by", "micro_adjust_to_pose"])
         self.assertEqual(local_motion_requests[0]["delta_yaw_deg"], 12.0)
 
+    def test_runtime_approach_uses_camera_forward_when_base_projection_is_off_axis(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="small bottle of water",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "small bottle",
+                    "confidence": 0.9,
+                    "bbox_xyxy": [280, 80, 360, 280],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.024,
+                        "lateral_m": -0.441,
+                        "distance_m": 1.0,
+                        "bearing_error_deg": -86.95,
+                        "estimated_pose_camera": {"x": 0.42, "y": 0.03, "z": 0.11},
+                        "estimated_pose_base": {"x": 0.024, "y": -0.441, "z": 0.89},
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                raise AssertionError("approach should reuse the tracked detection")
+            if request.full_url.endswith("/api/nav/local_motion"):
+                raise AssertionError("off-axis staging solve should not trigger motion when camera range is in band")
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="small bottle of water",
+                constraints={"allow_surface_alignment": False},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["geometry"]["staging_forward_m"], 0.42)
+        self.assertEqual(
+            result["attempts"][0]["geometry_consistency"]["status"],
+            "using_camera_forward_after_off_axis_base_projection",
+        )
+        self.assertIn("camera-forward", result["reason"])
+
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

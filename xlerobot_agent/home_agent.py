@@ -1149,7 +1149,23 @@ class HomeAgentToolRuntime:
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
             forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
+            original_forward_m = forward_m
+            lateral_m = float(geometry.get("lateral_m", 0.0) or 0.0)
+            planar_distance_m = math.hypot(forward_m, lateral_m)
+            camera_forward_m: float | None = None
+            estimated_pose_camera = geometry.get("estimated_pose_camera")
+            if isinstance(estimated_pose_camera, dict):
+                try:
+                    camera_forward_m = float(estimated_pose_camera.get("x"))
+                except Exception:
+                    camera_forward_m = None
             bearing_error_deg = float(geometry.get("bearing_error_deg", 0.0) or 0.0)
+            bearing_tolerance_deg = _bounded_float(
+                constraints.get("bearing_tolerance_deg", 6.0),
+                6.0,
+                minimum=1.0,
+                maximum=30.0,
+            )
             if allow_surface_alignment and not surface_alignment_attempted:
                 surface_alignment_attempted = True
                 alignment = self._maybe_align_to_object_surface(
@@ -1168,6 +1184,29 @@ class HomeAgentToolRuntime:
                 if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
                     if _constraint_bool(constraints, "relocalize_after_surface_alignment", True):
                         attempt["surface_alignment_relocalization"] = self.relocalize_here()
+                    shot_head_pan_delta_deg = _capture_head_pan_delta_deg(capture)
+                    if (
+                        shot_head_pan_delta_deg is not None
+                        and abs(shot_head_pan_delta_deg) > 1.0
+                        and _constraint_bool(constraints, "reset_head_pan_after_surface_alignment", True)
+                    ):
+                        attempt["post_surface_alignment_camera_pan"] = self.set_camera_pan(
+                            pan_rad=0.0,
+                            reason=(
+                                "Face head camera forward after support-surface alignment; "
+                                "approach geometry must use the base-forward camera frame."
+                            ),
+                            settle_s=_bounded_float(
+                                constraints.get("head_pan_settle_s", self.config.region_exploration_head_pan_settle_s),
+                                self.config.region_exploration_head_pan_settle_s,
+                                minimum=0.0,
+                                maximum=3.0,
+                            ),
+                        )
+                        attempt["post_surface_alignment_camera_pan"]["source_capture_head_pan_delta_deg"] = round(
+                            shot_head_pan_delta_deg,
+                            3,
+                        )
                     surface_alignment_reacquire_pending = _constraint_bool(
                         constraints,
                         "reacquire_after_surface_alignment_miss",
@@ -1273,6 +1312,60 @@ class HomeAgentToolRuntime:
                                 "staging estimate instead of re-detecting."
                             ),
                         }
+            center_reliable_for_camera_range = (
+                center.get("status") != "succeeded"
+                or abs(float(center.get("error_norm", 0.0) or 0.0)) <= max(center_tolerance * 2.5, 0.2)
+                or centered_this_attempt
+            )
+            off_axis_forward_projection = (
+                camera_forward_m is not None
+                and camera_forward_m >= target_min_m
+                and original_forward_m < target_min_m
+                and abs(lateral_m) >= max(0.08, target_min_m * 0.5)
+                and abs(bearing_error_deg) >= max(30.0, bearing_tolerance_deg)
+                and center_reliable_for_camera_range
+            )
+            if off_axis_forward_projection:
+                forward_m = camera_forward_m
+                geometry["staging_forward_m"] = round(forward_m, 3)
+                geometry["staging_source"] = "camera_forward_due_to_off_axis_base_projection"
+                attempt["geometry_consistency"] = {
+                    "status": "using_camera_forward_after_off_axis_base_projection",
+                    "original_forward_m": round(original_forward_m, 3),
+                    "lateral_m": round(lateral_m, 3),
+                    "planar_distance_m": round(planar_distance_m, 3),
+                    "camera_forward_m": round(camera_forward_m, 3),
+                    "bearing_error_deg": round(bearing_error_deg, 3),
+                    "reason": (
+                        "The image-visible object is centered enough for approach, but the base-frame "
+                        "projection is mostly lateral. This usually means the head-camera pan/TF handoff "
+                        "is stale or intentionally off-axis, so camera-forward range is safer than "
+                        "treating base forward as true distance."
+                    ),
+                }
+                if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
+                    if forward_m <= target_max_m:
+                        reason = f"Object is within grasp staging range by camera-forward estimate ({forward_m:.2f} m)."
+                    else:
+                        reason = (
+                            "Object is within grasp staging tolerance by camera-forward estimate "
+                            f"({forward_m:.3f} m, target max {target_max_m:.3f} m)."
+                        )
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "succeeded",
+                        "object_label": label,
+                        "detection_id": detection.get("selected_detection_id"),
+                        "selected_detection": selected,
+                        "geometry": geometry,
+                        "target_tolerance_m": target_tolerance_m,
+                        "attempt_count": attempt_index,
+                        "attempts": attempts,
+                        "reason": reason,
+                    }
+                    self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
+                    self.emit("tool_executed", "Approach Object", result["reason"], result)
+                    return result
             if forward_m <= 0.0:
                 result = {
                     "tool": "approach_detected_object",
@@ -1302,12 +1395,6 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
-            bearing_tolerance_deg = _bounded_float(
-                constraints.get("bearing_tolerance_deg", 6.0),
-                6.0,
-                minimum=1.0,
-                maximum=30.0,
-            )
             use_geometry_bearing_correction = _constraint_bool(
                 constraints,
                 "use_geometry_bearing_correction",
@@ -3523,6 +3610,19 @@ def _bearing_error_deg(current_pose: dict[str, Any], target_pose: dict[str, Any]
 def _yaw_delta_deg(current_yaw: float, target_yaw: float) -> float:
     delta = math.atan2(math.sin(target_yaw - current_yaw), math.cos(target_yaw - current_yaw))
     return round(math.degrees(delta), 2)
+
+
+def _capture_head_pan_delta_deg(capture: dict[str, Any]) -> float | None:
+    shot = capture.get("shot") if isinstance(capture, dict) else None
+    if not isinstance(shot, dict) or shot.get("yaw") is None:
+        return None
+    pose = capture.get("robot_pose") if isinstance(capture.get("robot_pose"), dict) else capture.get("current_pose")
+    if not isinstance(pose, dict) or pose.get("yaw") is None:
+        return None
+    try:
+        return _yaw_delta_deg(float(pose["yaw"]), float(shot["yaw"]))
+    except Exception:
+        return None
 
 
 def _constraint_bool(constraints: dict[str, Any], key: str, default: bool) -> bool:
