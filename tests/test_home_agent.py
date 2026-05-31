@@ -178,6 +178,21 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
         self.assertLess(result["approach_pose"]["y"], result["support_surface"]["hit_point"]["y"])
         self.assertGreater(result["support_surface"]["occupied_sample_count"], 1)
 
+    def test_object_surface_approach_pose_ignores_saved_map_standoff_gate(self) -> None:
+        result = resolve_object_surface_approach_pose(
+            object_surface_memory(),
+            {"x": 1.25, "y": 1.25, "yaw": 0.0},
+            {"x": 2.75, "y": 2.85},
+            min_clearance_m=0.90,
+            standoff_m=0.65,
+            max_alignment_distance_m=3.0,
+        )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertIn("approach_pose", result)
+        self.assertEqual(result["standoff_clearance_check"]["status"], "disabled")
+        self.assertFalse(result["standoff_clearance_check"]["would_have_been_footprint_clear"])
+
     def test_region_navigation_goal_uses_occupancy_when_no_explicit_pose(self) -> None:
         memory = sample_memory()
         memory["regions"][0]["default_waypoints"] = []

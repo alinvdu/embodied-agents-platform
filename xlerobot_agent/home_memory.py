@@ -1102,7 +1102,7 @@ def resolve_object_surface_approach_pose(
         return {
             "tool": "resolve_object_surface_approach_pose",
             "status": "blocked",
-            "reason": "No footprint-clear standoff pose was found in front of the occupied support surface.",
+            "reason": "Could not compute a geometric standoff pose in front of the occupied support surface.",
             "current_pose": start,
             "object_pose": obj,
             "support_surface": _support_surface_payload(hit_point, tangent, normal, support_cells, grid),
@@ -1150,6 +1150,23 @@ def resolve_object_surface_approach_pose(
         "min_clearance_m": round(float(min_clearance_m), 3),
         "standoff_m": round(desired_standoff_m, 3),
         "path": _path_payload(candidate["line_cells"], grid),
+        "standoff_clearance_check": {
+            "status": "disabled",
+            "reason": "Saved-map footprint-clear standoff gating is disabled; using geometric support-surface alignment.",
+            "candidate_cell": (
+                {"cell_x": candidate["cell"][0], "cell_y": candidate["cell"][1]} if candidate.get("cell") else None
+            ),
+            "candidate_clearance_m": (
+                round(float(candidate["clearance_m"]), 3) if candidate.get("clearance_m") is not None else None
+            ),
+            "would_have_been_footprint_clear": bool(candidate.get("footprint_clear", False)),
+            "unsafe_cell_count": int(candidate.get("unsafe_cell_count", 0) or 0),
+            "first_unsafe_cell": (
+                {"cell_x": candidate["first_unsafe_cell"][0], "cell_y": candidate["first_unsafe_cell"][1]}
+                if candidate.get("first_unsafe_cell")
+                else None
+            ),
+        },
         "support_surface": _support_surface_payload(hit_point, tangent, normal, support_cells, grid),
         "ray": _path_payload(ray_cells, grid),
     }
@@ -1713,17 +1730,14 @@ def _surface_approach_candidate(
             x = float(hit_point["x"]) + normal[0] * standoff + tangent[0] * offset
             y = float(hit_point["y"]) + normal[1] * standoff + tangent[1] * offset
             cell = _cell_for_xy(x, y, grid)
-            if cell is None or cell not in footprint_safe_cells:
-                continue
-            line_cells = _bresenham_cells(start_cell, cell)
+            line_cells = _bresenham_cells(start_cell, cell) if cell is not None else []
             unsafe = [line_cell for line_cell in line_cells[1:] if line_cell not in footprint_safe_cells]
-            if unsafe:
-                continue
-            clearance_m = _cell_clearance_m(cell, grid)
+            clearance_m = _cell_clearance_m(cell, grid) if cell is not None else None
+            footprint_clear = cell in footprint_safe_cells and not unsafe if cell is not None else False
             score = (
                 abs(standoff - desired_standoff_m)
                 + abs(offset) * 0.5
-                - min(clearance_m, desired_standoff_m) * 0.05
+                - min(float(clearance_m or 0.0), desired_standoff_m) * 0.05
             )
             scored.append(
                 (
@@ -1734,6 +1748,9 @@ def _surface_approach_candidate(
                         "cell": cell,
                         "line_cells": line_cells,
                         "clearance_m": clearance_m,
+                        "footprint_clear": footprint_clear,
+                        "unsafe_cell_count": len(unsafe),
+                        "first_unsafe_cell": unsafe[0] if unsafe else None,
                     },
                 )
             )
