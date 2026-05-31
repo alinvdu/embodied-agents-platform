@@ -1799,6 +1799,162 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertAlmostEqual(alignment_pose["yaw"], 1.57, delta=0.3)
         self.assertIn("surface_alignment", result["attempts"][0])
 
+    def test_runtime_approach_reacquires_after_surface_alignment_missed_refresh(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=object_surface_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="surface_reacquire_run",
+        )
+        runtime._track_detection_result(
+            object_label="small bottle of water",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "old_det",
+                "selected_detection": {
+                    "detection_id": "old_det",
+                    "label": "small bottle",
+                    "confidence": 0.91,
+                    "bbox_xyxy": [273, 33, 367, 255],
+                },
+            },
+            capture={"shot_id": "old_shot", "image_width": 640, "image_height": 480},
+        )
+        current_pose = dict(runtime.current_pose)
+        geometry_calls = 0
+        local_motion_bodies = []
+        detection_statuses = ["not_found", "not_found", "matched", "matched"]
+
+        def fake_detection(*_args, **kwargs):
+            status = detection_statuses.pop(0)
+            shot_id = kwargs.get("shot_id") or "shot"
+            image_path = kwargs.get("image_path")
+            if status != "matched":
+                return {
+                    "status": "not_found",
+                    "provider": "mock",
+                    "shot_id": shot_id,
+                    "object_label": "small bottle of water",
+                    "detections": [],
+                    "selected_detection_id": None,
+                    "selected_detection": None,
+                    "reason": "mock miss",
+                }
+            detection = {
+                "detection_id": f"{shot_id}_det_1",
+                "label": "small bottle",
+                "confidence": 0.92,
+                "bbox_xyxy": [160, 120, 260, 360],
+                "source_bbox": [160, 120, 260, 360],
+                "image_path": image_path,
+            }
+            return {
+                "status": "matched",
+                "provider": "mock",
+                "shot_id": shot_id,
+                "object_label": "small bottle of water",
+                "detections": [detection],
+                "selected_detection_id": detection["detection_id"],
+                "selected_detection": detection,
+                "reason": "mock reacquired",
+            }
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                forward = 0.70 if geometry_calls < 3 else 0.42
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": forward,
+                        "distance_m": forward,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_map": {"x": 5.7, "y": -0.5, "z": 0.7},
+                        "current_pose": dict(current_pose),
+                        "safety": {
+                            "safe": True,
+                            "safe_forward_step_m": 0.25 if forward > 0.45 else 0.0,
+                            "reason": "clear",
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                primitive = body.get("primitive")
+                if primitive == "micro_adjust_to_pose":
+                    current_pose.update(body["pose"])
+                elif primitive == "rotate_by":
+                    current_pose["yaw"] = current_pose.get("yaw", 0.0) + math.radians(float(body["delta_yaw_deg"]))
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "local motion completed",
+                        "local_motion": {
+                            "primitive": primitive,
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/relocalize"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "skipped",
+                        "message": "Relocalization skipped in test.",
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        alignment = {
+            "tool": "resolve_object_surface_approach_pose",
+            "status": "succeeded",
+            "reason": "surface pose solved",
+            "needs_alignment": True,
+            "approach_pose": {"x": 0.1, "y": 0.0, "yaw": -1.57},
+            "distance_m": 0.2,
+        }
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen), patch(
+            "xlerobot_agent.home_agent.resolve_object_surface_approach_pose",
+            return_value=alignment,
+        ), patch("xlerobot_agent.home_agent.detect_object_in_image", side_effect=fake_detection):
+            result = runtime.approach_detected_object(
+                object_label="small bottle of water",
+                constraints={"max_attempts": 4},
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        reacquire = result["attempts"][1]["surface_alignment_reacquire"]
+        self.assertEqual(reacquire["status"], "matched")
+        self.assertEqual([step["delta_yaw_deg"] for step in reacquire["steps"]], [15.0, -30.0])
+        self.assertEqual(result["attempts"][1]["source"], "surface_alignment_reacquire")
+        self.assertEqual(result["attempts"][1]["image_centering"]["rotation_source"], "image_bbox")
+        primitives = [body["primitive"] for body in local_motion_bodies]
+        self.assertEqual(primitives[:4], ["micro_adjust_to_pose", "rotate_by", "rotate_by", "rotate_by"])
+        self.assertIn("micro_adjust_to_pose", primitives[4:])
+
     def test_runtime_approach_retry_refreshes_detection_without_surface_realign(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

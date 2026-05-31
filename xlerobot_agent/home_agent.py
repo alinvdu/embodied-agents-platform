@@ -88,6 +88,7 @@ class HomeAgentConfig:
     object_approach_step_fraction: float = 0.8
     object_approach_max_attempts: int = 20
     object_approach_max_centering_corrections: int = 1
+    object_approach_surface_reacquire_sweep_deg: float = 15.0
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
     object_alignment_rotation_scope: str = "camera_center"
@@ -905,6 +906,15 @@ class HomeAgentToolRuntime:
             minimum=0,
             maximum=5,
         ))
+        surface_reacquire_sweep_deg = _bounded_float(
+            constraints.get(
+                "surface_alignment_reacquire_sweep_deg",
+                self.config.object_approach_surface_reacquire_sweep_deg,
+            ),
+            self.config.object_approach_surface_reacquire_sweep_deg,
+            minimum=1.0,
+            maximum=45.0,
+        )
         redetect_after_motion_steps = int(_bounded_float(
             constraints.get("redetect_after_motion_steps", 1),
             1,
@@ -929,6 +939,8 @@ class HomeAgentToolRuntime:
         refresh_after_geometry_failure = False
         last_state = state
         surface_alignment_attempted = False
+        surface_alignment_reacquire_pending = False
+        surface_alignment_reacquire_used = False
         centering_correction_count = 0
         retry_policy = None
         if surface_alignment_already_attempted:
@@ -999,15 +1011,60 @@ class HomeAgentToolRuntime:
                 attempt["retry_policy"] = retry_policy
             attempts.append(attempt)
             if detection.get("status") != "matched":
-                result = {
-                    "tool": "approach_detected_object",
-                    "status": "object_lost",
-                    "object_label": label,
-                    "reason": detection.get("reason") or "Object was lost during approach.",
-                    "attempts": attempts,
+                if surface_alignment_reacquire_pending and not surface_alignment_reacquire_used:
+                    surface_alignment_reacquire_used = True
+                    attempt["initial_detection"] = detection
+                    reacquire = self._reacquire_object_after_surface_alignment(
+                        object_label=label,
+                        constraints=constraints,
+                        attempt_index=attempt_index,
+                        sweep_deg=surface_reacquire_sweep_deg,
+                    )
+                    attempt["surface_alignment_reacquire"] = reacquire
+                    surface_alignment_reacquire_pending = False
+                    if reacquire.get("status") == "matched":
+                        reacquired_capture = reacquire.get("capture")
+                        reacquired_detection = reacquire.get("detection")
+                        if isinstance(reacquired_capture, dict) and isinstance(reacquired_detection, dict):
+                            capture = reacquired_capture
+                            detection = reacquired_detection
+                            source = "surface_alignment_reacquire"
+                            attempt["source"] = source
+                            attempt["capture"] = capture
+                            attempt["detection"] = detection
+                            attempt["motion_steps_since_detection"] = 0
+                            last_state = self._resolve_detection_state(
+                                detection_id=str(detection.get("selected_detection_id") or ""),
+                                object_label=label,
+                            )
+                    elif reacquire.get("status") == "blocked":
+                        result = {
+                            "tool": "approach_detected_object",
+                            "status": "blocked",
+                            "object_label": label,
+                            "reason": reacquire.get("reason") or "Object reacquire sweep was blocked after surface alignment.",
+                            "attempts": attempts,
+                        }
+                        self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                        return result
+                if detection.get("status") == "matched":
+                    pass
+                else:
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "object_lost",
+                        "object_label": label,
+                        "reason": detection.get("reason") or "Object was lost during approach.",
+                        "attempts": attempts,
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+            if surface_alignment_reacquire_pending and detection.get("status") == "matched":
+                attempt["post_surface_alignment_detection"] = {
+                    "status": "matched",
+                    "reason": "Object was found after surface alignment; bbox will be trusted for one centering correction.",
                 }
-                self.emit("tool_blocked", "Approach Object", result["reason"], result)
-                return result
+                surface_alignment_reacquire_pending = False
             selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
             geometry = self._estimate_detection_geometry(
                 detection=selected,
@@ -1053,6 +1110,11 @@ class HomeAgentToolRuntime:
                 if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
                     if _constraint_bool(constraints, "relocalize_after_surface_alignment", True):
                         attempt["surface_alignment_relocalization"] = self.relocalize_here()
+                    surface_alignment_reacquire_pending = _constraint_bool(
+                        constraints,
+                        "reacquire_after_surface_alignment_miss",
+                        True,
+                    )
                     motion_steps_since_detection = redetect_after_motion_steps
                     refresh_after_geometry_failure = False
                     continue
@@ -1294,6 +1356,81 @@ class HomeAgentToolRuntime:
             "attempts": attempts,
         }
         self.emit("tool_blocked", "Approach Object", result["reason"], result)
+        return result
+
+    def _reacquire_object_after_surface_alignment(
+        self,
+        *,
+        object_label: str,
+        constraints: dict[str, Any],
+        attempt_index: int,
+        sweep_deg: float,
+    ) -> dict[str, Any]:
+        sweep_deg = float(sweep_deg)
+        result: dict[str, Any] = {
+            "status": "not_found",
+            "reason": (
+                "Object was not detected immediately after surface alignment; "
+                "performed a bounded left/right visual reacquire sweep."
+            ),
+            "sweep_deg": round(sweep_deg, 3),
+            "steps": [],
+        }
+        sweep_steps = (
+            (sweep_deg, "left_15_from_aligned_pose"),
+            (-2.0 * sweep_deg, "right_15_from_aligned_pose"),
+        )
+        for sweep_index, (delta_yaw_deg, step_label) in enumerate(sweep_steps, start=1):
+            step: dict[str, Any] = {
+                "step": sweep_index,
+                "label": step_label,
+                "delta_yaw_deg": round(delta_yaw_deg, 3),
+            }
+            result["steps"].append(step)
+            rotation = self.rotate_by(
+                delta_yaw_deg=delta_yaw_deg,
+                reason=(
+                    f"Reacquire `{object_label}` after surface alignment "
+                    f"with {step_label.replace('_', ' ')}."
+                ),
+                **_object_alignment_rotation_kwargs(constraints, self.config),
+            )
+            step["rotation"] = rotation
+            if rotation.get("status") not in {"succeeded", "partial"}:
+                result["status"] = "blocked"
+                result["reason"] = rotation.get("reason") or "Surface-alignment reacquire rotation failed."
+                return result
+            capture = self._capture_rgb_for_object_tool(
+                tool_name="approach_detected_object_reacquire",
+                object_label=object_label,
+                attempt_index=attempt_index * 10 + sweep_index,
+            )
+            step["capture"] = capture
+            if capture.get("status") != "succeeded":
+                result["status"] = "blocked"
+                result["reason"] = capture.get("reason") or "RGB capture failed during post-alignment reacquire."
+                return result
+            detection = self._detect_object_in_capture(
+                object_label=object_label,
+                shot_id=str(capture.get("shot_id") or f"surface_reacquire_{attempt_index}_{sweep_index}"),
+                capture=capture,
+            )
+            step["detection"] = detection
+            if detection.get("status") == "matched":
+                result.update(
+                    {
+                        "status": "matched",
+                        "reason": (
+                            f"Reacquired `{object_label}` during {step_label.replace('_', ' ')}; "
+                            "trusting this bbox for one centering correction and forward approach."
+                        ),
+                        "capture": capture,
+                        "detection": detection,
+                        "selected_detection_id": detection.get("selected_detection_id"),
+                        "selected_detection": detection.get("selected_detection"),
+                    }
+                )
+                return result
         return result
 
     def _record_object_surface_alignment(
@@ -2452,7 +2589,7 @@ class HomeTaskAgent:
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step until the object is 0.35-0.45m away. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step until the object is 0.35-0.45m away. If the immediate detector refresh after surface alignment misses the object, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approaches instead of returning to region exploration. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
@@ -2880,6 +3017,9 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
         object_approach_max_centering_corrections=int(
             os.getenv("ROBOT42_OBJECT_APPROACH_MAX_CENTERING_CORRECTIONS", "1")
+        ),
+        object_approach_surface_reacquire_sweep_deg=float(
+            os.getenv("ROBOT42_OBJECT_APPROACH_SURFACE_REACQUIRE_SWEEP_DEG", "15")
         ),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
