@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import queue
 from dataclasses import dataclass
 import json
 import math
+import threading
 import time
 from typing import Any
 from urllib import request
 from urllib.parse import urljoin
+
+from xlerobot_playground.imu_transport import build_websocket_url
+
+try:
+    import aiohttp
+except Exception as exc:  # pragma: no cover - runtime dependency guard.
+    aiohttp = None
+    AIOHTTP_IMPORT_ERROR: Exception | None = exc
+else:
+    AIOHTTP_IMPORT_ERROR = None
 
 IMPORT_ERROR: Exception | None = None
 try:
@@ -40,13 +53,17 @@ class PlanarPose:
 class WheelOdometryConfig:
     robot_brain_url: str = "http://127.0.0.1:8765"
     wheel_state_path: str = "/wheel_state"
+    wheel_state_ws_path: str = "/ws/wheel_state"
+    wheel_state_transport: str = "websocket"
+    wheel_state_ws_reconnect_delay_s: float = 1.0
+    wheel_state_ws_queue_size: int = 4096
     odom_topic: str = "/odom"
     odom_reset_topic: str = "/xlerobot/odom/set_pose"
     odom_frame: str = "odom"
     base_frame: str = "base_link"
     nav_active_topic: str = "/xlerobot/nav_active"
     odom_requires_nav_active: bool = False
-    publish_rate_hz: float = 50.0
+    publish_rate_hz: float = 100.0
     http_timeout_s: float = 2.0
     encoder_ticks_per_revolution: float = 4096.0
     wheel_radius_m: float = 0.05
@@ -252,10 +269,59 @@ def integrate_wheel_state_delta(
 
 
 class RobotBrainWheelStateClient:
-    def __init__(self, base_url: str, *, path: str = "/wheel_state", timeout_s: float = 2.0) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        path: str = "/wheel_state",
+        timeout_s: float = 2.0,
+        websocket_path: str = "/ws/wheel_state",
+        transport: str = "websocket",
+        websocket_reconnect_delay_s: float = 1.0,
+        websocket_queue_size: int = 4096,
+    ) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.path = path
         self.timeout_s = float(timeout_s)
+        self.websocket_path = websocket_path
+        self.transport = str(transport).strip().lower()
+        if self.transport not in {"http", "websocket"}:
+            raise ValueError("wheel_state transport must be 'http' or 'websocket'.")
+        self.websocket_reconnect_delay_s = float(websocket_reconnect_delay_s)
+        self._samples: queue.Queue[dict[str, Any]] = queue.Queue(maxsize=max(1, int(websocket_queue_size)))
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._logger: Any | None = None
+        self._connected = False
+        self._received_count = 0
+        self._queue_drop_count = 0
+        self._last_log_received_count = 0
+        self._last_log_s = time.monotonic()
+
+    @property
+    def websocket_url(self) -> str:
+        return build_websocket_url(self.base_url, self.websocket_path)
+
+    def start(self, *, logger: Any | None = None) -> None:
+        self._logger = logger
+        if self.transport != "websocket" or self._thread is not None:
+            return
+        if AIOHTTP_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "Wheel odometry websocket transport requires `aiohttp`. "
+                "Install it with `python -m pip install aiohttp`, or pass --wheel-state-transport http."
+            ) from AIOHTTP_IMPORT_ERROR
+        self._thread = threading.Thread(
+            target=self._run_websocket_thread,
+            name="robot-brain-wheel-state-ws",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, self.websocket_reconnect_delay_s + 1.0))
 
     def get_json(self) -> dict[str, Any]:
         with request.urlopen(urljoin(self.base_url, self.path.lstrip("/")), timeout=self.timeout_s) as response:
@@ -263,6 +329,92 @@ class RobotBrainWheelStateClient:
         if not data:
             return {}
         return json.loads(data.decode("utf-8"))
+
+    def get_pending_json_samples(self) -> list[dict[str, Any]]:
+        if self.transport == "http":
+            return [self.get_json()]
+        samples: list[dict[str, Any]] = []
+        while True:
+            try:
+                samples.append(self._samples.get_nowait())
+            except queue.Empty:
+                break
+        return samples
+
+    def _run_websocket_thread(self) -> None:
+        asyncio.run(self._websocket_loop())
+
+    async def _websocket_loop(self) -> None:
+        timeout = aiohttp.ClientTimeout(total=None, sock_connect=5.0, sock_read=None)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            while not self._stop_event.is_set():
+                try:
+                    self._log_info(f"Connecting wheel_state websocket: {self.websocket_url}")
+                    async with session.ws_connect(self.websocket_url, heartbeat=20.0) as ws:
+                        self._connected = True
+                        self._log_info(f"wheel_state websocket connected: {self.websocket_url}")
+                        while not self._stop_event.is_set():
+                            try:
+                                message = await ws.receive(timeout=1.0)
+                            except asyncio.TimeoutError:
+                                continue
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                payload = message.data
+                            elif message.type == aiohttp.WSMsgType.BINARY:
+                                payload = message.data
+                            elif message.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED):
+                                raise RuntimeError("wheel_state websocket closed")
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                raise ws.exception() or RuntimeError("wheel_state websocket error")
+                            else:
+                                continue
+                            try:
+                                sample = json.loads(payload.decode("utf-8") if isinstance(payload, bytes) else payload)
+                            except Exception as exc:
+                                self._log_warning(f"Failed to decode wheel_state websocket payload: {exc}")
+                                continue
+                            self._enqueue_sample(sample)
+                except Exception as exc:
+                    self._connected = False
+                    if self._stop_event.is_set():
+                        break
+                    self._log_warning(
+                        "wheel_state websocket disconnected: "
+                        f"{exc}; retrying in {self.websocket_reconnect_delay_s:.1f}s"
+                    )
+                    await asyncio.sleep(max(self.websocket_reconnect_delay_s, 0.1))
+
+    def _enqueue_sample(self, sample: dict[str, Any]) -> None:
+        if self._samples.full():
+            try:
+                self._samples.get_nowait()
+                self._queue_drop_count += 1
+            except queue.Empty:
+                pass
+        try:
+            self._samples.put_nowait(sample)
+        except queue.Full:
+            self._queue_drop_count += 1
+        self._received_count += 1
+        if self._received_count % 500 == 0:
+            now_s = time.monotonic()
+            dt = max(now_s - self._last_log_s, 1e-6)
+            delta = self._received_count - self._last_log_received_count
+            self._log_info(
+                "wheel_state websocket "
+                f"rx~={delta / dt:.1f}Hz total={self._received_count} "
+                f"queued={self._samples.qsize()} queue_drops={self._queue_drop_count}"
+            )
+            self._last_log_s = now_s
+            self._last_log_received_count = self._received_count
+
+    def _log_info(self, message: str) -> None:
+        if self._logger is not None:
+            self._logger.info(message)
+
+    def _log_warning(self, message: str) -> None:
+        if self._logger is not None:
+            self._logger.warning(message)
 
 
 class WheelOdometryNode(Node):
@@ -279,10 +431,17 @@ class WheelOdometryNode(Node):
             config.robot_brain_url,
             path=config.wheel_state_path,
             timeout_s=config.http_timeout_s,
+            websocket_path=config.wheel_state_ws_path,
+            transport=config.wheel_state_transport,
+            websocket_reconnect_delay_s=config.wheel_state_ws_reconnect_delay_s,
+            websocket_queue_size=config.wheel_state_ws_queue_size,
         )
+        if hasattr(self.client, "start"):
+            self.client.start(logger=self.get_logger())
         self.axle_pose = PlanarPose(0.0, 0.0, 0.0)
         self._previous_sample: WheelStateSample | None = None
-        self._previous_sample_monotonic_s: float | None = None
+        self._previous_sample_time_s: float | None = None
+        self._last_sample_received_monotonic_s: float | None = None
         self._latest_forward_m_s = 0.0
         self._latest_yaw_rate_rad_s = 0.0
         self._nav_active = False
@@ -294,7 +453,9 @@ class WheelOdometryNode(Node):
         self.timer = self.create_timer(1.0 / max(config.publish_rate_hz, 1e-6), self.step)
         self.get_logger().info(
             "Wheel odometry ready: "
-            f"brain={config.robot_brain_url.rstrip('/')}{config.wheel_state_path} "
+            f"brain={config.robot_brain_url.rstrip('/')} "
+            f"transport={config.wheel_state_transport} "
+            f"wheel_state={config.wheel_state_path} ws={config.wheel_state_ws_path} "
             f"odom={config.odom_topic} frame={config.odom_frame}->{config.base_frame} "
             f"wheel_radius={config.wheel_radius_m:.3f}m track={config.wheel_track_width_m:.3f}m "
             f"base_from_axle=({config.base_link_x_from_wheel_axle_m:.3f},"
@@ -316,7 +477,8 @@ class WheelOdometryNode(Node):
         base_pose = PlanarPose(float(pose.position.x), float(pose.position.y), angle_wrap(yaw))
         self.axle_pose = self._axle_pose_from_base_pose(base_pose)
         self._previous_sample = None
-        self._previous_sample_monotonic_s = None
+        self._previous_sample_time_s = None
+        self._last_sample_received_monotonic_s = None
         self._latest_forward_m_s = 0.0
         self._latest_yaw_rate_rad_s = 0.0
         self._publish_odom(self.get_clock().now().to_msg())
@@ -340,21 +502,35 @@ class WheelOdometryNode(Node):
         self._publish_odom(stamp)
 
     def _poll_and_integrate(self) -> None:
+        payloads = self.client.get_pending_json_samples()
+        if not payloads:
+            if (
+                self._last_sample_received_monotonic_s is not None
+                and time.monotonic() - self._last_sample_received_monotonic_s > self.config.max_sample_dt_s
+            ):
+                self._latest_forward_m_s = 0.0
+                self._latest_yaw_rate_rad_s = 0.0
+            return
+        for payload in payloads:
+            self._integrate_payload(payload)
+
+    def _integrate_payload(self, payload: dict[str, Any]) -> None:
         sample = parse_wheel_state_sample(
-            self.client.get_json(),
+            payload,
             left_wheel_motor=self.config.left_wheel_motor,
             right_wheel_motor=self.config.right_wheel_motor,
         )
-        now_s = time.monotonic()
+        self._last_sample_received_monotonic_s = time.monotonic()
+        sample_time_s = float(sample.timestamp_s) if sample.timestamp_s is not None else time.monotonic()
         previous = self._previous_sample
-        previous_time_s = self._previous_sample_monotonic_s
+        previous_time_s = self._previous_sample_time_s
         self._previous_sample = sample
-        self._previous_sample_monotonic_s = now_s
+        self._previous_sample_time_s = sample_time_s
         if previous is None or previous_time_s is None:
             self._latest_forward_m_s = 0.0
             self._latest_yaw_rate_rad_s = 0.0
             return
-        dt = max(now_s - previous_time_s, 0.0)
+        dt = max(sample_time_s - previous_time_s, 0.0)
         if dt <= 1e-6 or dt > self.config.max_sample_dt_s:
             self._latest_forward_m_s = 0.0
             self._latest_yaw_rate_rad_s = 0.0
@@ -425,6 +601,11 @@ class WheelOdometryNode(Node):
         transform.transform.rotation = _quaternion_msg(qx, qy, qz, qw)
         self.tf_broadcaster.sendTransform(transform)
 
+    def destroy_node(self) -> Any:
+        if hasattr(self.client, "close"):
+            self.client.close()
+        return super().destroy_node()
+
 
 def _quaternion_msg(x: float, y: float, z: float, w: float) -> Any:
     msg = Quaternion()
@@ -441,6 +622,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--wheel-state-path", default="/wheel_state")
+    parser.add_argument("--wheel-state-ws-path", default="/ws/wheel_state")
+    parser.add_argument(
+        "--wheel-state-transport",
+        choices=("websocket", "http"),
+        default="websocket",
+        help="Use the high-rate robot-brain websocket by default; use http only for debug/fallback.",
+    )
+    parser.add_argument("--wheel-state-ws-reconnect-delay-s", type=float, default=1.0)
+    parser.add_argument("--wheel-state-ws-queue-size", type=int, default=4096)
     parser.add_argument("--odom-topic", default="/odom")
     parser.add_argument("--odom-reset-topic", default="/xlerobot/odom/set_pose")
     parser.add_argument("--odom-frame", default="odom")
@@ -452,7 +642,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Only integrate wheel deltas while nav_active is true. Default false keeps local/manual wheel motion visible.",
     )
-    parser.add_argument("--publish-rate-hz", type=float, default=50.0)
+    parser.add_argument("--publish-rate-hz", type=float, default=100.0)
     parser.add_argument("--http-timeout-s", type=float, default=2.0)
     parser.add_argument("--encoder-ticks-per-revolution", type=float, default=4096.0)
     parser.add_argument("--wheel-radius-m", type=float, default=0.0604)
@@ -487,6 +677,10 @@ def config_from_args(args: argparse.Namespace) -> WheelOdometryConfig:
     return WheelOdometryConfig(
         robot_brain_url=args.robot_brain_url,
         wheel_state_path=args.wheel_state_path,
+        wheel_state_ws_path=args.wheel_state_ws_path,
+        wheel_state_transport=args.wheel_state_transport,
+        wheel_state_ws_reconnect_delay_s=args.wheel_state_ws_reconnect_delay_s,
+        wheel_state_ws_queue_size=args.wheel_state_ws_queue_size,
         odom_topic=args.odom_topic,
         odom_reset_topic=args.odom_reset_topic,
         odom_frame=args.odom_frame,

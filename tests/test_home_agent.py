@@ -1515,7 +1515,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["target_tolerance_m"], 0.025)
         self.assertIn("tolerance", result["reason"])
 
-    def test_runtime_approach_refreshes_detector_after_image_centering_rotation(self) -> None:
+    def test_runtime_approach_commits_after_one_image_centering_rotation(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=visual_sweep_memory(),
             config=HomeAgentConfig(
@@ -1540,7 +1540,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         )
         geometry_calls = 0
         capture_calls = 0
-        rotation_requests = []
+        local_motion_requests = []
 
         def fake_urlopen(request, timeout=0):
             nonlocal geometry_calls, capture_calls
@@ -1560,19 +1560,19 @@ class HomeTaskAgentTests(unittest.TestCase):
                     }
                 )
             if request.full_url.endswith("/api/nav/local_motion"):
-                self.assertEqual(body.get("primitive"), "rotate_by")
-                rotation_requests.append(body.get("delta_yaw_deg"))
+                local_motion_requests.append(body)
+                primitive = body.get("primitive")
                 return FakeHTTPResponse(
                     {
                         "status": "succeeded",
-                        "reason": "rotation completed",
+                        "reason": "local motion completed",
                         "local_motion": {
-                            "primitive": "rotate_by",
+                            "primitive": primitive,
                             "status": "succeeded",
                             "start_pose": dict(runtime.current_pose),
-                            "end_pose": dict(runtime.current_pose),
+                            "end_pose": dict(body.get("pose") or runtime.current_pose),
                         },
-                        "map": {"robot_pose": dict(runtime.current_pose)},
+                        "map": {"robot_pose": dict(body.get("pose") or runtime.current_pose)},
                     }
                 )
             if request.full_url.endswith("/api/nav/capture_rgb"):
@@ -1598,9 +1598,10 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(geometry_calls, 2)
         self.assertEqual(capture_calls, 1)
         self.assertEqual(result["attempts"][1]["source"], "detector_refresh")
-        self.assertEqual(result["attempts"][0]["next_action"], "refresh_detector_after_image_centering_rotation")
         self.assertEqual(result["attempts"][0]["image_centering"]["rotation_source"], "image_bbox")
-        self.assertEqual(rotation_requests, [12.0])
+        self.assertEqual(result["attempts"][0]["image_centering"]["next_action"], "commit_forward_approach_without_extra_recentering")
+        self.assertEqual([request["primitive"] for request in local_motion_requests[:2]], ["rotate_by", "micro_adjust_to_pose"])
+        self.assertEqual(local_motion_requests[0]["delta_yaw_deg"], 12.0)
 
     def test_runtime_approach_recenters_negative_forward_geometry_instead_of_too_close(self) -> None:
         runtime = HomeAgentToolRuntime(
@@ -1627,7 +1628,7 @@ class HomeTaskAgentTests(unittest.TestCase):
         )
         geometry_calls = 0
         capture_calls = 0
-        rotation_requests = []
+        local_motion_requests = []
 
         def fake_urlopen(request, timeout=0):
             nonlocal geometry_calls, capture_calls
@@ -1649,19 +1650,19 @@ class HomeTaskAgentTests(unittest.TestCase):
                     }
                 )
             if request.full_url.endswith("/api/nav/local_motion"):
-                self.assertEqual(body.get("primitive"), "rotate_by")
-                rotation_requests.append(body.get("delta_yaw_deg"))
+                local_motion_requests.append(body)
+                primitive = body.get("primitive")
                 return FakeHTTPResponse(
                     {
                         "status": "succeeded",
-                        "reason": "rotation completed",
+                        "reason": "local motion completed",
                         "local_motion": {
-                            "primitive": "rotate_by",
+                            "primitive": primitive,
                             "status": "succeeded",
                             "start_pose": dict(runtime.current_pose),
-                            "end_pose": dict(runtime.current_pose),
+                            "end_pose": dict(body.get("pose") or runtime.current_pose),
                         },
-                        "map": {"robot_pose": dict(runtime.current_pose)},
+                        "map": {"robot_pose": dict(body.get("pose") or runtime.current_pose)},
                     }
                 )
             if request.full_url.endswith("/api/nav/capture_rgb"):
@@ -1686,10 +1687,11 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["status"], "succeeded")
         self.assertEqual(geometry_calls, 2)
         self.assertEqual(capture_calls, 1)
-        self.assertEqual(result["attempts"][0]["geometry_consistency"]["status"], "invalid_forward")
-        self.assertEqual(result["attempts"][0]["next_action"], "refresh_detector_after_image_centering_rotation")
+        self.assertEqual(result["attempts"][0]["geometry_consistency"]["status"], "using_range_after_centering_correction")
         self.assertEqual(result["attempts"][0]["image_centering"]["rotation_source"], "image_bbox")
-        self.assertEqual(rotation_requests, [12.0])
+        self.assertEqual(result["attempts"][0]["image_centering"]["next_action"], "commit_forward_approach_without_extra_recentering")
+        self.assertEqual([request["primitive"] for request in local_motion_requests[:2]], ["rotate_by", "micro_adjust_to_pose"])
+        self.assertEqual(local_motion_requests[0]["delta_yaw_deg"], 12.0)
 
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()

@@ -25,6 +25,7 @@ class WheelOdometryTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertEqual(config.robot_brain_url, "http://127.0.0.1:8765")
+        self.assertEqual(config.wheel_state_transport, "websocket")
         self.assertEqual(config.odom_topic, "/odom")
         self.assertEqual(config.odom_reset_topic, "/xlerobot/odom/set_pose")
         self.assertEqual(config.left_wheel_motor, "base_left_wheel")
@@ -32,9 +33,29 @@ class WheelOdometryTests(unittest.TestCase):
         self.assertEqual(config.left_wheel_position_sign, -1.0)
         self.assertEqual(config.right_wheel_position_sign, 1.0)
         self.assertFalse(config.odom_requires_nav_active)
+        self.assertEqual(config.publish_rate_hz, 100.0)
         self.assertEqual(config.http_timeout_s, 2.0)
+        self.assertEqual(config.wheel_state_ws_path, "/ws/wheel_state")
+        self.assertEqual(config.wheel_state_ws_queue_size, 4096)
         self.assertEqual(config.base_link_x_from_wheel_axle_m, 0.0)
         self.assertEqual(config.base_link_y_from_wheel_axle_m, 0.0)
+
+    def test_parser_can_use_http_wheel_state_transport(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--wheel-state-transport",
+                "http",
+                "--wheel-state-ws-path",
+                "/custom/ws/wheels",
+                "--wheel-state-ws-reconnect-delay-s",
+                "0.25",
+            ]
+        )
+        config = config_from_args(args)
+
+        self.assertEqual(config.wheel_state_transport, "http")
+        self.assertEqual(config.wheel_state_ws_path, "/custom/ws/wheels")
+        self.assertEqual(config.wheel_state_ws_reconnect_delay_s, 0.25)
 
     def test_parser_accepts_base_link_offset_from_wheel_axle(self) -> None:
         args = build_parser().parse_args(

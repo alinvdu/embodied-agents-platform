@@ -60,7 +60,7 @@ def build_websocket_url(base_url: str, path: str) -> str:
     elif parts.scheme in {"ws", "wss"}:
         scheme = parts.scheme
     else:
-        raise ValueError(f"Unsupported IMU URL scheme: {parts.scheme}")
+        raise ValueError(f"Unsupported websocket URL scheme: {parts.scheme}")
     return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
 
 

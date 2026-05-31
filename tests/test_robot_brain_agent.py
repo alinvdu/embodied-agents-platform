@@ -83,6 +83,9 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(config.stream_imu)
         self.assertEqual(config.imu_udp_host, "127.0.0.1")
         self.assertEqual(config.imu_udp_port, 8766)
+        self.assertTrue(config.stream_wheel_state)
+        self.assertEqual(config.wheel_state_stream_rate_hz, 100.0)
+        self.assertEqual(config.wheel_state_ws_client_queue_size, 4096)
         self.assertEqual(config.camera_max_frame_bytes, 16 * 1024 * 1024)
         self.assertEqual(config.camera_log_every, 30)
         self.assertEqual(config.camera_pan_action_key, "head_motor_1.pos")
@@ -102,6 +105,12 @@ class RobotBrainAgentTests(unittest.TestCase):
         config = config_from_args(args)
 
         self.assertFalse(config.stream_imu)
+
+    def test_parser_can_disable_wheel_state_streaming(self) -> None:
+        args = build_parser().parse_args(["--no-stream-wheel-state"])
+        config = config_from_args(args)
+
+        self.assertFalse(config.stream_wheel_state)
 
     def test_parser_accepts_interactive_calibration(self) -> None:
         args = build_parser().parse_args(["--interactive-calibration"])
@@ -140,6 +149,18 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(state["velocities_raw"], {"base_left_wheel": -35, "base_right_wheel": 40})
         self.assertEqual(state["body_velocity"], {"x.vel": 37.5, "theta.vel": 12.5})
         self.assertIn(("Present_Position", ("base_left_wheel", "base_right_wheel"), False, 1), runtime.bus2.reads)
+
+    def test_agent_publishes_wheel_state_snapshot(self) -> None:
+        runtime = FakeRuntime()
+        agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=runtime)
+
+        state = agent.sample_and_publish_wheel_state()
+
+        self.assertEqual(agent.wheel_state_snapshot(), state)
+        stats = agent.wheel_state_stream.stats()
+        self.assertTrue(stats["ready"])
+        self.assertEqual(stats["sample_count"], 1)
+        self.assertEqual(stats["latest_timestamp_s"], state["timestamp_s"])
 
     def test_agent_commands_camera_pitch_and_updates_state(self) -> None:
         runtime = FakeRuntime()

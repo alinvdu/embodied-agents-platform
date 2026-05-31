@@ -100,10 +100,12 @@ python -m xlerobot_playground.robot_brain_agent \
   --camera-pitch-action-offset-deg -28 \
   --camera-pitch-settle-s 0.5 \
   --initial-camera-pitch-deg 0 \
+  --stream-wheel-state \
+  --wheel-state-stream-rate-hz 100 \
   --no-stream-imu
 ```
 
-For wheel-odometry-only mode, add `--no-stream-imu` to `robot_brain_agent`. That keeps robot brain from opening the Orbbec IMU UDP listener or `/ws/imu`; `/wheel_state`, camera control, RGB-D ingest, and `/cmd_vel` still work.
+For wheel-odometry-only mode, keep `--stream-wheel-state --wheel-state-stream-rate-hz 100` and add `--no-stream-imu` to `robot_brain_agent`. That keeps robot brain from opening the Orbbec IMU UDP listener or `/ws/imu`; `/wheel_state`, `/ws/wheel_state`, camera control, RGB-D ingest, and `/cmd_vel` still work.
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
 
@@ -190,6 +192,18 @@ curl http://127.0.0.1:8765/camera/head/pose
 curl http://127.0.0.1:8765/wheel_state
 curl http://127.0.0.1:8765/rgb --output /tmp/brain_rgb.ppm
 curl http://127.0.0.1:8765/depth --output /tmp/brain_depth.pgm
+python - <<'PY'
+import asyncio
+from aiohttp import ClientSession
+
+async def main():
+    async with ClientSession() as session:
+        async with session.ws_connect("ws://127.0.0.1:8765/ws/wheel_state") as ws:
+            first = await ws.receive()
+            print(first.data)
+
+asyncio.run(main())
+PY
 curl http://127.0.0.1:8765/imu
 python - <<'PY'
 import asyncio
@@ -205,7 +219,7 @@ asyncio.run(main())
 PY
 ```
 
-In wheel mode with `--no-stream-imu`, skip the `/imu` curl and websocket check. `/health` should show `"imu_streaming": false`.
+In wheel mode with `--no-stream-imu`, skip the `/imu` curl and IMU websocket check. `/health` should show `"imu_streaming": false` and `"wheel_state_streaming": true`.
 
 The health response should include point-cloud stats after the first RGB-D frame. If `/camera/head/points` is empty on the offload computer, first confirm this sidecar command includes `--enable-point-cloud` and that the sidecar log reports nonzero point counts.
 
@@ -505,11 +519,13 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m xlerobot_playground.wheel_odometry \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --wheel-state-path /wheel_state \
+  --wheel-state-ws-path /ws/wheel_state \
+  --wheel-state-transport websocket \
   --odom-topic /odom \
   --odom-reset-topic /xlerobot/odom/set_pose \
   --odom-frame odom \
   --base-frame base_link \
-  --publish-rate-hz 50 \
+  --publish-rate-hz 100 \
   --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0604 \

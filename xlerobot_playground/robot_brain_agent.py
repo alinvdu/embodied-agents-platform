@@ -57,6 +57,10 @@ class RobotBrainAgentConfig:
     imu_udp_port: int = 8766
     imu_ws_client_queue_size: int = 64
     imu_log_every: int = 200
+    stream_wheel_state: bool = True
+    wheel_state_stream_rate_hz: float = 100.0
+    wheel_state_ws_client_queue_size: int = 4096
+    wheel_state_log_every: int = 500
     camera_max_frame_bytes: int = 16 * 1024 * 1024
     camera_log_every: int = 30
     initial_camera_pitch_rad: float = 0.0
@@ -164,6 +168,100 @@ class ImuStreamState:
         }
 
 
+class WheelStateStreamState:
+    def __init__(self, *, queue_size: int, log_every: int) -> None:
+        self.queue_size = max(1, int(queue_size))
+        self.log_every = max(1, int(log_every))
+        self.latest_sample: dict[str, Any] | None = None
+        self.latest_json: str | None = None
+        self._clients: set[asyncio.Queue[str]] = set()
+        self._sample_count = 0
+        self._sent_count = 0
+        self._queue_drop_count = 0
+        self._read_error_count = 0
+        self._last_rx_log_at = time.monotonic()
+        self._last_rx_log_count = 0
+        self._last_tx_log_at = time.monotonic()
+        self._last_tx_log_count = 0
+        self._last_sample_monotonic_s: float | None = None
+
+    def publish(self, sample: dict[str, Any]) -> None:
+        payload = json.dumps(sample, separators=(",", ":"))
+        self.latest_sample = sample
+        self.latest_json = payload
+        self._sample_count += 1
+        self._last_sample_monotonic_s = time.monotonic()
+        for queue in tuple(self._clients):
+            if queue.full():
+                try:
+                    queue.get_nowait()
+                    self._queue_drop_count += 1
+                except asyncio.QueueEmpty:
+                    pass
+            try:
+                queue.put_nowait(payload)
+            except asyncio.QueueFull:
+                self._queue_drop_count += 1
+        if self._sample_count % self.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - self._last_rx_log_at, 1e-6)
+            delta = self._sample_count - self._last_rx_log_count
+            print(
+                "[robot_brain_agent] wheel_state rx "
+                f"rate~={delta / dt:.1f}Hz total={self._sample_count} "
+                f"clients={len(self._clients)} queue_drops={self._queue_drop_count} "
+                f"read_errors={self._read_error_count}",
+                flush=True,
+            )
+            self._last_rx_log_at = now
+            self._last_rx_log_count = self._sample_count
+
+    def note_read_error(self) -> None:
+        self._read_error_count += 1
+
+    def note_sent(self) -> None:
+        self._sent_count += 1
+        if self._sent_count % self.log_every == 0:
+            now = time.monotonic()
+            dt = max(now - self._last_tx_log_at, 1e-6)
+            delta = self._sent_count - self._last_tx_log_count
+            print(
+                "[robot_brain_agent] wheel_state ws send "
+                f"rate~={delta / dt:.1f}Hz total={self._sent_count} "
+                f"clients={len(self._clients)} queue_drops={self._queue_drop_count}",
+                flush=True,
+            )
+            self._last_tx_log_at = now
+            self._last_tx_log_count = self._sent_count
+
+    def register_client(self) -> asyncio.Queue[str]:
+        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self.queue_size)
+        self._clients.add(queue)
+        if self.latest_json is not None:
+            queue.put_nowait(self.latest_json)
+        return queue
+
+    def unregister_client(self, queue: asyncio.Queue[str]) -> None:
+        self._clients.discard(queue)
+
+    def stats(self) -> dict[str, Any]:
+        age_s = None
+        if self._last_sample_monotonic_s is not None:
+            age_s = max(time.monotonic() - self._last_sample_monotonic_s, 0.0)
+        return {
+            "ready": self.latest_sample is not None,
+            "age_s": None if age_s is None else round(age_s, 3),
+            "sample_count": self._sample_count,
+            "sent_count": self._sent_count,
+            "client_count": len(self._clients),
+            "queue_drop_count": self._queue_drop_count,
+            "read_error_count": self._read_error_count,
+            "latest_timestamp_s": None
+            if self.latest_sample is None
+            else self.latest_sample.get("timestamp_s"),
+        }
+
+
 class RgbdStreamState:
     def __init__(self, *, log_every: int) -> None:
         self.log_every = max(1, int(log_every))
@@ -263,6 +361,10 @@ class RobotBrainAgent:
             queue_size=config.imu_ws_client_queue_size,
             log_every=config.imu_log_every,
         )
+        self.wheel_state_stream = WheelStateStreamState(
+            queue_size=config.wheel_state_ws_client_queue_size,
+            log_every=config.wheel_state_log_every,
+        )
         self.rgbd_stream = RgbdStreamState(log_every=config.camera_log_every)
         self._camera_state_lock = threading.Lock()
         self._camera_pitch_rad = float(config.initial_camera_pitch_rad)
@@ -322,6 +424,9 @@ class RobotBrainAgent:
     def imu_snapshot(self) -> dict[str, Any] | None:
         return self.imu_stream.latest_sample
 
+    def wheel_state_snapshot(self) -> dict[str, Any] | None:
+        return self.wheel_state_stream.latest_sample
+
     def camera_state(self) -> dict[str, Any]:
         with self._camera_state_lock:
             now_s = time.time()
@@ -342,11 +447,20 @@ class RobotBrainAgent:
 
     def wheel_state(self) -> dict[str, Any]:
         """Read live differential-drive wheel feedback from the XLeRobot bus."""
+        return self._read_wheel_state()
+
+    def _runtime_connected(self) -> bool:
+        if bool(getattr(self.runtime, "_connected", False)):
+            return True
+        return bool(getattr(self.runtime, "connected", False))
+
+    def _read_wheel_state(self) -> dict[str, Any]:
         left_motor = self.config.left_wheel_motor
         right_motor = self.config.right_wheel_motor
         wheel_motors = [left_motor, right_motor]
         with self._motion_lock:
-            self.runtime.connect()
+            if not self._runtime_connected():
+                self.runtime.connect()
             robot = self.runtime.robot
             bus = getattr(robot, "bus2", None)
             if bus is None or not hasattr(bus, "sync_read"):
@@ -374,6 +488,11 @@ class RobotBrainAgent:
             "velocities_raw": {key: int(value) for key, value in velocities_raw.items()},
             "body_velocity": body_velocity,
         }
+
+    def sample_and_publish_wheel_state(self) -> dict[str, Any]:
+        state = self._read_wheel_state()
+        self.wheel_state_stream.publish(state)
+        return state
 
     def update_camera_state(
         self,
@@ -648,6 +767,12 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "imu_udp_port": agent.config.imu_udp_port if agent.config.stream_imu else None,
             "imu_ws_path": "/ws/imu" if agent.config.stream_imu else None,
             "imu": agent.imu_stream.stats(),
+            "wheel_state_streaming": agent.config.stream_wheel_state,
+            "wheel_state_stream_rate_hz": agent.config.wheel_state_stream_rate_hz
+            if agent.config.stream_wheel_state
+            else None,
+            "wheel_state_ws_path": "/ws/wheel_state" if agent.config.stream_wheel_state else None,
+            "wheel_state": agent.wheel_state_stream.stats(),
             "rgbd": agent.rgbd_stream.stats(),
             "camera": agent.camera_state(),
         }
@@ -826,9 +951,69 @@ async def _handle_imu_websocket(request: web.Request) -> web.WebSocketResponse:
     return ws
 
 
+async def _wheel_state_sender(agent: RobotBrainAgent, ws: web.WebSocketResponse, queue: asyncio.Queue[str]) -> None:
+    while True:
+        payload = await queue.get()
+        await ws.send_str(payload)
+        agent.wheel_state_stream.note_sent()
+
+
+async def _handle_wheel_state_websocket(request: web.Request) -> web.WebSocketResponse:
+    agent: RobotBrainAgent = request.app["agent"]
+    if not agent.config.stream_wheel_state:
+        raise web.HTTPNotFound(text="Wheel-state stream disabled")
+    ws = web.WebSocketResponse(heartbeat=20.0)
+    await ws.prepare(request)
+    queue = agent.wheel_state_stream.register_client()
+    print(
+        f"[robot_brain_agent] wheel_state websocket connected clients={len(agent.wheel_state_stream._clients)}",
+        flush=True,
+    )
+    sender = asyncio.create_task(_wheel_state_sender(agent, ws, queue))
+    try:
+        async for message in ws:
+            if message.type == WSMsgType.ERROR:
+                raise ws.exception() or RuntimeError("websocket error")
+            if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED):
+                break
+    finally:
+        sender.cancel()
+        try:
+            await sender
+        except asyncio.CancelledError:
+            pass
+        agent.wheel_state_stream.unregister_client(queue)
+        print(
+            f"[robot_brain_agent] wheel_state websocket disconnected clients={len(agent.wheel_state_stream._clients)}",
+            flush=True,
+        )
+    return ws
+
+
+async def _wheel_state_stream_loop(agent: RobotBrainAgent) -> None:
+    period_s = 1.0 / max(float(agent.config.wheel_state_stream_rate_hz), 1e-6)
+    last_error_log_s = 0.0
+    while True:
+        started_s = time.monotonic()
+        try:
+            state = await asyncio.to_thread(agent._read_wheel_state)
+            agent.wheel_state_stream.publish(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            agent.wheel_state_stream.note_read_error()
+            now_s = time.monotonic()
+            if now_s - last_error_log_s >= 2.0:
+                last_error_log_s = now_s
+                print(f"[robot_brain_agent] wheel_state stream read failed: {exc}", flush=True)
+        elapsed_s = time.monotonic() - started_s
+        await asyncio.sleep(max(period_s - elapsed_s, 0.0))
+
+
 async def _runtime_context(app: web.Application) -> Any:
     agent: RobotBrainAgent = app["agent"]
     transport = None
+    wheel_state_task = None
     if agent.config.stream_imu:
         loop = asyncio.get_running_loop()
         transport, _protocol = await loop.create_datagram_endpoint(
@@ -843,9 +1028,24 @@ async def _runtime_context(app: web.Application) -> Any:
         )
     else:
         print("[robot_brain_agent] IMU streaming disabled; UDP/websocket paths are inactive.", flush=True)
+    if agent.config.stream_wheel_state:
+        wheel_state_task = asyncio.create_task(_wheel_state_stream_loop(agent))
+        print(
+            "[robot_brain_agent] wheel_state websocket stream ready: "
+            f"/ws/wheel_state @ {agent.config.wheel_state_stream_rate_hz:.1f}Hz",
+            flush=True,
+        )
+    else:
+        print("[robot_brain_agent] wheel_state websocket stream disabled; HTTP /wheel_state remains available.", flush=True)
     try:
         yield
     finally:
+        if wheel_state_task is not None:
+            wheel_state_task.cancel()
+            try:
+                await wheel_state_task
+            except asyncio.CancelledError:
+                pass
         if transport is not None:
             transport.close()
         await asyncio.to_thread(agent.close)
@@ -870,6 +1070,8 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
     app.router.add_post("/camera/head/pitch", _handle_camera_head_pitch)
     app.router.add_post("/camera/head/pan", _handle_camera_head_pan)
     app.router.add_get("/wheel_state", _handle_wheel_state)
+    if agent.config.stream_wheel_state:
+        app.router.add_get("/ws/wheel_state", _handle_wheel_state_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
     return app
@@ -933,6 +1135,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--imu-udp-port", type=int, default=8766)
     parser.add_argument("--imu-ws-client-queue-size", type=int, default=64)
     parser.add_argument("--imu-log-every", type=int, default=200)
+    parser.add_argument(
+        "--stream-wheel-state",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Poll wheel encoders on the robot brain and expose them over /ws/wheel_state.",
+    )
+    parser.add_argument("--wheel-state-stream-rate-hz", type=float, default=100.0)
+    parser.add_argument("--wheel-state-ws-client-queue-size", type=int, default=4096)
+    parser.add_argument("--wheel-state-log-every", type=int, default=500)
     parser.add_argument("--camera-max-frame-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--camera-log-every", type=int, default=30)
     parser.add_argument("--initial-camera-pitch-rad", type=float, default=0.0)
@@ -1009,6 +1220,10 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         imu_udp_port=args.imu_udp_port,
         imu_ws_client_queue_size=args.imu_ws_client_queue_size,
         imu_log_every=args.imu_log_every,
+        stream_wheel_state=args.stream_wheel_state,
+        wheel_state_stream_rate_hz=args.wheel_state_stream_rate_hz,
+        wheel_state_ws_client_queue_size=args.wheel_state_ws_client_queue_size,
+        wheel_state_log_every=args.wheel_state_log_every,
         camera_max_frame_bytes=args.camera_max_frame_bytes,
         camera_log_every=args.camera_log_every,
         initial_camera_pitch_rad=(
@@ -1044,6 +1259,8 @@ def main(argv: list[str] | None = None) -> int:
         "Robot brain agent ready: "
         f"http://{config.host}:{config.port} robot={config.robot_kind} "
         f"motion_enabled={config.allow_motion_commands} orbbec={config.orbbec_output_dir} "
+        f"wheel_state_ws={'/ws/wheel_state' if config.stream_wheel_state else 'disabled'} "
+        f"wheel_state_rate={config.wheel_state_stream_rate_hz:.1f}Hz "
         + (
             f"imu_udp={config.imu_udp_host}:{config.imu_udp_port} imu_ws=/ws/imu"
             if config.stream_imu

@@ -6,7 +6,7 @@ This runbook defaults to the wheel-encoder odometry stack. The older RGB-D/IMU s
 Default wheel mode:
 Orbbec RGB-D sidecar without IMU
 STS3215 wheel feedback
-  -> robot_brain_agent /wheel_state
+  -> robot_brain_agent /ws/wheel_state
   -> wheel_odometry publishes /odom and odom -> base_link
 
 Optional RGB-D/IMU mode:
@@ -63,16 +63,19 @@ python -m xlerobot_playground.robot_brain_agent \
   --port2 /dev/tty.usbmodem5B140332271 \
   --max-linear-m-s 0.05 \
   --max-angular-rad-s 0.15 \
+  --stream-wheel-state \
+  --wheel-state-stream-rate-hz 100 \
   --no-stream-imu
 ```
 
-`--no-stream-imu` keeps the robot brain from opening the IMU UDP listener or `/ws/imu`.
+`--no-stream-imu` keeps the robot brain from opening the IMU UDP listener or `/ws/imu`. `--stream-wheel-state --wheel-state-stream-rate-hz 100` keeps `/ws/wheel_state` alive for high-rate encoder odometry.
 
 Expected:
 
 - Logs show the HTTP agent is ready on port `8765`.
 - `/health` later reports `"motion_enabled": true`.
 - `/wheel_state` later returns `positions_raw` for `base_left_wheel` and `base_right_wheel`.
+- `/ws/wheel_state` streams the same encoder payload continuously.
 
 ## Terminal RB-2: Orbbec RGB-D Sidecar
 
@@ -292,11 +295,13 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 python -m xlerobot_playground.wheel_odometry \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --wheel-state-path /wheel_state \
+  --wheel-state-ws-path /ws/wheel_state \
+  --wheel-state-transport websocket \
   --odom-topic /odom \
   --odom-reset-topic /xlerobot/odom/set_pose \
   --odom-frame odom \
   --base-frame base_link \
-  --publish-rate-hz 120 \
+  --publish-rate-hz 100 \
   --http-timeout-s 2.0 \
   --encoder-ticks-per-revolution 4096 \
   --wheel-radius-m 0.0604 \
@@ -779,7 +784,7 @@ If rotation direction is wrong:
 
 If yaw is stable but forward odometry is bad:
 
-- Check that `/wheel_state` positions change while the robot moves.
+- Check that `/wheel_state` positions change while the robot moves, and that `ws://ROBOT_BRAIN_IP:8765/ws/wheel_state` is streaming if using the default websocket transport.
 - Tune `--wheel-radius-m` using a measured straight-line run.
 - Confirm only `wheel_odometry` publishes `/odom`.
 

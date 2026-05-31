@@ -87,6 +87,7 @@ class HomeAgentConfig:
     object_approach_step_m: float = 0.25
     object_approach_step_fraction: float = 0.8
     object_approach_max_attempts: int = 20
+    object_approach_max_centering_corrections: int = 1
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
     object_alignment_rotation_scope: str = "camera_center"
@@ -898,6 +899,12 @@ class HomeAgentToolRuntime:
             minimum=1,
             maximum=30,
         ))
+        max_centering_corrections = int(_bounded_float(
+            constraints.get("max_centering_corrections", self.config.object_approach_max_centering_corrections),
+            self.config.object_approach_max_centering_corrections,
+            minimum=0,
+            maximum=5,
+        ))
         redetect_after_motion_steps = int(_bounded_float(
             constraints.get("redetect_after_motion_steps", 1),
             1,
@@ -922,6 +929,7 @@ class HomeAgentToolRuntime:
         refresh_after_geometry_failure = False
         last_state = state
         surface_alignment_attempted = False
+        centering_correction_count = 0
         retry_policy = None
         if surface_alignment_already_attempted:
             retry_policy = {
@@ -1070,6 +1078,7 @@ class HomeAgentToolRuntime:
             should_image_center = (
                 center.get("status") == "succeeded"
                 and abs(float(center["error_norm"])) > center_tolerance
+                and centering_correction_count < max_centering_corrections
             )
             if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
                 if forward_m <= target_max_m:
@@ -1103,6 +1112,7 @@ class HomeAgentToolRuntime:
                         "recenter or refresh before using this range estimate."
                     ),
                 }
+            centered_this_attempt = False
             if should_image_center:
                 rotation = self.rotate_by(
                     delta_yaw_deg=_visual_servo_yaw_step_deg(center, constraints, self.config),
@@ -1125,9 +1135,24 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
-                motion_steps_since_detection = redetect_after_motion_steps
-                attempt["next_action"] = "refresh_detector_after_image_centering_rotation"
-                continue
+                centering_correction_count += 1
+                centered_this_attempt = True
+                attempt["image_centering"]["correction_count"] = centering_correction_count
+                attempt["image_centering"]["max_centering_corrections"] = max_centering_corrections
+                attempt["image_centering"]["next_action"] = "commit_forward_approach_without_extra_recentering"
+                if forward_m <= 0.0:
+                    range_estimate_m = float(geometry.get("distance_m", 0.0) or 0.0)
+                    if range_estimate_m > 0.0:
+                        forward_m = range_estimate_m
+                        attempt["geometry_consistency"] = {
+                            "status": "using_range_after_centering_correction",
+                            "original_forward_m": round(float(geometry.get("forward_m", 0.0) or 0.0), 3),
+                            "range_m": round(range_estimate_m, 3),
+                            "reason": (
+                                "Committed after one bbox-centering correction; using range as the forward "
+                                "staging estimate instead of re-detecting."
+                            ),
+                        }
             if forward_m <= 0.0:
                 result = {
                     "tool": "approach_detected_object",
@@ -1168,7 +1193,11 @@ class HomeAgentToolRuntime:
                 "use_geometry_bearing_correction",
                 center.get("status") != "succeeded",
             )
-            if use_geometry_bearing_correction and abs(bearing_error_deg) > bearing_tolerance_deg:
+            if (
+                use_geometry_bearing_correction
+                and abs(bearing_error_deg) > bearing_tolerance_deg
+                and centering_correction_count < max_centering_corrections
+            ):
                 rotation = self.rotate_by(
                     delta_yaw_deg=max(min(bearing_error_deg, 12.0), -12.0),
                     reason=f"Center `{label}` from RGB-D bearing before forward approach.",
@@ -1209,6 +1238,8 @@ class HomeAgentToolRuntime:
             remaining_to_staging_m = max(forward_m - target_max_m, 0.0)
             desired_forward_step_m = remaining_to_staging_m * step_fraction
             safe_forward_step_m = float(safety.get("safe_forward_step_m", max_step_m) or 0.0)
+            if centered_this_attempt and safe_forward_step_m <= 0.01 and forward_m > target_max_m:
+                safe_forward_step_m = max_step_m
             forward_step = min(safe_forward_step_m, max_step_m, desired_forward_step_m)
             attempt["approach_step"] = {
                 "remaining_to_staging_m": round(remaining_to_staging_m, 3),
@@ -2421,8 +2452,8 @@ class HomeTaskAgent:
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses the RGB bbox center for approach recentering, infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step until the object is 0.35-0.45m away. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
-                "- After each physical rotation or forward approach step, approach_detected_object refreshes detection by default so the next center/distance estimate uses a fresh RGB bbox with the latest depth image.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step until the object is 0.35-0.45m away. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
+                "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
@@ -2847,6 +2878,9 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_step_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_M", "0.25")),
         object_approach_step_fraction=float(os.getenv("ROBOT42_OBJECT_APPROACH_STEP_FRACTION", "0.8")),
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
+        object_approach_max_centering_corrections=int(
+            os.getenv("ROBOT42_OBJECT_APPROACH_MAX_CENTERING_CORRECTIONS", "1")
+        ),
         object_approach_robot_width_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_ROBOT_WIDTH_M", "0.459")),
         object_approach_clearance_m=float(os.getenv("ROBOT42_OBJECT_APPROACH_CLEARANCE_M", "0.06")),
         object_alignment_rotation_scope=os.getenv("ROBOT42_OBJECT_ALIGNMENT_ROTATION_SCOPE", "camera_center"),
