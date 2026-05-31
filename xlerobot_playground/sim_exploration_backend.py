@@ -5908,6 +5908,19 @@ class ExplorationRunner:
             return {"status": "unavailable", "reason": "The active session does not support local motion primitives."}
         return execute(payload)
 
+    def set_camera_pan(self, payload: dict[str, Any]) -> dict[str, Any]:
+        with self._active_session_lock:
+            session = self._active_session
+        if session is None:
+            return {
+                "status": "unavailable",
+                "reason": "No live navigation session is running. Load an environment and click Start Nav Session first.",
+            }
+        set_pan = getattr(session, "set_camera_pan", None)
+        if not callable(set_pan):
+            return {"status": "unavailable", "reason": "The active session does not support camera pan control."}
+        return set_pan(payload)
+
     def capture_rgb_snapshot(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self._active_session_lock:
             session = self._active_session

@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig
 from xlerobot_playground.real_agentic_exploration import build_parser, translated_args
-from xlerobot_playground.sim_exploration_backend import RosExplorationSession, SimExplorationConfig
+from xlerobot_playground.sim_exploration_backend import ExplorationRunner, RosExplorationSession, SimExplorationConfig
 
 
 class RealAgenticExplorationTests(unittest.TestCase):
@@ -142,6 +142,29 @@ class RealAgenticExplorationTests(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "requires the local ROS runtime"):
             RosExplorationSession(config, backend, "task_1")
+
+    def test_runner_delegates_camera_pan_to_active_session(self) -> None:
+        class FakeSession:
+            def __init__(self) -> None:
+                self.payload = None
+
+            def set_camera_pan(self, payload):
+                self.payload = dict(payload)
+                return {"status": "succeeded", "camera_pan": {"pan_rad": payload["pan_rad"]}}
+
+        backend = ExplorationBackend(ExplorationBackendConfig(mode="sim"))
+        runner = ExplorationRunner(
+            SimExplorationConfig(repo_root=".", persist_path="/tmp/robot42-test-map.json"),
+            backend,
+        )
+        session = FakeSession()
+        runner._active_session = session
+        runner._active_session_kind = "navigation_only"
+
+        result = runner.set_camera_pan({"pan_rad": 0.25})
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(session.payload, {"pan_rad": 0.25})
 
 
 if __name__ == "__main__":
