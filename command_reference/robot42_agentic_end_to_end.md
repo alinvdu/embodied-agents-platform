@@ -159,7 +159,7 @@ python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories \
   --exploration-backend-url http://127.0.0.1:8770 \
   --provider openai \
-  --model gpt-5.5 \
+  --model gpt-5.4 \
   --navigation-waypoint-horizon-m 2.0 \
   --max-turns 80 \
   --object-detector-provider replicate_grounding_dino \
@@ -167,7 +167,7 @@ python examples/robot42_agent_backend.py \
   --object-detector-model adirik/grounding-dino \
   --object-detector-box-threshold 0.25 \
   --object-detector-text-threshold 0.25 \
-  --object-detector-min-confidence 0.65 \
+  --object-detector-min-confidence 0.55 \
   --object-detector-max-image-edge-px 1280 \
   --object-detector-jpeg-quality 85 \
   --object-approach-target-min-m 0.2 \

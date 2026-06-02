@@ -26,7 +26,7 @@ class ObjectDetectorConfig:
     model_version: str | None = None
     box_threshold: float = 0.25
     text_threshold: float = 0.25
-    min_confidence: float = 0.65
+    min_confidence: float = 0.55
     timeout_s: float = 90.0
     max_image_edge_px: int = 1280
     jpeg_quality: int = 85
@@ -152,6 +152,8 @@ def _replicate_grounding_dino_detection(
             "reason": prediction.get("error") or f"Replicate prediction ended with status `{status}`.",
             "replicate_prediction_id": prediction.get("id"),
             "replicate_status": status,
+            "replicate_model_version": version,
+            "_replicate_raw_prediction": prediction,
         }
 
     output = prediction.get("output")
@@ -174,8 +176,10 @@ def _replicate_grounding_dino_detection(
         "selected_detection": detections[0] if detections else None,
         "replicate_prediction_id": prediction.get("id"),
         "replicate_status": status,
+        "replicate_model_version": version,
         "provider_result_image_url": result_image,
         "image_preprocess": image_preprocess,
+        "_replicate_raw_prediction": prediction,
         "reason": (
             f"Detected `{object_label}` with Replicate Grounding DINO."
             if detections

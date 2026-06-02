@@ -74,7 +74,7 @@ class HomeAgentConfig:
     object_detector_model_version: str | None = None
     object_detector_box_threshold: float = 0.25
     object_detector_text_threshold: float = 0.25
-    object_detector_min_confidence: float = 0.65
+    object_detector_min_confidence: float = 0.55
     object_detector_timeout_s: float = 90.0
     object_detector_max_image_edge_px: int = 1280
     object_detector_jpeg_quality: int = 85
@@ -2521,7 +2521,7 @@ class HomeTaskAgent:
             command=command,
             memory_summary=summarize_home_memory(memory) if memory else "No home memory loaded.",
         )
-        self.emit("session_started", "Run Started", f"Started HomeTaskAgent for `{command}`.", record.to_dict())
+        self._emit_and_persist(record, "session_started", "Run Started", f"Started HomeTaskAgent for `{command}`.", record.to_dict())
         runtime = HomeAgentToolRuntime(
             memory=memory,
             config=self.config,
@@ -2538,9 +2538,10 @@ class HomeTaskAgent:
         except Exception as exc:
             record.status = "failed"
             record.summary = f"HomeTaskAgent failed: {exc}"
-            self.emit("session_failed", "Run Failed", record.summary, {"error": str(exc)})
+            self._emit_and_persist(record, "session_failed", "Run Failed", record.summary, {"error": str(exc)})
         record.completed_at = time.time()
-        self.emit("session_finished", "Run Finished", record.summary or record.status, record.to_dict())
+        _write_offline_run_record(self.config, record)
+        self._emit_and_persist(record, "session_finished", "Run Finished", record.summary or record.status, record.to_dict())
         return record
 
     def _load_memory(self) -> dict[str, Any] | None:
@@ -2553,9 +2554,30 @@ class HomeTaskAgent:
         def emit(kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
             if details and details.get("tool"):
                 record.actions.append(dict(details))
-            self.emit(kind, title, summary, details)
+            self._emit_and_persist(record, kind, title, summary, details)
 
         return emit
+
+    def _emit_and_persist(
+        self,
+        record: HomeAgentRunRecord,
+        kind: str,
+        title: str,
+        summary: str,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        _append_offline_trace_event(
+            self.config,
+            record.run_id,
+            {
+                "kind": kind,
+                "title": title,
+                "summary": summary,
+                "details": details or {},
+                "timestamp": _timestamp(),
+            },
+        )
+        self.emit(kind, title, summary, details)
 
     def _run_deterministic(
         self,
@@ -3193,7 +3215,7 @@ def config_from_env() -> HomeAgentConfig:
         object_detector_model_version=os.getenv("ROBOT42_OBJECT_DETECTOR_MODEL_VERSION"),
         object_detector_box_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_BOX_THRESHOLD", "0.25")),
         object_detector_text_threshold=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TEXT_THRESHOLD", "0.25")),
-        object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.65")),
+        object_detector_min_confidence=float(os.getenv("ROBOT42_OBJECT_DETECTOR_MIN_CONFIDENCE", "0.55")),
         object_detector_timeout_s=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TIMEOUT_S", "90")),
         object_detector_max_image_edge_px=int(os.getenv("ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX", "1280")),
         object_detector_jpeg_quality=int(os.getenv("ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY", "85")),
@@ -3676,6 +3698,33 @@ def _agent_artifacts_root(config: HomeAgentConfig) -> Path:
     return Path(config.agent_artifacts_root).expanduser()
 
 
+def _agent_run_artifact_dir(config: HomeAgentConfig, run_id: str) -> Path:
+    return _agent_artifacts_root(config) / _safe_artifact_name(run_id)
+
+
+def _append_offline_trace_event(config: HomeAgentConfig, run_id: str, event: dict[str, Any]) -> None:
+    try:
+        run_dir = _agent_run_artifact_dir(config, run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        trace_path = run_dir / "trace_events.jsonl"
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+    except Exception:
+        return
+
+
+def _write_offline_run_record(config: HomeAgentConfig, record: HomeAgentRunRecord) -> None:
+    try:
+        run_dir = _agent_run_artifact_dir(config, record.run_id)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run_record.json").write_text(
+            json.dumps(record.to_dict(), indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    except Exception:
+        return
+
+
 def _object_detector_config(config: HomeAgentConfig) -> ObjectDetectorConfig:
     return ObjectDetectorConfig(
         provider=config.object_detector_provider,
@@ -3879,6 +3928,9 @@ def _record_capture_detection(
     capture: dict[str, Any],
     detection: dict[str, Any],
 ) -> None:
+    raw_artifact = _write_dino_response_artifact(config=config, run_id=run_id, capture=capture, detection=detection)
+    if raw_artifact:
+        detection.update(raw_artifact)
     annotation = _write_detection_annotation_artifact(
         config=config,
         run_id=run_id,
@@ -3917,6 +3969,75 @@ def _record_capture_detection(
         manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     except Exception:
         pass
+
+
+def _write_dino_response_artifact(
+    *,
+    config: HomeAgentConfig,
+    run_id: str,
+    capture: dict[str, Any],
+    detection: dict[str, Any],
+) -> dict[str, Any]:
+    raw_prediction = detection.pop("_replicate_raw_prediction", None)
+    if raw_prediction is None:
+        return {}
+    image_path_value = capture.get("image_path")
+    if not isinstance(image_path_value, str) or not image_path_value:
+        return {}
+    image_path = Path(image_path_value)
+    dino_path = image_path.with_name(f"{image_path.stem}_dino.json")
+    payload = {
+        "capture": {
+            key: capture.get(key)
+            for key in (
+                "run_id",
+                "region_label",
+                "object_label",
+                "stop_id",
+                "shot_id",
+                "image_path",
+                "image_width",
+                "image_height",
+                "robot_pose",
+                "current_pose",
+                "shot",
+                "captured_at",
+            )
+            if capture.get(key) is not None
+        },
+        "detector": {
+            key: detection.get(key)
+            for key in (
+                "provider",
+                "object_label",
+                "shot_id",
+                "status",
+                "reason",
+                "replicate_prediction_id",
+                "replicate_status",
+                "replicate_model_version",
+                "provider_result_image_url",
+                "image_preprocess",
+            )
+            if detection.get(key) is not None
+        },
+        "replicate_prediction": raw_prediction,
+        "saved_at": time.time(),
+    }
+    try:
+        dino_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    except Exception:
+        return {}
+    root = _agent_artifacts_root(config)
+    try:
+        relpath = str(dino_path.relative_to(root))
+    except Exception:
+        relpath = f"{run_id}/vision_report/shots/{dino_path.name}"
+    return {
+        "dino_response_path": str(dino_path),
+        "dino_response_relpath": relpath,
+        "dino_response_url": f"/api/artifacts/{relpath}",
+    }
 
 
 def _write_detection_annotation_artifact(

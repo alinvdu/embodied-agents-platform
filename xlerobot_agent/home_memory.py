@@ -14,12 +14,14 @@ from .memory_discovery import HOME_MEMORY_FILENAME, default_environment_memory_d
 HOME_MEMORY_SCHEMA_VERSION = "home_memory.v1"
 XLEROBOT_FOOTPRINT_LENGTH_M = 0.3913
 XLEROBOT_FOOTPRINT_WIDTH_M = 0.459
-DEFAULT_NAVIGATION_SAFETY_GAP_M = 0.05
+NAV2_FOOTPRINT_PADDING_M = 0.03
+NAV2_INFLATION_RADIUS_M = 0.07
 DEFAULT_ROBOT_FOOTPRINT_RADIUS_M = math.hypot(
     XLEROBOT_FOOTPRINT_LENGTH_M / 2.0,
     XLEROBOT_FOOTPRINT_WIDTH_M / 2.0,
 )
-DEFAULT_NAVIGATION_CLEARANCE_M = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M + DEFAULT_NAVIGATION_SAFETY_GAP_M
+DEFAULT_NAVIGATION_CLEARANCE_M = XLEROBOT_FOOTPRINT_WIDTH_M / 2.0 + NAV2_FOOTPRINT_PADDING_M
+DEFAULT_NAVIGATION_CENTERLINE_PREFERENCE_M = XLEROBOT_FOOTPRINT_WIDTH_M / 2.0 + NAV2_INFLATION_RADIUS_M
 DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M = 2.0
 DEFAULT_REGION_EXPLORATION_FOV_DEG = 65.0
 DEFAULT_REGION_EXPLORATION_SHOTS_PER_STOP = 2
@@ -376,7 +378,8 @@ def resolve_region_navigation_goal(
         }
 
     footprint_radius_m = DEFAULT_ROBOT_FOOTPRINT_RADIUS_M
-    safety_gap_m = max(float(min_clearance_m) - footprint_radius_m, 0.0)
+    lateral_clearance_m = XLEROBOT_FOOTPRINT_WIDTH_M / 2.0 + NAV2_FOOTPRINT_PADDING_M
+    safety_gap_m = max(float(min_clearance_m) - lateral_clearance_m, 0.0)
     footprint_safe_cells = _footprint_safe_cells(grid, min_clearance_m)
     if not footprint_safe_cells:
         return {
@@ -387,6 +390,7 @@ def resolve_region_navigation_goal(
             "region_id": region.get("region_id"),
             "reason": "No known-free cells satisfy the robot footprint clearance.",
             "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "robot_lateral_clearance_m": round(lateral_clearance_m, 3),
             "safety_gap_m": round(safety_gap_m, 3),
             "min_clearance_m": round(float(min_clearance_m), 3),
         }
@@ -427,6 +431,7 @@ def resolve_region_navigation_goal(
             "reachable_candidate_count": 0,
             "footprint_safe_candidate_count": len([cell for cell in region_free_cells if cell in footprint_safe_cells]),
             "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "robot_lateral_clearance_m": round(lateral_clearance_m, 3),
             "safety_gap_m": round(safety_gap_m, 3),
             "min_clearance_m": round(float(min_clearance_m), 3),
         }
@@ -440,6 +445,7 @@ def resolve_region_navigation_goal(
             "reason": "No footprint-safe known-free cells were found inside the region.",
             "candidate_count": len(region_free_cells),
             "robot_footprint_radius_m": round(footprint_radius_m, 3),
+            "robot_lateral_clearance_m": round(lateral_clearance_m, 3),
             "safety_gap_m": round(safety_gap_m, 3),
             "min_clearance_m": round(float(min_clearance_m), 3),
         }
@@ -490,6 +496,15 @@ def resolve_region_navigation_goal(
         target_label=region.get("label") or name_or_label,
         region_id=region.get("region_id"),
     )
+    centerline_waypoints = _centerline_waypoints_payload(
+        path_cells,
+        grid,
+        current_pose,
+        goal_pose,
+        waypoint_horizon_m,
+        target_label=region.get("label") or name_or_label,
+        region_id=region.get("region_id"),
+    )
     status = "succeeded" if best_clearance >= min_clearance_m else "low_clearance"
     return {
         "tool": "resolve_region_navigation_goal",
@@ -499,6 +514,7 @@ def resolve_region_navigation_goal(
         "region_id": region.get("region_id"),
         "goal_pose": goal_pose,
         "next_waypoint": next_waypoint,
+        "centerline_waypoints": centerline_waypoints,
         "source": (
             "home_memory.occupancy_region_inside_edge_approach"
             if goal_selection == "inside_region_edge_approach"
@@ -511,6 +527,7 @@ def resolve_region_navigation_goal(
         "path_clearance_m": round(path_clearance, 3),
         "min_clearance_m": round(float(min_clearance_m), 3),
         "robot_footprint_radius_m": round(footprint_radius_m, 3),
+        "robot_lateral_clearance_m": round(lateral_clearance_m, 3),
         "safety_gap_m": round(safety_gap_m, 3),
         "path_strategy": "footprint_eroded_centerline_weighted_grid",
         "goal_selection": goal_selection,
@@ -1445,7 +1462,12 @@ def _centered_path_cells(
         for neighbor in _neighbors8(cell, traversable):
             clearance = max(_cell_clearance_m(neighbor, grid), float(grid["resolution"]) * 0.25)
             distance = math.hypot(neighbor[0] - cell[0], neighbor[1] - cell[1])
-            centerline_penalty = 1.0 + (1.25 / max(clearance, float(grid["resolution"]) * 0.25))
+            lateral_balance_penalty = _lateral_obstacle_balance_penalty(cell, neighbor, grid)
+            centerline_penalty = (
+                1.0
+                + (1.25 / max(clearance, float(grid["resolution"]) * 0.25))
+                + lateral_balance_penalty * 0.45
+            )
             new_cost = cost_so_far[cell] + distance * centerline_penalty
             if neighbor not in cost_so_far or new_cost < cost_so_far[neighbor]:
                 cost_so_far[neighbor] = new_cost
@@ -1477,6 +1499,40 @@ def _neighbors8(cell: tuple[int, int], traversable: set[tuple[int, int]]) -> tup
                 continue
             result.append(neighbor)
     return tuple(result)
+
+
+def _lateral_obstacle_balance_penalty(
+    previous: tuple[int, int],
+    cell: tuple[int, int],
+    grid: dict[str, Any],
+) -> float:
+    dx = cell[0] - previous[0]
+    dy = cell[1] - previous[1]
+    if dx == 0 and dy == 0:
+        return 0.0
+    left = _lateral_free_distance_m(cell, -dy, dx, grid)
+    right = _lateral_free_distance_m(cell, dy, -dx, grid)
+    if left is None or right is None:
+        return 0.0
+    channel_width = left + right
+    if channel_width <= 1e-9:
+        return 0.0
+    return abs(left - right) / channel_width
+
+
+def _lateral_free_distance_m(
+    cell: tuple[int, int],
+    step_x: int,
+    step_y: int,
+    grid: dict[str, Any],
+) -> float | None:
+    resolution = float(grid["resolution"])
+    max_steps = max(1, int(math.ceil(1.2 / resolution)))
+    for step in range(1, max_steps + 1):
+        probe = (cell[0] + step_x * step, cell[1] + step_y * step)
+        if probe not in grid["free"]:
+            return max(0.0, (step - 0.5) * resolution)
+    return max_steps * resolution
 
 
 def _path_payload(path_cells: list[tuple[int, int]], grid: dict[str, Any]) -> list[dict[str, float]]:
@@ -1556,6 +1612,86 @@ def _next_waypoint_payload(
         remaining_to_goal_m=remaining_m,
         is_final_waypoint=remaining_m <= final_tolerance_m,
     )
+
+
+def _centerline_waypoints_payload(
+    path_cells: list[tuple[int, int]],
+    grid: dict[str, Any],
+    current_pose: dict[str, Any] | None,
+    goal_pose: dict[str, float],
+    horizon_m: float,
+    *,
+    target_label: str,
+    region_id: Any,
+) -> list[dict[str, Any]]:
+    points = _path_points_for_waypoint(path_cells, grid, current_pose, goal_pose)
+    if len(points) < 2:
+        return [
+            _waypoint_payload(
+                target_label,
+                region_id,
+                goal_pose,
+                horizon_m=max(float(horizon_m or DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M), 0.01),
+                distance_from_start_m=0.0,
+                remaining_to_goal_m=0.0,
+                is_final_waypoint=True,
+            )
+        ]
+
+    total_m = _path_length_m(points)
+    if total_m <= 1e-9:
+        return []
+    horizon_m = max(float(horizon_m or DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M), float(grid["resolution"]))
+    final_tolerance_m = max(float(grid["resolution"]) * 2.0, 0.20)
+    distances: list[float] = []
+    next_distance = min(horizon_m, total_m)
+    while next_distance < total_m - final_tolerance_m:
+        distances.append(next_distance)
+        next_distance += horizon_m
+    if not distances or abs(distances[-1] - total_m) > final_tolerance_m:
+        distances.append(total_m)
+
+    waypoints: list[dict[str, Any]] = []
+    for distance_m in distances:
+        pose = _pose_at_path_distance(points, distance_m)
+        remaining_m = max(total_m - distance_m, 0.0)
+        waypoints.append(
+            _waypoint_payload(
+                target_label,
+                region_id,
+                pose,
+                horizon_m=horizon_m,
+                distance_from_start_m=distance_m,
+                remaining_to_goal_m=remaining_m,
+                is_final_waypoint=remaining_m <= final_tolerance_m,
+            )
+        )
+    return waypoints
+
+
+def _pose_at_path_distance(points: list[dict[str, Any]], target_m: float) -> dict[str, float]:
+    travelled_m = 0.0
+    for previous, nxt in zip(points, points[1:]):
+        dx = float(nxt["x"]) - float(previous["x"])
+        dy = float(nxt["y"]) - float(previous["y"])
+        segment_m = math.hypot(dx, dy)
+        if segment_m <= 1e-9:
+            continue
+        if travelled_m + segment_m >= target_m:
+            ratio = max(0.0, min((target_m - travelled_m) / segment_m, 1.0))
+            return {
+                "x": round(float(previous["x"]) + dx * ratio, 3),
+                "y": round(float(previous["y"]) + dy * ratio, 3),
+                "yaw": round(math.atan2(dy, dx), 3),
+            }
+        travelled_m += segment_m
+    if len(points) >= 2:
+        previous = points[-2]
+        nxt = points[-1]
+        yaw = math.atan2(float(nxt["y"]) - float(previous["y"]), float(nxt["x"]) - float(previous["x"]))
+    else:
+        yaw = _resolved_goal_yaw(points[-1] if points else None)
+    return {**_json_pose(points[-1]), "yaw": round(yaw, 3)}
 
 
 def _explicit_waypoint_payload(

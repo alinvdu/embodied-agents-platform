@@ -7,6 +7,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from xlerobot_agent import home_agent
 from xlerobot_agent.home_agent import (
     HomeAgentConfig,
     HomeAgentController,
@@ -433,6 +434,61 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
 
 
 class HomeTaskAgentTests(unittest.TestCase):
+    def test_record_capture_detection_writes_dino_response_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            run_id = "run_dino"
+            root = Path(tmpdir)
+            shots_dir = root / run_id / "vision_report" / "shots"
+            shots_dir.mkdir(parents=True)
+            image_path = shots_dir / "kitchen_stop_1_yaw_-60.png"
+            image_path.write_bytes(b"not a real png")
+            metadata_path = shots_dir / "kitchen_stop_1_yaw_-60.json"
+            capture = {
+                "run_id": run_id,
+                "region_label": "kitchen",
+                "object_label": "small bottle of water",
+                "stop_id": "kitchen_stop_1",
+                "shot_id": "yaw_-60",
+                "image_path": str(image_path),
+                "metadata_path": str(metadata_path),
+                "image_width": 640,
+                "image_height": 480,
+            }
+            metadata_path.write_text(json.dumps(capture), encoding="utf-8")
+            manifest_path = root / run_id / "vision_report" / "manifest.json"
+            manifest_path.write_text(json.dumps({"run_id": run_id, "captures": [dict(capture)]}), encoding="utf-8")
+            detection = {
+                "status": "not_found",
+                "provider": "replicate_grounding_dino",
+                "object_label": "small bottle of water",
+                "shot_id": "yaw_-60",
+                "replicate_prediction_id": "prediction-1",
+                "replicate_status": "succeeded",
+                "replicate_model_version": "version-1",
+                "reason": "No detections above threshold.",
+                "_replicate_raw_prediction": {
+                    "id": "prediction-1",
+                    "status": "succeeded",
+                    "output": {"detections": [{"label": "bottle", "score": 0.61, "bbox": [1, 2, 3, 4]}]},
+                },
+            }
+
+            home_agent._record_capture_detection(
+                config=HomeAgentConfig(agent_artifacts_root=str(root)),
+                run_id=run_id,
+                capture=capture,
+                detection=detection,
+            )
+
+            dino_path = shots_dir / "kitchen_stop_1_yaw_-60_dino.json"
+            self.assertTrue(dino_path.is_file())
+            dino_payload = json.loads(dino_path.read_text(encoding="utf-8"))
+            self.assertEqual(dino_payload["replicate_prediction"]["output"]["detections"][0]["score"], 0.61)
+            self.assertEqual(detection["dino_response_relpath"], f"{run_id}/vision_report/shots/{dino_path.name}")
+            self.assertNotIn("_replicate_raw_prediction", detection)
+            updated_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            self.assertEqual(updated_metadata["detection"]["dino_response_path"], str(dino_path))
+
     def test_mock_agent_resolves_navigation_to_known_region(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = Path(tmpdir) / "house.home_memory.json"

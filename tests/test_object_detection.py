@@ -124,7 +124,7 @@ class ObjectDetectionTest(unittest.TestCase):
                         "status": "succeeded",
                         "output": {
                             "detections": [
-                                {"label": "small bottle", "score": 0.63, "bbox": [10, 20, 110, 220]},
+                                {"label": "small bottle", "score": 0.53, "bbox": [10, 20, 110, 220]},
                             ],
                         },
                     }
@@ -144,7 +144,7 @@ class ObjectDetectionTest(unittest.TestCase):
 
         self.assertEqual(result["status"], "not_found")
         self.assertEqual(result["detections"], [])
-        self.assertIn("0.65", result["reason"])
+        self.assertIn("0.55", result["reason"])
 
     def test_replicate_preprocess_resizes_image_and_maps_boxes_back_to_source_pixels(self) -> None:
         if object_detection.Image is None:
