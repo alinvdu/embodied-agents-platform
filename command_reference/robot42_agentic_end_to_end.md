@@ -21,6 +21,7 @@ python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories \
   --provider openai \
   --model gpt-5.5 \
+  --agent-tool-output-mode compact \
   --exploration-backend-url http://127.0.0.1:8770 \
   --navigation-waypoint-horizon-m 2.0 \
   --navigation-auto-rotate-threshold-deg 45 \
@@ -160,6 +161,7 @@ python examples/robot42_agent_backend.py \
   --exploration-backend-url http://127.0.0.1:8770 \
   --provider openai \
   --model gpt-5.4 \
+  --agent-tool-output-mode compact \
   --navigation-waypoint-horizon-m 2.0 \
   --max-turns 80 \
   --object-detector-provider replicate_grounding_dino \
@@ -170,8 +172,8 @@ python examples/robot42_agent_backend.py \
   --object-detector-min-confidence 0.55 \
   --object-detector-max-image-edge-px 1280 \
   --object-detector-jpeg-quality 85 \
-  --object-approach-target-min-m 0.2 \
-  --object-approach-target-max-m 0.3 \
+  --object-approach-target-min-m 0.3 \
+  --object-approach-target-max-m 0.35 \
   --object-approach-target-tolerance-m 0.025 \
   --object-approach-step-m 0.25 \
   --object-approach-step-fraction 0.8 \
@@ -227,6 +229,7 @@ python examples/robot42_agent_backend.py \
   --memory-root ./artifacts/memories \
   --provider openai \
   --model gpt-5.5 \
+  --agent-tool-output-mode compact \
   --exploration-backend-url http://127.0.0.1:8770 \
   --navigation-waypoint-horizon-m 1.5 \
   --navigation-auto-rotate-threshold-deg 45 \

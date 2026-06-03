@@ -434,6 +434,169 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
 
 
 class HomeTaskAgentTests(unittest.TestCase):
+    def test_agent_tool_compaction_keeps_navigation_decision_contract(self) -> None:
+        full = {
+            "tool": "resolve_navigation_to_region",
+            "status": "succeeded",
+            "target_label": "kitchen",
+            "reason": "Resolved kitchen.",
+            "current_pose": {"x": 0.0, "y": 0.0, "yaw": 0.0},
+            "goal_pose": {"x": 4.0, "y": 2.0, "yaw": 1.57},
+            "next_waypoint": {
+                "waypoint_id": "kitchen_search_entry_1",
+                "x": 1.7,
+                "y": 0.8,
+                "yaw": 0.4,
+                "is_final_waypoint": False,
+            },
+            "path": [
+                {"x": 0.0, "y": 0.0, "yaw": 0.0},
+                {"x": 0.9, "y": 0.4, "yaw": 0.2},
+                {"x": 1.7, "y": 0.8, "yaw": 0.4},
+            ],
+        }
+
+        compact = home_agent._compact_agent_tool_result(full, tool_name="resolve_navigation_to_region")
+
+        self.assertEqual(compact["next_recommended_tool"], "navigate_to_waypoint")
+        self.assertEqual(compact["next_waypoint"]["waypoint_id"], "kitchen_search_entry_1")
+        self.assertEqual(compact["next_waypoint"]["x"], 1.7)
+        self.assertNotIn("path", compact)
+        self.assertEqual(compact["path_summary"]["point_count"], 3)
+
+    def test_agent_tool_compaction_keeps_object_search_decision_contract(self) -> None:
+        full = {
+            "tool": "execute_region_exploration_plan",
+            "status": "object_found",
+            "region_label": "kitchen",
+            "object_label": "small yellow bottle",
+            "reason": "Detected object.",
+            "plan": {"stops": [{"very": "large"}]},
+            "stops": [
+                {
+                    "stop_id": "kitchen_stop_1",
+                    "pose": {"x": 5.0, "y": 0.2, "yaw": -1.4},
+                    "navigation": {"status": "succeeded", "current_pose": {"x": 5.0, "y": 0.2, "yaw": -1.4}},
+                    "shots": [
+                        {
+                            "shot_id": "yaw_-60",
+                            "yaw_deg": -60,
+                            "alignment": {"status": "succeeded", "reason": "head pan"},
+                            "capture": {
+                                "status": "succeeded",
+                                "artifact_url": "/api/artifacts/shot.png",
+                                "metadata_url": "/api/artifacts/shot.json",
+                                "image_path": "/tmp/full/path/shot.png",
+                            },
+                            "detection": {
+                                "status": "matched",
+                                "selected_detection_id": "det_1",
+                                "detections": [{"detection_id": "det_1"}, {"detection_id": "det_2"}],
+                                "selected_detection": {
+                                    "detection_id": "det_1",
+                                    "label": "small yellow bottle",
+                                    "confidence": 0.9221,
+                                    "bbox_xyxy": [1, 2, 3, 4],
+                                },
+                            },
+                        }
+                    ],
+                }
+            ],
+            "detection_status": "matched",
+            "selected_detection_id": "det_1",
+            "selected_detection": {
+                "detection_id": "det_1",
+                "label": "small yellow bottle",
+                "confidence": 0.9221,
+                "bbox_xyxy": [1, 2, 3, 4],
+            },
+            "detection": {
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "detections": [{"detection_id": f"det_{index}"} for index in range(20)],
+            },
+        }
+
+        compact = home_agent._compact_agent_tool_result(full, tool_name="execute_region_exploration_plan")
+
+        self.assertEqual(compact["next_recommended_tool"], "focus_detected_object")
+        self.assertEqual(compact["selected_detection_id"], "det_1")
+        self.assertEqual(compact["selected_detection"]["confidence"], 0.922)
+        self.assertEqual(compact["detection"]["detection_count"], 20)
+        self.assertNotIn("plan", compact)
+        self.assertNotIn("stops", compact)
+        self.assertEqual(compact["last_stop"]["last_shot"]["capture"]["artifact_url"], "/api/artifacts/shot.png")
+
+    def test_agent_tool_compaction_keeps_approach_decision_contract(self) -> None:
+        full = {
+            "tool": "approach_detected_object",
+            "status": "succeeded",
+            "object_label": "small yellow bottle",
+            "detection_id": "det_1",
+            "reason": "Object is within grasp staging range.",
+            "selected_detection": {
+                "detection_id": "det_1",
+                "label": "small yellow bottle",
+                "confidence": 0.92,
+                "bbox_xyxy": [260, 210, 340, 478],
+            },
+            "geometry": {
+                "status": "succeeded",
+                "forward_m": 0.361,
+                "staging_forward_m": 0.214,
+                "staging_source": "camera_forward_x",
+                "estimated_pose_camera": {"x": 0.214, "y": -0.018, "z": 0.11},
+                "safety": {"safe": True, "safe_forward_step_m": 0.049},
+            },
+            "attempts": [
+                {
+                    "attempt": index,
+                    "capture": {"image_path": f"/tmp/shot_{index}.png", "metadata_path": f"/tmp/shot_{index}.json"},
+                    "geometry": {
+                        "status": "succeeded",
+                        "staging_forward_m": 0.214,
+                        "staging_source": "camera_forward_x",
+                    },
+                }
+                for index in range(20)
+            ],
+        }
+
+        compact = home_agent._compact_agent_tool_result(full, tool_name="approach_detected_object")
+
+        self.assertEqual(compact["next_recommended_tool"], "grab_object")
+        self.assertEqual(compact["geometry"]["staging_forward_m"], 0.214)
+        self.assertEqual(compact["geometry"]["staging_source"], "camera_forward_x")
+        self.assertEqual(compact["last_attempt"]["attempt"], 19)
+        self.assertNotIn("attempts", compact)
+        self.assertNotIn("capture", compact["last_attempt"])
+
+    def test_agent_tool_model_result_can_return_full_output_for_debugging(self) -> None:
+        full = {
+            "tool": "approach_detected_object",
+            "status": "succeeded",
+            "attempts": [{"attempt": 1}],
+        }
+
+        compact = home_agent._agent_tool_model_result(
+            full,
+            tool_name="approach_detected_object",
+            config=HomeAgentConfig(agent_artifacts_root="/tmp/robot42-agent-tests"),
+            run_id="run_1",
+        )
+        uncompressed = home_agent._agent_tool_model_result(
+            full,
+            tool_name="approach_detected_object",
+            config=HomeAgentConfig(agent_tool_output_mode="full"),
+            run_id="run_1",
+        )
+
+        self.assertEqual(compact["model_visible_output"], "compact")
+        self.assertIn("full_details_ref", compact)
+        self.assertNotIn("attempts", compact)
+        self.assertIn("attempts", uncompressed)
+
     def test_record_capture_detection_writes_dino_response_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             run_id = "run_dino"

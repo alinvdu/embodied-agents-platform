@@ -58,6 +58,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-approach-max-attempts", type=int, default=None)
     parser.add_argument("--object-approach-robot-width-m", type=float, default=None)
     parser.add_argument("--object-approach-clearance-m", type=float, default=None)
+    parser.add_argument("--agent-tool-output-mode", choices=("compact", "full"), default=None)
     parser.add_argument("--specialist-provider", choices=("openai", "openai-compatible", "litellm"), default=None)
     parser.add_argument("--specialist-model", default=None)
     parser.add_argument("--specialist-base-url", default=None)
@@ -263,6 +264,7 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             if args.object_approach_clearance_m is not None
             else config.object_approach_clearance_m
         ),
+        agent_tool_output_mode=args.agent_tool_output_mode or config.agent_tool_output_mode,
     )
 
 

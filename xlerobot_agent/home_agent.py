@@ -97,6 +97,7 @@ class HomeAgentConfig:
     region_exploration_use_head_pan_for_shots: bool = True
     region_exploration_head_pan_limit_deg: float = 180.0
     region_exploration_head_pan_settle_s: float = 0.25
+    agent_tool_output_mode: str = "compact"
 
 
 @dataclass
@@ -2666,24 +2667,36 @@ class HomeTaskAgent:
         except ImportError as exc:
             raise RuntimeError("OpenAI Agents SDK is not installed") from exc
 
+        def tool_result(tool_name: str, result: dict[str, Any]) -> str:
+            return json.dumps(
+                _agent_tool_model_result(
+                    result,
+                    tool_name=tool_name,
+                    config=self.config,
+                    run_id=record.run_id,
+                )
+            )
+
         @function_tool
         def resolve_navigation_to_region(target_label: str, constraints_json: str = "{}") -> str:
             """Resolve a semantic region label into a concrete safe path, final pose, and short-horizon waypoint."""
-            return json.dumps(
+            return tool_result(
+                "resolve_navigation_to_region",
                 runtime.resolve_navigation_to_region(
                     target_label=target_label,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
         def plan_region_exploration(region_label: str, constraints_json: str = "{}") -> str:
             """Plan inspection stops and 65-degree visual-search shots for a semantic region."""
-            return json.dumps(
+            return tool_result(
+                "plan_region_exploration",
                 runtime.plan_region_exploration(
                     region_label=region_label,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
@@ -2693,93 +2706,100 @@ class HomeTaskAgent:
             constraints_json: str = "{}",
         ) -> str:
             """Navigate visual-search stops and aim the head camera for each planned shot cone."""
-            return json.dumps(
+            return tool_result(
+                "execute_region_exploration_plan",
                 runtime.execute_region_exploration_plan(
                     region_label=region_label,
                     object_label=object_label,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
         def navigate_to_waypoint(waypoint_id: str, x: float, y: float, yaw: float = 0.0, constraints_json: str = "{}") -> str:
             """Send a resolved waypoint to the live exploration/Nav2 backend and wait for the result."""
-            return json.dumps(
+            return tool_result(
+                "navigate_to_waypoint",
                 runtime.navigate_to_waypoint(
                     waypoint_id=waypoint_id,
                     x=x,
                     y=y,
                     yaw=yaw,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
         def relocalize_here() -> str:
             """Run the existing exploration backend relocalization scan and odometry correction."""
-            return json.dumps(runtime.relocalize_here())
+            return tool_result("relocalize_here", runtime.relocalize_here())
 
         @function_tool
         def rotate_by(delta_yaw_deg: float, reason: str = "", rotation_scope: str = "rear_drive") -> str:
             """Run a bounded backend-controlled rotation; use rear_drive for navigation and camera_center for camera/object alignment."""
-            return json.dumps(
+            return tool_result(
+                "rotate_by",
                 runtime.rotate_by(
                     delta_yaw_deg=delta_yaw_deg,
                     reason=reason,
                     rotation_scope=rotation_scope,
-                )
+                ),
             )
 
         @function_tool
         def rotate_towards_point(x: float, y: float, reason: str = "") -> str:
             """Rotate the robot toward a target point before using Nav2 or as recovery."""
-            return json.dumps(runtime.rotate_towards_point(x=x, y=y, reason=reason))
+            return tool_result("rotate_towards_point", runtime.rotate_towards_point(x=x, y=y, reason=reason))
 
         @function_tool
         def micro_adjust_to_pose(x: float, y: float, yaw: float = 0.0, max_distance_m: float = 0.5, reason: str = "") -> str:
             """Use bounded backend-controlled local motion for close final pose adjustment."""
-            return json.dumps(
+            return tool_result(
+                "micro_adjust_to_pose",
                 runtime.micro_adjust_to_pose(
                     x=x,
                     y=y,
                     yaw=yaw,
                     max_distance_m=max_distance_m,
                     reason=reason,
-                )
+                ),
             )
 
         @function_tool
         def focus_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
             """Closed-loop visual servo: reuse the tracked box when possible and rotate until the object is centered."""
-            return json.dumps(
+            return tool_result(
+                "focus_detected_object",
                 runtime.focus_detected_object(
                     detection_id=detection_id,
                     object_label=object_label,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
         def approach_detected_object(detection_id: str = "", object_label: str = "", constraints_json: str = "{}") -> str:
             """Closed-loop RGB-D approach: align to the support surface, solve depth, then move tiny safe steps."""
-            return json.dumps(
+            return tool_result(
+                "approach_detected_object",
                 runtime.approach_detected_object(
                     detection_id=detection_id,
                     object_label=object_label,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         @function_tool
         def grab_object(object_label: str, detection_id: str = "", object_description: str = "", constraints_json: str = "{}") -> str:
             """Mock VLA grasp entrypoint for a focused object at grasp staging range."""
-            return json.dumps(
+            return tool_result(
+                "grab_object",
                 runtime.grab_object(
                     object_label=object_label,
                     detection_id=detection_id,
                     object_description=object_description,
                     constraints=_loads_object(constraints_json),
-                )
+                ),
             )
 
         agent = Agent(
@@ -3278,6 +3298,7 @@ def config_from_env() -> HomeAgentConfig:
         region_exploration_head_pan_settle_s=float(
             os.getenv("ROBOT42_REGION_EXPLORATION_HEAD_PAN_SETTLE_S", "0.25")
         ),
+        agent_tool_output_mode=os.getenv("ROBOT42_AGENT_TOOL_OUTPUT_MODE", "compact"),
     )
 
 
@@ -3751,6 +3772,442 @@ def _write_offline_run_record(config: HomeAgentConfig, record: HomeAgentRunRecor
         )
     except Exception:
         return
+
+
+def _agent_tool_model_result(
+    result: dict[str, Any],
+    *,
+    tool_name: str,
+    config: HomeAgentConfig,
+    run_id: str,
+) -> dict[str, Any]:
+    mode = str(config.agent_tool_output_mode or "compact").strip().lower()
+    if mode == "full":
+        return result
+    compact = _compact_agent_tool_result(result, tool_name=tool_name)
+    trace_path = _agent_run_artifact_dir(config, run_id) / "trace_events.jsonl"
+    try:
+        trace_relpath = str(trace_path.relative_to(_agent_artifacts_root(config)))
+    except Exception:
+        trace_relpath = str(trace_path)
+    compact["model_visible_output"] = "compact"
+    compact["full_details_ref"] = {
+        "run_id": run_id,
+        "trace_path": str(trace_path),
+        "trace_url": f"/api/agent-runs/{run_id}/trace_events.jsonl",
+        "artifact_relpath": trace_relpath,
+    }
+    return compact
+
+
+def _compact_agent_tool_result(result: dict[str, Any], *, tool_name: str = "") -> dict[str, Any]:
+    tool = str(result.get("tool") or tool_name or "tool")
+    compact: dict[str, Any] = {
+        "tool": tool,
+        "status": result.get("status"),
+        "reason": result.get("reason") or result.get("message") or "",
+    }
+    for key in ("target_label", "region_label", "object_label", "waypoint_id", "detection_id"):
+        if result.get(key) is not None:
+            compact[key] = result.get(key)
+    if isinstance(result.get("current_pose"), dict):
+        compact["current_pose"] = _json_pose(result["current_pose"])
+
+    if tool == "resolve_navigation_to_region":
+        _compact_update(
+            compact,
+            result,
+            (
+                "source",
+                "goal_pose",
+                "next_waypoint",
+                "next_waypoint_bearing_error_deg",
+                "distance_to_goal_m",
+                "local_clearance_m",
+            ),
+        )
+        if isinstance(result.get("path"), list):
+            compact["path_summary"] = _path_summary(result["path"])
+        search_stop = result.get("search_stop") if isinstance(result.get("search_stop"), dict) else None
+        if search_stop is not None:
+            compact["search_stop"] = _compact_stop(search_stop)
+        waypoint = result.get("next_waypoint") if isinstance(result.get("next_waypoint"), dict) else None
+        compact["next_recommended_tool"] = "navigate_to_waypoint" if waypoint is not None else None
+        return _drop_none(compact)
+
+    if tool == "plan_region_exploration":
+        stops = result.get("stops") if isinstance(result.get("stops"), list) else []
+        compact["stop_count"] = len(stops)
+        compact["stops_preview"] = [_compact_stop(stop) for stop in stops[:3] if isinstance(stop, dict)]
+        if len(stops) > 3:
+            compact["omitted_stop_count"] = len(stops) - 3
+        if isinstance(result.get("coverage"), dict):
+            compact["coverage"] = {
+                key: result["coverage"].get(key)
+                for key in ("coverage_ratio", "covered_boundary_cell_count", "total_boundary_cell_count")
+                if result["coverage"].get(key) is not None
+            }
+        compact["next_recommended_tool"] = (
+            "execute_region_exploration_plan" if result.get("status") == "succeeded" else None
+        )
+        return _drop_none(compact)
+
+    if tool == "execute_region_exploration_plan":
+        _compact_update(
+            compact,
+            result,
+            (
+                "detection_status",
+                "selected_detection_id",
+                "visited_stop_count",
+                "captured_shot_count",
+                "saved_rgb_count",
+                "local_exploration_start_radius_m",
+            ),
+        )
+        selected = result.get("selected_detection") if isinstance(result.get("selected_detection"), dict) else None
+        if selected is not None:
+            compact["selected_detection"] = _compact_detection(selected)
+        detection = result.get("detection") if isinstance(result.get("detection"), dict) else None
+        if detection is not None:
+            compact["detection"] = _compact_detection_result(detection)
+        if isinstance(result.get("suggested_navigation"), dict):
+            compact["suggested_navigation"] = result["suggested_navigation"]
+            compact["next_recommended_tool"] = result["suggested_navigation"].get("tool")
+        elif result.get("status") == "object_found":
+            compact["next_recommended_tool"] = "focus_detected_object"
+        elif result.get("status") == "succeeded":
+            compact["next_recommended_tool"] = "summarize_not_found"
+        elif result.get("status") in {"blocked", "requires_navigation"}:
+            compact["next_recommended_tool"] = "inspect_reason_or_retry"
+        first_stop = result.get("first_stop") if isinstance(result.get("first_stop"), dict) else None
+        if first_stop is not None:
+            compact["first_stop"] = _compact_stop(first_stop)
+        last_stop = _last_dict(result.get("stops"))
+        if last_stop is not None:
+            compact["last_stop"] = _compact_executed_stop(last_stop)
+            last_pose = _latest_pose_from_stop(last_stop)
+            if last_pose is not None and "current_pose" not in compact:
+                compact["current_pose"] = last_pose
+        return _drop_none(compact)
+
+    if tool == "navigate_to_waypoint":
+        _compact_update(
+            compact,
+            result,
+            (
+                "requested_pose",
+                "distance_remaining_m",
+                "actual_pose_delta_m",
+                "actual_yaw_delta_deg",
+                "estimated_feedback_path_m",
+                "failure_hint",
+            ),
+        )
+        nav2 = result.get("nav2") if isinstance(result.get("nav2"), dict) else {}
+        compact["nav2_summary"] = {
+            key: nav2.get(key)
+            for key in ("status", "reason", "path_length_m", "plan_status", "plan_reason", "feedback_summary")
+            if nav2.get(key) is not None
+        }
+        if isinstance(result.get("pre_nav_auto_rotation"), dict):
+            compact["pre_nav_auto_rotation"] = _compact_local_motion(result["pre_nav_auto_rotation"])
+        if isinstance(result.get("fallback_navigation"), dict):
+            compact["fallback_navigation"] = _compact_local_motion(result["fallback_navigation"])
+        if isinstance(result.get("direct_fallback_plan"), dict):
+            compact["direct_fallback_plan"] = _compact_status_reason(result["direct_fallback_plan"])
+        recovery = result.get("local_clearance_recovery") if isinstance(result.get("local_clearance_recovery"), dict) else None
+        if recovery is not None:
+            compact["local_clearance_recovery"] = _compact_local_clearance_recovery(recovery)
+        compact["next_recommended_tool"] = "relocalize_here" if result.get("status") == "succeeded" else "inspect_navigation_failure"
+        return _drop_none(compact)
+
+    if tool in {"relocalize_here", "rotate_by", "rotate_towards_point", "micro_adjust_to_pose", "set_camera_pan"}:
+        compact.update(_compact_local_motion(result))
+        return _drop_none(compact)
+
+    if tool == "focus_detected_object":
+        _compact_update(
+            compact,
+            result,
+            ("selected_detection", "center_error_norm", "center_error_norm_before", "attempt_count", "detector_refreshed"),
+        )
+        if isinstance(compact.get("selected_detection"), dict):
+            compact["selected_detection"] = _compact_detection(compact["selected_detection"])
+        last_attempt = _last_dict(result.get("attempts"))
+        if last_attempt is not None:
+            compact["last_attempt"] = _compact_focus_attempt(last_attempt)
+        compact["object_visible"] = result.get("status") in {"succeeded", "partial"}
+        compact["next_recommended_tool"] = (
+            "approach_detected_object" if result.get("status") == "succeeded" else "retry_or_report_object_lost"
+        )
+        return _drop_none(compact)
+
+    if tool == "approach_detected_object":
+        _compact_update(
+            compact,
+            result,
+            ("selected_detection", "selected_detection_id", "target_tolerance_m", "attempt_count"),
+        )
+        if isinstance(compact.get("selected_detection"), dict):
+            compact["selected_detection"] = _compact_detection(compact["selected_detection"])
+        geometry = result.get("geometry") if isinstance(result.get("geometry"), dict) else None
+        if geometry is not None:
+            compact["geometry"] = _compact_geometry(geometry)
+        last_attempt = _last_dict(result.get("attempts"))
+        if last_attempt is not None:
+            compact["last_attempt"] = _compact_approach_attempt(last_attempt)
+            if "geometry" not in compact and isinstance(last_attempt.get("geometry"), dict):
+                compact["geometry"] = _compact_geometry(last_attempt["geometry"])
+        compact["object_visible"] = result.get("status") not in {"object_lost"}
+        if result.get("status") == "succeeded":
+            compact["next_recommended_tool"] = "grab_object"
+        elif result.get("status") in {"partial", "blocked"}:
+            compact["next_recommended_tool"] = "relocalize_then_retry_once_or_report"
+        elif result.get("status") == "too_close":
+            compact["next_recommended_tool"] = "grab_object_or_report_too_close"
+        return _drop_none(compact)
+
+    if tool == "grab_object":
+        _compact_update(compact, result, ("object_description", "constraints"))
+        compact["next_recommended_tool"] = "final_summary"
+        return _drop_none(compact)
+
+    for key in (
+        "goal_pose",
+        "selected_detection_id",
+        "distance_remaining_m",
+        "actual_pose_delta_m",
+        "attempt_count",
+    ):
+        if result.get(key) is not None:
+            compact[key] = result.get(key)
+    return _drop_none(compact)
+
+
+def _compact_update(target: dict[str, Any], source: dict[str, Any], keys: tuple[str, ...]) -> None:
+    for key in keys:
+        value = source.get(key)
+        if value is not None:
+            target[key] = value
+
+
+def _compact_status_reason(value: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "status": value.get("status"),
+        "reason": value.get("reason") or value.get("message") or "",
+    }
+    return _drop_none(compact)
+
+
+def _compact_stop(stop: dict[str, Any]) -> dict[str, Any]:
+    shots = stop.get("shots") if isinstance(stop.get("shots"), list) else []
+    compact = {
+        "stop_id": stop.get("stop_id"),
+        "pose": _json_pose(stop["pose"]) if isinstance(stop.get("pose"), dict) else None,
+        "shot_count": len(shots),
+        "shot_yaw_deg": [
+            shot.get("yaw_deg")
+            for shot in shots[:4]
+            if isinstance(shot, dict) and shot.get("yaw_deg") is not None
+        ],
+    }
+    return _drop_none(compact)
+
+
+def _compact_executed_stop(stop: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_stop(stop)
+    if isinstance(stop.get("navigation"), dict):
+        compact["navigation"] = {
+            key: stop["navigation"].get(key)
+            for key in ("status", "reason", "distance_remaining_m", "actual_pose_delta_m")
+            if stop["navigation"].get(key) is not None
+        }
+    shots = stop.get("shots") if isinstance(stop.get("shots"), list) else []
+    if shots:
+        compact["last_shot"] = _compact_shot(shots[-1])
+    return _drop_none(compact)
+
+
+def _compact_shot(shot: dict[str, Any]) -> dict[str, Any]:
+    capture = shot.get("capture") if isinstance(shot.get("capture"), dict) else {}
+    detection = shot.get("detection") if isinstance(shot.get("detection"), dict) else {}
+    compact = {
+        "shot_id": shot.get("shot_id"),
+        "yaw_deg": shot.get("yaw_deg"),
+        "alignment": _compact_status_reason(shot["alignment"]) if isinstance(shot.get("alignment"), dict) else None,
+        "capture": {
+            key: capture.get(key)
+            for key in ("status", "reason", "shot_id", "artifact_url", "metadata_url", "annotated_artifact_url")
+            if capture.get(key) is not None
+        },
+        "detection": _compact_detection_result(detection) if detection else None,
+    }
+    return _drop_none(compact)
+
+
+def _compact_detection_result(detection: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "status": detection.get("status"),
+        "reason": detection.get("reason"),
+        "object_label": detection.get("object_label"),
+        "shot_id": detection.get("shot_id"),
+        "selected_detection_id": detection.get("selected_detection_id"),
+        "detection_count": len(detection.get("detections")) if isinstance(detection.get("detections"), list) else None,
+        "dino_response_url": detection.get("dino_response_url"),
+    }
+    selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else None
+    if selected is not None:
+        compact["selected_detection"] = _compact_detection(selected)
+    return _drop_none(compact)
+
+
+def _compact_detection(detection: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "detection_id": detection.get("tracking_id") or detection.get("detection_id"),
+        "label": detection.get("label"),
+        "confidence": _round_optional(detection.get("confidence")),
+        "bbox_xyxy": detection.get("bbox_xyxy"),
+        "shot_id": detection.get("shot_id"),
+        "image_path": detection.get("image_path"),
+    }
+    return _drop_none(compact)
+
+
+def _compact_geometry(geometry: dict[str, Any]) -> dict[str, Any]:
+    safety = geometry.get("safety") if isinstance(geometry.get("safety"), dict) else {}
+    compact = {
+        "status": geometry.get("status"),
+        "reason": geometry.get("reason"),
+        "staging_forward_m": _round_optional(geometry.get("staging_forward_m")),
+        "staging_source": geometry.get("staging_source"),
+        "forward_m": _round_optional(geometry.get("forward_m")),
+        "distance_m": _round_optional(geometry.get("distance_m")),
+        "lateral_m": _round_optional(geometry.get("lateral_m")),
+        "bearing_error_deg": _round_optional(geometry.get("bearing_error_deg")),
+        "estimated_pose_camera": _compact_xyz(geometry.get("estimated_pose_camera")),
+        "estimated_pose_base": _compact_xyz(geometry.get("estimated_pose_base")),
+        "safety": {
+            key: safety.get(key)
+            for key in ("safe", "reason", "safe_forward_step_m")
+            if safety.get(key) is not None
+        },
+    }
+    return _drop_none(compact)
+
+
+def _compact_xyz(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    return _drop_none(
+        {
+            "x": _round_optional(value.get("x")),
+            "y": _round_optional(value.get("y")),
+            "z": _round_optional(value.get("z")),
+        }
+    )
+
+
+def _compact_focus_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "attempt": attempt.get("attempt"),
+        "source": attempt.get("source"),
+        "center": attempt.get("center"),
+    }
+    if isinstance(attempt.get("detection"), dict):
+        compact["detection"] = _compact_detection_result(attempt["detection"])
+    if isinstance(attempt.get("rotation"), dict):
+        compact["rotation"] = _compact_local_motion(attempt["rotation"])
+    return _drop_none(compact)
+
+
+def _compact_approach_attempt(attempt: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "attempt": attempt.get("attempt"),
+        "source": attempt.get("source"),
+        "staging_distance": attempt.get("staging_distance"),
+        "image_center": attempt.get("image_center"),
+        "approach_step": attempt.get("approach_step"),
+        "motion_no_progress": attempt.get("motion_no_progress"),
+        "next_action": attempt.get("next_action"),
+    }
+    if isinstance(attempt.get("detection"), dict):
+        compact["detection"] = _compact_detection_result(attempt["detection"])
+    if isinstance(attempt.get("geometry"), dict):
+        compact["geometry"] = _compact_geometry(attempt["geometry"])
+    if isinstance(attempt.get("surface_alignment"), dict):
+        compact["surface_alignment"] = _compact_status_reason(attempt["surface_alignment"])
+    if isinstance(attempt.get("surface_alignment_reacquire"), dict):
+        compact["surface_alignment_reacquire"] = _compact_status_reason(attempt["surface_alignment_reacquire"])
+    if isinstance(attempt.get("rotation"), dict):
+        compact["rotation"] = _compact_local_motion(attempt["rotation"])
+    if isinstance(attempt.get("motion"), dict):
+        compact["motion"] = _compact_local_motion(attempt["motion"])
+    return _drop_none(compact)
+
+
+def _compact_local_motion(result: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "tool": result.get("tool"),
+        "status": result.get("status"),
+        "reason": result.get("reason") or result.get("message") or "",
+        "current_pose": _json_pose(result["current_pose"]) if isinstance(result.get("current_pose"), dict) else None,
+        "actual_pose_delta_m": _round_optional(result.get("actual_pose_delta_m")),
+        "actual_yaw_delta_deg": _round_optional(result.get("actual_yaw_delta_deg")),
+        "distance_remaining_m": _round_optional(result.get("distance_remaining_m")),
+        "requested_pan_deg": result.get("requested_pan_deg"),
+        "delta_yaw_deg_requested": result.get("delta_yaw_deg_requested"),
+        "bearing_error_deg": _round_optional(result.get("bearing_error_deg")),
+    }
+    return _drop_none(compact)
+
+
+def _compact_local_clearance_recovery(recovery: dict[str, Any]) -> dict[str, Any]:
+    compact = _compact_status_reason(recovery)
+    for key in ("suggested_tool", "recovery_pose", "distance_m"):
+        if recovery.get(key) is not None:
+            compact[key] = recovery.get(key)
+    return _drop_none(compact)
+
+
+def _path_summary(path: list[Any]) -> dict[str, Any]:
+    first = path[0] if path and isinstance(path[0], dict) else None
+    last = path[-1] if path and isinstance(path[-1], dict) else None
+    return _drop_none(
+        {
+            "point_count": len(path),
+            "first": _json_pose(first) if first else None,
+            "last": _json_pose(last) if last else None,
+        }
+    )
+
+
+def _latest_pose_from_stop(stop: dict[str, Any]) -> dict[str, float] | None:
+    navigation = stop.get("navigation") if isinstance(stop.get("navigation"), dict) else {}
+    if isinstance(navigation.get("current_pose"), dict):
+        return _json_pose(navigation["current_pose"])
+    shots = stop.get("shots") if isinstance(stop.get("shots"), list) else []
+    for shot in reversed(shots):
+        if not isinstance(shot, dict):
+            continue
+        capture = shot.get("capture") if isinstance(shot.get("capture"), dict) else {}
+        for key in ("current_pose", "robot_pose"):
+            if isinstance(capture.get(key), dict):
+                return _json_pose(capture[key])
+    return None
+
+
+def _last_dict(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, list):
+        return None
+    for item in reversed(value):
+        if isinstance(item, dict):
+            return item
+    return None
+
+
+def _drop_none(value: dict[str, Any]) -> dict[str, Any]:
+    return {key: item for key, item in value.items() if item is not None and item != {} and item != []}
 
 
 def _object_detector_config(config: HomeAgentConfig) -> ObjectDetectorConfig:
