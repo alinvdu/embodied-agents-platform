@@ -1148,10 +1148,9 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
-            forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
-            original_forward_m = forward_m
+            base_forward_m = float(geometry.get("forward_m", geometry.get("distance_m", 999.0)) or 999.0)
+            forward_m = base_forward_m
             lateral_m = float(geometry.get("lateral_m", 0.0) or 0.0)
-            planar_distance_m = math.hypot(forward_m, lateral_m)
             camera_forward_m: float | None = None
             estimated_pose_camera = geometry.get("estimated_pose_camera")
             if isinstance(estimated_pose_camera, dict):
@@ -1159,6 +1158,32 @@ class HomeAgentToolRuntime:
                     camera_forward_m = float(estimated_pose_camera.get("x"))
                 except Exception:
                     camera_forward_m = None
+            use_camera_forward_for_staging = (
+                camera_forward_m is not None
+                and math.isfinite(camera_forward_m)
+                and camera_forward_m > 0.0
+            )
+            staging_source = "camera_forward_x" if use_camera_forward_for_staging else "base_forward"
+            staging_forward_m = camera_forward_m if use_camera_forward_for_staging else base_forward_m
+            geometry["staging_forward_m"] = round(staging_forward_m, 3)
+            geometry["staging_source"] = staging_source
+            attempt["staging_distance"] = {
+                "source": staging_source,
+                "staging_forward_m": round(staging_forward_m, 3),
+                "base_forward_m": round(base_forward_m, 3),
+                "camera_forward_m": (
+                    round(camera_forward_m, 3)
+                    if camera_forward_m is not None and math.isfinite(camera_forward_m)
+                    else None
+                ),
+                "reason": (
+                    "Using camera-frame object x for grasp staging because it measures the visual "
+                    "front-camera standoff directly."
+                    if use_camera_forward_for_staging
+                    else "Camera-frame object x was unavailable; falling back to base-frame forward projection."
+                ),
+            }
+            forward_m = staging_forward_m
             bearing_error_deg = float(geometry.get("bearing_error_deg", 0.0) or 0.0)
             bearing_tolerance_deg = _bounded_float(
                 constraints.get("bearing_tolerance_deg", 6.0),
@@ -1182,7 +1207,7 @@ class HomeAgentToolRuntime:
                         alignment=alignment,
                     )
                 if alignment.get("status") in {"succeeded", "partial"} and alignment.get("motion"):
-                    if _constraint_bool(constraints, "relocalize_after_surface_alignment", True):
+                    if _constraint_bool(constraints, "relocalize_after_surface_alignment", False):
                         attempt["surface_alignment_relocalization"] = self.relocalize_here()
                     shot_head_pan_delta_deg = _capture_head_pan_delta_deg(capture)
                     if (
@@ -1239,12 +1264,13 @@ class HomeAgentToolRuntime:
                 and abs(float(center["error_norm"])) > center_tolerance
                 and centering_correction_count < max_centering_corrections
             )
+            staging_basis = "camera-forward estimate" if staging_source == "camera_forward_x" else "base-frame forward estimate"
             if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
                 if forward_m <= target_max_m:
-                    reason = f"Object is within grasp staging range ({forward_m:.2f} m)."
+                    reason = f"Object is within grasp staging range by {staging_basis} ({forward_m:.2f} m)."
                 else:
                     reason = (
-                        f"Object is within grasp staging tolerance "
+                        f"Object is within grasp staging tolerance by {staging_basis} "
                         f"({forward_m:.3f} m, target max {target_max_m:.3f} m)."
                     )
                 result = {
@@ -1266,8 +1292,9 @@ class HomeAgentToolRuntime:
                 attempt["geometry_consistency"] = {
                     "status": "invalid_forward",
                     "forward_m": round(forward_m, 3),
+                    "staging_source": staging_source,
                     "reason": (
-                        "RGB-D geometry placed an image-visible detection behind the robot base frame; "
+                        "RGB-D geometry placed an image-visible detection behind the selected staging frame; "
                         "recenter or refresh before using this range estimate."
                     ),
                 }
@@ -1303,6 +1330,15 @@ class HomeAgentToolRuntime:
                     range_estimate_m = float(geometry.get("distance_m", 0.0) or 0.0)
                     if range_estimate_m > 0.0:
                         forward_m = range_estimate_m
+                        geometry["staging_forward_m"] = round(forward_m, 3)
+                        geometry["staging_source"] = "rgbd_range_after_centering"
+                        staging_source = "rgbd_range_after_centering"
+                        staging_basis = "RGB-D range after image centering"
+                        attempt["staging_distance"] = {
+                            **attempt["staging_distance"],
+                            "source": staging_source,
+                            "staging_forward_m": round(forward_m, 3),
+                        }
                         attempt["geometry_consistency"] = {
                             "status": "using_range_after_centering_correction",
                             "original_forward_m": round(float(geometry.get("forward_m", 0.0) or 0.0), 3),
@@ -1312,60 +1348,6 @@ class HomeAgentToolRuntime:
                                 "staging estimate instead of re-detecting."
                             ),
                         }
-            center_reliable_for_camera_range = (
-                center.get("status") != "succeeded"
-                or abs(float(center.get("error_norm", 0.0) or 0.0)) <= max(center_tolerance * 2.5, 0.2)
-                or centered_this_attempt
-            )
-            off_axis_forward_projection = (
-                camera_forward_m is not None
-                and camera_forward_m >= target_min_m
-                and original_forward_m < target_min_m
-                and abs(lateral_m) >= max(0.08, target_min_m * 0.5)
-                and abs(bearing_error_deg) >= max(30.0, bearing_tolerance_deg)
-                and center_reliable_for_camera_range
-            )
-            if off_axis_forward_projection:
-                forward_m = camera_forward_m
-                geometry["staging_forward_m"] = round(forward_m, 3)
-                geometry["staging_source"] = "camera_forward_due_to_off_axis_base_projection"
-                attempt["geometry_consistency"] = {
-                    "status": "using_camera_forward_after_off_axis_base_projection",
-                    "original_forward_m": round(original_forward_m, 3),
-                    "lateral_m": round(lateral_m, 3),
-                    "planar_distance_m": round(planar_distance_m, 3),
-                    "camera_forward_m": round(camera_forward_m, 3),
-                    "bearing_error_deg": round(bearing_error_deg, 3),
-                    "reason": (
-                        "The image-visible object is centered enough for approach, but the base-frame "
-                        "projection is mostly lateral. This usually means the head-camera pan/TF handoff "
-                        "is stale or intentionally off-axis, so camera-forward range is safer than "
-                        "treating base forward as true distance."
-                    ),
-                }
-                if target_min_m <= forward_m <= target_max_m + target_tolerance_m:
-                    if forward_m <= target_max_m:
-                        reason = f"Object is within grasp staging range by camera-forward estimate ({forward_m:.2f} m)."
-                    else:
-                        reason = (
-                            "Object is within grasp staging tolerance by camera-forward estimate "
-                            f"({forward_m:.3f} m, target max {target_max_m:.3f} m)."
-                        )
-                    result = {
-                        "tool": "approach_detected_object",
-                        "status": "succeeded",
-                        "object_label": label,
-                        "detection_id": detection.get("selected_detection_id"),
-                        "selected_detection": selected,
-                        "geometry": geometry,
-                        "target_tolerance_m": target_tolerance_m,
-                        "attempt_count": attempt_index,
-                        "attempts": attempts,
-                        "reason": reason,
-                    }
-                    self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
-                    self.emit("tool_executed", "Approach Object", result["reason"], result)
-                    return result
             if forward_m <= 0.0:
                 result = {
                     "tool": "approach_detected_object",
@@ -1375,8 +1357,8 @@ class HomeAgentToolRuntime:
                     "attempt_count": attempt_index,
                     "attempts": attempts,
                     "reason": (
-                        "RGB-D geometry placed the detected object behind the robot base frame; "
-                        "refresh detection or verify the head-camera transform before approaching."
+                        "RGB-D geometry placed the detected object behind the selected staging frame; "
+                        "refresh detection or verify the head-camera depth estimate before approaching."
                     ),
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
@@ -1486,6 +1468,52 @@ class HomeAgentToolRuntime:
                     "attempt_count": attempt_index,
                     "attempts": attempts,
                     "reason": motion.get("reason") or "Forward visual-servo approach step failed.",
+                }
+                self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                return result
+            try:
+                actual_pose_delta_m = float(motion.get("actual_pose_delta_m") or 0.0)
+            except Exception:
+                actual_pose_delta_m = 0.0
+            try:
+                distance_remaining_m = float(motion.get("distance_remaining_m") or 0.0)
+            except Exception:
+                distance_remaining_m = 0.0
+            min_actual_progress_m = _bounded_float(
+                constraints.get("min_actual_approach_progress_m", 0.005),
+                0.005,
+                minimum=0.0,
+                maximum=0.05,
+            )
+            no_progress_remaining_threshold_m = _bounded_float(
+                constraints.get("no_progress_remaining_threshold_m", 0.015),
+                0.015,
+                minimum=0.0,
+                maximum=0.1,
+            )
+            if (
+                forward_step > 0.02
+                and actual_pose_delta_m <= min_actual_progress_m
+                and distance_remaining_m >= no_progress_remaining_threshold_m
+            ):
+                attempt["motion_no_progress"] = {
+                    "requested_forward_step_m": round(forward_step, 3),
+                    "actual_pose_delta_m": round(actual_pose_delta_m, 3),
+                    "distance_remaining_m": round(distance_remaining_m, 3),
+                    "min_actual_progress_m": round(min_actual_progress_m, 3),
+                    "reason": (
+                        "Local motion reported success/partial but odometry showed no measurable "
+                        "forward progress, so the approach loop will not retry the same blocked step."
+                    ),
+                }
+                result = {
+                    "tool": "approach_detected_object",
+                    "status": "partial",
+                    "object_label": label,
+                    "geometry": geometry,
+                    "attempt_count": attempt_index,
+                    "attempts": attempts,
+                    "reason": "Approach motion made no measurable progress toward the staging distance.",
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
@@ -2802,7 +2830,7 @@ class HomeTaskAgent:
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, relocalizes after that alignment, then moves toward grasp staging using 80% of the remaining gap capped by max step until the object is 0.35-0.45m away. If the immediate detector refresh after surface alignment misses the object, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approaches instead of returning to region exploration. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, then immediately uses fresh RGB-D detection/geometry for local approach unless relocalize_after_surface_alignment is explicitly requested. It moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If the immediate detector refresh after surface alignment misses the object, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approaches instead of returning to region exploration. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
