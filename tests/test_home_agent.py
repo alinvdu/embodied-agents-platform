@@ -436,7 +436,7 @@ class HomeMemoryAgentContextTests(unittest.TestCase):
 class HomeTaskAgentTests(unittest.TestCase):
     def test_agent_tool_compaction_keeps_navigation_decision_contract(self) -> None:
         full = {
-            "tool": "resolve_navigation_to_region",
+            "tool": "resolve_region_navigation_goal",
             "status": "succeeded",
             "target_label": "kitchen",
             "reason": "Resolved kitchen.",
@@ -458,6 +458,8 @@ class HomeTaskAgentTests(unittest.TestCase):
 
         compact = home_agent._compact_agent_tool_result(full, tool_name="resolve_navigation_to_region")
 
+        self.assertEqual(compact["tool"], "resolve_navigation_to_region")
+        self.assertEqual(compact["source_tool"], "resolve_region_navigation_goal")
         self.assertEqual(compact["next_recommended_tool"], "navigate_to_waypoint")
         self.assertEqual(compact["next_waypoint"]["waypoint_id"], "kitchen_search_entry_1")
         self.assertEqual(compact["next_waypoint"]["x"], 1.7)
@@ -1738,6 +1740,115 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(geometry_body["bbox_sample_inner_ratio"], 0.65)
         self.assertEqual(geometry_body["min_valid_points"], 12)
 
+    def test_runtime_approach_aims_from_first_panned_detection_before_redetect(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="test_initial_sighting_approach_run",
+        )
+        runtime._track_detection_result(
+            object_label="small yellow bottle",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "yaw_-60_det_1",
+                "selected_detection": {
+                    "detection_id": "yaw_-60_det_1",
+                    "label": "small yellow bottle",
+                    "confidence": 0.94,
+                    "bbox_xyxy": [406.0, 79.0, 471.0, 199.0],
+                },
+            },
+            capture={
+                "shot_id": "kitchen_stop_1_yaw_-60",
+                "artifact_url": "/api/artifacts/run/vision_report/shots/kitchen_stop_1_yaw_-60.png",
+                "image_path": "artifacts/agent_runs/home_agent_79d1c88e9c/vision_report/shots/kitchen_kitchen_stop_1_yaw_-60.png",
+                "image_width": 640,
+                "image_height": 480,
+                "robot_pose": dict(runtime.current_pose),
+            },
+        )
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            calls.append((request.full_url, body))
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "camera centered",
+                        "camera_pan": {"pan_deg": 0.0, "pan_rad": 0.0},
+                        "robot_pose": dict(runtime.current_pose),
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                self.assertEqual(body.get("primitive"), "rotate_by")
+                self.assertEqual(body.get("rotation_scope"), "rear_drive")
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "rotated toward first sighting",
+                        "local_motion": {
+                            "primitive": "rotate_by",
+                            "status": "succeeded",
+                            "actual_yaw_delta_deg": body.get("delta_yaw_deg"),
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(runtime.current_pose),
+                        },
+                        "map": {"robot_pose": dict(runtime.current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(runtime.current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.34,
+                        "distance_m": 0.34,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_camera": {"x": 0.34, "y": 0.0, "z": 0.1},
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="small yellow bottle",
+                constraints={
+                    "allow_surface_alignment": False,
+                    "target_min_m": 0.3,
+                    "target_max_m": 0.35,
+                },
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        setup = result["attempts"][0]["setup_actions"]["initial_sighting_angle_correction"]
+        self.assertEqual(setup["tracked_capture_head_pan_delta_deg"], -60.0)
+        self.assertLess(setup["chosen_correction_deg"], -50.0)
+        self.assertEqual(result["attempts"][0]["source"], "detector_refresh")
+        ordered_paths = [url.rsplit("/", 1)[-1] for url, _body in calls]
+        self.assertEqual(ordered_paths[:3], ["camera_pan", "local_motion", "capture_rgb"])
+
     def test_runtime_approach_accepts_grasp_staging_tolerance(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=visual_sweep_memory(),
@@ -1758,8 +1869,10 @@ class HomeTaskAgentTests(unittest.TestCase):
             },
             capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
         )
+        local_motion_bodies = []
 
         def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
             if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
                 return FakeHTTPResponse(
                     {
@@ -1992,8 +2105,10 @@ class HomeTaskAgentTests(unittest.TestCase):
             },
             capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
         )
+        local_motion_bodies = []
 
         def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
             if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
                 return FakeHTTPResponse(
                     {
@@ -2047,8 +2162,10 @@ class HomeTaskAgentTests(unittest.TestCase):
             },
             capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
         )
+        local_motion_bodies = []
 
         def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
             if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
                 return FakeHTTPResponse(
                     {
@@ -2065,7 +2182,22 @@ class HomeTaskAgentTests(unittest.TestCase):
                     }
                 )
             if request.full_url.endswith("/api/nav/local_motion"):
-                raise AssertionError("camera-forward staging is already in range; approach should not move")
+                local_motion_bodies.append(body)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "micro adjustment completed",
+                        "local_motion": {
+                            "primitive": body.get("primitive"),
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(body.get("pose") or runtime.current_pose),
+                            "actual_pose_delta_m": 0.06,
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(body.get("pose") or runtime.current_pose)},
+                    }
+                )
             if request.full_url.endswith("/api/nav/capture_rgb"):
                 raise AssertionError("approach should reuse the tracked detection")
             raise AssertionError(f"unexpected URL {request.full_url}")
@@ -2154,6 +2286,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                     "target_min_m": 0.2,
                     "target_max_m": 0.3,
                     "max_attempts": 5,
+                    "no_progress_min_requested_step_m": 0.02,
                 },
             )
 
@@ -2161,6 +2294,184 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(geometry_calls, 1)
         self.assertEqual(result["attempts"][0]["motion_no_progress"]["actual_pose_delta_m"], 0.0)
         self.assertIn("no measurable progress", result["reason"])
+
+    def test_runtime_approach_uses_min_actionable_step_for_small_safe_gap(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="test_min_actionable_approach_run",
+        )
+        current_pose = dict(runtime.current_pose)
+        start_pose = dict(current_pose)
+        geometry_calls = 0
+        local_motion_bodies = []
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0 + geometry_calls,
+                    }
+                )
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                forward = 0.381 if geometry_calls == 1 else 0.321
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": forward,
+                        "distance_m": forward,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_camera": {"x": forward, "y": 0.0, "z": 0.12},
+                        "base_from_camera_transform": {"yaw_deg": 0.0},
+                        "current_pose": dict(current_pose),
+                        "safety": {
+                            "safe": True,
+                            "safe_forward_step_m": 0.25 if geometry_calls == 1 else 0.0,
+                            "reason": "clear",
+                        },
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                pose = body["pose"]
+                current_pose.update(pose)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "micro adjustment completed",
+                        "local_motion": {
+                            "primitive": "micro_adjust_to_pose",
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                            "actual_pose_delta_m": 0.06,
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="small yellow bottle",
+                constraints={
+                    "allow_surface_alignment": False,
+                    "target_min_m": 0.3,
+                    "target_max_m": 0.35,
+                    "target_tolerance_m": 0.025,
+                },
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(geometry_calls, 2)
+        self.assertTrue(local_motion_bodies)
+        first_pose = local_motion_bodies[0]["pose"]
+        moved = math.hypot(first_pose["x"] - start_pose["x"], first_pose["y"] - start_pose["y"])
+        self.assertAlmostEqual(moved, 0.06, delta=0.01)
+        self.assertEqual(result["attempts"][0]["approach_step"]["chosen_forward_step_m"], 0.06)
+        self.assertEqual(result["attempts"][0]["approach_step"]["min_actionable_step_m"], 0.06)
+
+    def test_runtime_approach_keeps_camera_x_staging_when_base_tf_is_off_axis(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime._track_detection_result(
+            object_label="small yellow bottle",
+            detection={
+                "status": "matched",
+                "selected_detection_id": "det_1",
+                "selected_detection": {
+                    "detection_id": "det_1",
+                    "label": "small yellow bottle",
+                    "confidence": 0.92,
+                    "bbox_xyxy": [260, 210, 340, 478],
+                },
+            },
+            capture={"shot_id": "shot_1", "image_width": 640, "image_height": 480},
+        )
+        local_motion_bodies = []
+        geometry_calls = 0
+
+        def fake_urlopen(request, timeout=0):
+            nonlocal geometry_calls
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                geometry_calls += 1
+                forward = 0.383 if geometry_calls == 1 else 0.323
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.018,
+                        "distance_m": forward,
+                        "lateral_m": -0.277,
+                        "bearing_error_deg": -86.29,
+                        "estimated_pose_camera": {"x": forward, "y": 0.0, "z": 0.12},
+                        "estimated_pose_base": {"x": 0.018, "y": -0.277, "z": 0.12},
+                        "base_from_camera_transform": {"yaw_deg": -120.0},
+                        "current_pose": dict(runtime.current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.25, "reason": "clear"},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "micro adjustment completed",
+                        "local_motion": {
+                            "primitive": body.get("primitive"),
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(body.get("pose") or runtime.current_pose),
+                            "actual_pose_delta_m": 0.06,
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(body.get("pose") or runtime.current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                raise AssertionError("approach should reuse the tracked detection")
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.approach_detected_object(
+                object_label="small yellow bottle",
+                constraints={
+                    "allow_surface_alignment": False,
+                    "target_min_m": 0.3,
+                    "target_max_m": 0.35,
+                    "refresh_detector_after_forward_motion": False,
+                },
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["geometry"]["staging_source"], "camera_forward_x")
+        self.assertEqual(result["attempts"][0]["geometry"]["staging_forward_m"], 0.383)
+        self.assertEqual(result["geometry"]["staging_forward_m"], 0.323)
+        self.assertEqual(result["attempts"][0]["staging_distance"]["camera_frame_yaw_deg"], -120.0)
+        self.assertTrue(local_motion_bodies)
+        self.assertEqual(result["attempts"][0]["approach_step"]["chosen_forward_step_m"], 0.06)
+        self.assertEqual(result["attempts"][0]["approach_step"]["chosen_forward_step_m"], 0.06)
 
     def test_runtime_approach_aligns_body_to_occupied_surface_before_close_approach(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
@@ -3069,6 +3380,9 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("navigation_purpose", instructions)
         self.assertIn("requires_navigation", instructions)
         self.assertIn("search-entry", instructions)
+        self.assertIn("Do not call relocalize_here between approach attempts", instructions)
+        self.assertIn('"reset_head_pan_before_approach": true', instructions)
+        self.assertNotIn("call relocalize_here once, then retry approach_detected_object", instructions)
         self.assertIn("Bad example", instructions)
 
     def test_openai_provider_applies_cli_api_key_to_agents_sdk_env(self) -> None:

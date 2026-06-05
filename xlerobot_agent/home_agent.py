@@ -9,6 +9,7 @@ import math
 import mimetypes
 import os
 from pathlib import Path
+import re
 import threading
 import time
 from typing import Any, Callable
@@ -965,6 +966,18 @@ class HomeAgentToolRuntime:
             minimum=0,
             maximum=5,
         ))
+        min_actionable_step_m = _bounded_float(
+            constraints.get("min_actionable_approach_step_m", 0.06),
+            0.06,
+            minimum=0.0,
+            maximum=0.15,
+        )
+        reset_head_pan_threshold_deg = _bounded_float(
+            constraints.get("reset_head_pan_before_approach_threshold_deg", 15.0),
+            15.0,
+            minimum=0.0,
+            maximum=180.0,
+        )
         surface_reacquire_sweep_deg = _bounded_float(
             constraints.get(
                 "surface_alignment_reacquire_sweep_deg",
@@ -974,12 +987,6 @@ class HomeAgentToolRuntime:
             minimum=1.0,
             maximum=45.0,
         )
-        redetect_after_motion_steps = int(_bounded_float(
-            constraints.get("redetect_after_motion_steps", 1),
-            1,
-            minimum=1,
-            maximum=6,
-        ))
         approach_key = _object_approach_key(label)
         approach_state = self.object_approach_state.get(approach_key, {})
         surface_alignment_already_attempted = bool(approach_state.get("surface_alignment_attempted"))
@@ -994,9 +1001,10 @@ class HomeAgentToolRuntime:
             and _constraint_bool(constraints, "refresh_detector_on_retry", True)
         )
         attempts: list[dict[str, Any]] = []
-        motion_steps_since_detection = redetect_after_motion_steps if force_detector_refresh_first else 0
+        detector_refresh_required = force_detector_refresh_first
         refresh_after_geometry_failure = False
         last_state = state
+        setup_actions: dict[str, Any] = {}
         surface_alignment_attempted = False
         surface_alignment_reacquire_pending = False
         surface_alignment_reacquire_used = False
@@ -1008,11 +1016,120 @@ class HomeAgentToolRuntime:
                 "detector_refresh_forced": force_detector_refresh_first,
                 "reason": "Surface alignment was already attempted for this object in this run.",
             }
+        tracked_before_setup = self._tracked_detection_and_capture(last_state)
+        tracked_capture_head_pan_delta_deg: float | None = None
+        initial_angle_corrected = False
+        if tracked_before_setup is not None:
+            tracked_capture_head_pan_delta_deg = _capture_head_pan_delta_deg(tracked_before_setup[1])
+        if (
+            tracked_before_setup is not None
+            and tracked_capture_head_pan_delta_deg is not None
+            and abs(tracked_capture_head_pan_delta_deg) > reset_head_pan_threshold_deg
+            and _constraint_bool(constraints, "initial_tracked_sighting_angle_correction", True)
+        ):
+            tracked_selected, tracked_capture = tracked_before_setup
+            tracked_center = _detection_center_error(tracked_selected, tracked_capture)
+            bbox_yaw_offset_deg = 0.0
+            if tracked_center.get("status") == "succeeded":
+                horizontal_fov_deg = _bounded_float(
+                    constraints.get("horizontal_fov_deg", self.config.object_focus_horizontal_fov_deg),
+                    self.config.object_focus_horizontal_fov_deg,
+                    minimum=20.0,
+                    maximum=120.0,
+                )
+                yaw_sign = _bounded_float(constraints.get("image_yaw_sign", -1.0), -1.0, minimum=-1.0, maximum=1.0)
+                if abs(yaw_sign) < 1e-6:
+                    yaw_sign = -1.0
+                bbox_yaw_offset_deg = yaw_sign * float(tracked_center["error_norm"]) * horizontal_fov_deg * 0.5
+            raw_correction_deg = tracked_capture_head_pan_delta_deg + bbox_yaw_offset_deg
+            max_initial_correction_deg = _bounded_float(
+                constraints.get("max_initial_sighting_yaw_correction_deg", 100.0),
+                100.0,
+                minimum=1.0,
+                maximum=180.0,
+            )
+            correction_deg = max(min(raw_correction_deg, max_initial_correction_deg), -max_initial_correction_deg)
+            initial_setup: dict[str, Any] = {
+                "source": "tracked_detection",
+                "tracked_capture_head_pan_delta_deg": round(tracked_capture_head_pan_delta_deg, 3),
+                "bbox_yaw_offset_deg": round(bbox_yaw_offset_deg, 3),
+                "raw_correction_deg": round(raw_correction_deg, 3),
+                "chosen_correction_deg": round(correction_deg, 3),
+                "image_center": tracked_center,
+                "reason": (
+                    "Use the first matched search-shot bbox to aim the robot body before any new detector pass."
+                ),
+            }
+            if _constraint_bool(constraints, "reset_head_pan_before_initial_angle_correction", True):
+                initial_setup["pre_angle_camera_pan"] = self.set_camera_pan(
+                    pan_rad=0.0,
+                    reason=(
+                        "Face head camera forward before the initial body yaw correction toward "
+                        f"`{label}`."
+                    ),
+                    settle_s=_bounded_float(
+                        constraints.get("head_pan_settle_s", self.config.region_exploration_head_pan_settle_s),
+                        self.config.region_exploration_head_pan_settle_s,
+                        minimum=0.0,
+                        maximum=3.0,
+                    ),
+                )
+            if abs(correction_deg) > _bounded_float(
+                constraints.get("initial_sighting_yaw_correction_tolerance_deg", 2.0),
+                2.0,
+                minimum=0.0,
+                maximum=20.0,
+            ):
+                initial_setup["rotation"] = self.rotate_by(
+                    delta_yaw_deg=correction_deg,
+                    reason=f"Turn robot body toward first `{label}` sighting before reacquiring front-camera bbox.",
+                    rotation_scope="rear_drive",
+                )
+                if initial_setup["rotation"].get("status") not in {"succeeded", "partial"}:
+                    result = {
+                        "tool": "approach_detected_object",
+                        "status": "blocked",
+                        "object_label": label,
+                        "reason": initial_setup["rotation"].get("reason")
+                        or "Initial tracked-sighting body yaw correction failed.",
+                        "attempts": [{"attempt": 0, "initial_sighting_angle_correction": initial_setup}],
+                    }
+                    self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                    return result
+            else:
+                initial_setup["rotation"] = {
+                    "status": "skipped",
+                    "reason": "Initial tracked sighting was already within yaw correction tolerance.",
+                }
+            setup_actions["initial_sighting_angle_correction"] = initial_setup
+            detector_refresh_required = True
+            initial_angle_corrected = True
+            refresh_after_geometry_failure = False
+        elif _constraint_bool(
+            constraints,
+            "reset_head_pan_before_approach",
+            True,
+        ) and self.config.object_detector_provider not in {"none", "mock"}:
+            setup_actions["pre_approach_camera_pan"] = self.set_camera_pan(
+                pan_rad=0.0,
+                reason=(
+                    "Face head camera forward before RGB-D object approach."
+                ),
+                settle_s=_bounded_float(
+                    constraints.get("head_pan_settle_s", self.config.region_exploration_head_pan_settle_s),
+                    self.config.region_exploration_head_pan_settle_s,
+                    minimum=0.0,
+                    maximum=3.0,
+                ),
+            )
+            if tracked_capture_head_pan_delta_deg is not None:
+                setup_actions["tracked_capture_head_pan_delta_deg"] = round(tracked_capture_head_pan_delta_deg, 3)
+            refresh_after_geometry_failure = False
         for attempt_index in range(1, max_attempts + 1):
             tracked = self._tracked_detection_and_capture(last_state)
             use_tracked_detection = (
                 tracked is not None
-                and motion_steps_since_detection < redetect_after_motion_steps
+                and not detector_refresh_required
                 and not refresh_after_geometry_failure
             )
             if use_tracked_detection and tracked is not None:
@@ -1053,7 +1170,7 @@ class HomeAgentToolRuntime:
                 )
                 source = "detector_refresh"
                 refresh_after_geometry_failure = False
-                motion_steps_since_detection = 0
+                detector_refresh_required = False
                 if detection.get("status") == "matched":
                     last_state = self._resolve_detection_state(
                         detection_id=str(detection.get("selected_detection_id") or ""),
@@ -1062,12 +1179,14 @@ class HomeAgentToolRuntime:
             attempt: dict[str, Any] = {
                 "attempt": attempt_index,
                 "source": source,
-                "motion_steps_since_detection": motion_steps_since_detection,
+                "detector_refresh_required": detector_refresh_required,
                 "capture": capture,
                 "detection": detection,
             }
             if retry_policy and attempt_index == 1:
                 attempt["retry_policy"] = retry_policy
+            if setup_actions and attempt_index == 1:
+                attempt["setup_actions"] = setup_actions
             attempts.append(attempt)
             if detection.get("status") != "matched":
                 if surface_alignment_reacquire_pending and not surface_alignment_reacquire_used:
@@ -1091,7 +1210,8 @@ class HomeAgentToolRuntime:
                             attempt["source"] = source
                             attempt["capture"] = capture
                             attempt["detection"] = detection
-                            attempt["motion_steps_since_detection"] = 0
+                            attempt["detector_refresh_required"] = False
+                            detector_refresh_required = False
                             last_state = self._resolve_detection_state(
                                 detection_id=str(detection.get("selected_detection_id") or ""),
                                 object_label=label,
@@ -1109,6 +1229,58 @@ class HomeAgentToolRuntime:
                 if detection.get("status") == "matched":
                     pass
                 else:
+                    if (
+                        source == "detector_refresh"
+                        and initial_angle_corrected
+                        and not surface_alignment_reacquire_used
+                        and _constraint_bool(constraints, "reacquire_after_initial_detector_miss", True)
+                    ):
+                        surface_alignment_reacquire_used = True
+                        attempt["initial_detection"] = detection
+                        reacquire = self._reacquire_object_after_surface_alignment(
+                            object_label=label,
+                            constraints=constraints,
+                            attempt_index=attempt_index,
+                            sweep_deg=surface_reacquire_sweep_deg,
+                        )
+                        attempt["detector_miss_reacquire"] = reacquire
+                        if reacquire.get("status") == "matched":
+                            reacquired_capture = reacquire.get("capture")
+                            reacquired_detection = reacquire.get("detection")
+                            if isinstance(reacquired_capture, dict) and isinstance(reacquired_detection, dict):
+                                capture = reacquired_capture
+                                detection = reacquired_detection
+                                source = "detector_miss_reacquire"
+                                attempt["source"] = source
+                                attempt["capture"] = capture
+                                attempt["detection"] = detection
+                                attempt["detector_refresh_required"] = False
+                                detector_refresh_required = False
+                                last_state = self._resolve_detection_state(
+                                    detection_id=str(detection.get("selected_detection_id") or ""),
+                                    object_label=label,
+                                )
+                        elif reacquire.get("status") == "blocked":
+                            result = {
+                                "tool": "approach_detected_object",
+                                "status": "blocked",
+                                "object_label": label,
+                                "reason": reacquire.get("reason") or "Object reacquire sweep was blocked.",
+                                "attempts": attempts,
+                            }
+                            self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                            return result
+                    if detection.get("status") != "matched":
+                        result = {
+                            "tool": "approach_detected_object",
+                            "status": "object_lost",
+                            "object_label": label,
+                            "reason": detection.get("reason") or "Object was lost during approach.",
+                            "attempts": attempts,
+                        }
+                        self.emit("tool_blocked", "Approach Object", result["reason"], result)
+                        return result
+                if detection.get("status") != "matched":
                     result = {
                         "tool": "approach_detected_object",
                         "status": "object_lost",
@@ -1159,6 +1331,13 @@ class HomeAgentToolRuntime:
                     camera_forward_m = float(estimated_pose_camera.get("x"))
                 except Exception:
                     camera_forward_m = None
+            camera_frame_yaw_deg: float | None = None
+            base_from_camera_transform = geometry.get("base_from_camera_transform")
+            if isinstance(base_from_camera_transform, dict):
+                try:
+                    camera_frame_yaw_deg = float(base_from_camera_transform.get("yaw_deg"))
+                except Exception:
+                    camera_frame_yaw_deg = None
             use_camera_forward_for_staging = (
                 camera_forward_m is not None
                 and math.isfinite(camera_forward_m)
@@ -1175,6 +1354,11 @@ class HomeAgentToolRuntime:
                 "camera_forward_m": (
                     round(camera_forward_m, 3)
                     if camera_forward_m is not None and math.isfinite(camera_forward_m)
+                    else None
+                ),
+                "camera_frame_yaw_deg": (
+                    round(camera_frame_yaw_deg, 3)
+                    if camera_frame_yaw_deg is not None and math.isfinite(camera_frame_yaw_deg)
                     else None
                 ),
                 "reason": (
@@ -1238,7 +1422,7 @@ class HomeAgentToolRuntime:
                         "reacquire_after_surface_alignment_miss",
                         True,
                     )
-                    motion_steps_since_detection = redetect_after_motion_steps
+                    detector_refresh_required = True
                     refresh_after_geometry_failure = False
                     continue
                 if alignment.get("status") == "blocked":
@@ -1409,7 +1593,7 @@ class HomeAgentToolRuntime:
                     }
                     self.emit("tool_blocked", "Approach Object", result["reason"], result)
                     return result
-                motion_steps_since_detection = redetect_after_motion_steps
+                detector_refresh_required = True
                 attempt["next_action"] = "refresh_detector_after_geometry_bearing_rotation"
                 continue
             safety = geometry.get("safety") if isinstance(geometry.get("safety"), dict) else {}
@@ -1431,12 +1615,20 @@ class HomeAgentToolRuntime:
             if centered_this_attempt and safe_forward_step_m <= 0.01 and forward_m > target_max_m:
                 safe_forward_step_m = max_step_m
             forward_step = min(safe_forward_step_m, max_step_m, desired_forward_step_m)
+            if (
+                0.01 < forward_step < min_actionable_step_m
+                and safe_forward_step_m >= min_actionable_step_m
+                and max_step_m >= min_actionable_step_m
+                and forward_m - min_actionable_step_m >= target_min_m
+            ):
+                forward_step = min_actionable_step_m
             attempt["approach_step"] = {
                 "remaining_to_staging_m": round(remaining_to_staging_m, 3),
                 "step_fraction": round(step_fraction, 3),
                 "desired_forward_step_m": round(desired_forward_step_m, 3),
                 "safe_forward_step_m": round(safe_forward_step_m, 3),
                 "max_step_m": round(max_step_m, 3),
+                "min_actionable_step_m": round(min_actionable_step_m, 3),
                 "chosen_forward_step_m": round(forward_step, 3),
             }
             if forward_step <= 0.01:
@@ -1492,8 +1684,14 @@ class HomeAgentToolRuntime:
                 minimum=0.0,
                 maximum=0.1,
             )
+            no_progress_min_requested_step_m = _bounded_float(
+                constraints.get("no_progress_min_requested_step_m", max(min_actionable_step_m, 0.06)),
+                max(min_actionable_step_m, 0.06),
+                minimum=0.0,
+                maximum=0.2,
+            )
             if (
-                forward_step > 0.02
+                forward_step >= no_progress_min_requested_step_m
                 and actual_pose_delta_m <= min_actual_progress_m
                 and distance_remaining_m >= no_progress_remaining_threshold_m
             ):
@@ -1502,6 +1700,7 @@ class HomeAgentToolRuntime:
                     "actual_pose_delta_m": round(actual_pose_delta_m, 3),
                     "distance_remaining_m": round(distance_remaining_m, 3),
                     "min_actual_progress_m": round(min_actual_progress_m, 3),
+                    "no_progress_min_requested_step_m": round(no_progress_min_requested_step_m, 3),
                     "reason": (
                         "Local motion reported success/partial but odometry showed no measurable "
                         "forward progress, so the approach loop will not retry the same blocked step."
@@ -1518,10 +1717,11 @@ class HomeAgentToolRuntime:
                 }
                 self.emit("tool_blocked", "Approach Object", result["reason"], result)
                 return result
-            motion_steps_since_detection += 1
             if _constraint_bool(constraints, "refresh_detector_after_forward_motion", True):
-                motion_steps_since_detection = redetect_after_motion_steps
+                detector_refresh_required = True
                 attempt["next_action"] = "refresh_detector_after_forward_motion"
+            else:
+                detector_refresh_required = False
         result = {
             "tool": "approach_detected_object",
             "status": "partial",
@@ -2850,9 +3050,10 @@ class HomeTaskAgent:
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, then immediately uses fresh RGB-D detection/geometry for local approach unless relocalize_after_surface_alignment is explicitly requested. It moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If the immediate detector refresh after surface alignment misses the object, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approaches instead of returning to region exploration. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking.",
+                "- approach_detected_object uses the first matched search-shot bbox before any new detector pass: if the object was seen with the head camera panned, it combines that shot yaw with the bbox horizontal offset, faces the head camera forward, and rotates the robot body toward the object. Only after this initial angle correction does it capture/DINO again to reacquire a front-camera bbox for RGB-D geometry. If that reacquire misses, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approach.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
-                "- Object search/grab uses many local rotations and micro-motions, so odometry drift matters. If approach returns partial after useful motion and the object was still detected, call relocalize_here once, then retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false}' so the retry re-detects/checks reachability instead of repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
+                "- Once approach_detected_object has been called for an object, stay in visual/RGB-D approach mode. Do not call relocalize_here between approach attempts; stale ROS camera/head state can make final approach worse. If approach returns partial after useful motion and the object was still detected, retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false, \"reset_head_pan_before_approach\": true}' so the retry refreshes the camera-forward detection and checks reachability without repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
                 "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate using resolve_navigation_to_region with navigation_purpose='object_search' before any execute_region_exploration_plan call. Once near the returned search-entry goal, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
@@ -3686,6 +3887,16 @@ def _yaw_delta_deg(current_yaw: float, target_yaw: float) -> float:
 def _capture_head_pan_delta_deg(capture: dict[str, Any]) -> float | None:
     shot = capture.get("shot") if isinstance(capture, dict) else None
     if not isinstance(shot, dict) or shot.get("yaw") is None:
+        for key in ("shot_id", "artifact_url", "image_path", "metadata_path", "metadata_url"):
+            value = capture.get(key) if isinstance(capture, dict) else None
+            if not isinstance(value, str):
+                continue
+            match = re.search(r"(?:^|[_/-])yaw_(-?\d+(?:\.\d+)?)", value)
+            if match:
+                try:
+                    return float(match.group(1))
+                except Exception:
+                    return None
         return None
     pose = capture.get("robot_pose") if isinstance(capture.get("robot_pose"), dict) else capture.get("current_pose")
     if not isinstance(pose, dict) or pose.get("yaw") is None:
@@ -3801,12 +4012,15 @@ def _agent_tool_model_result(
 
 
 def _compact_agent_tool_result(result: dict[str, Any], *, tool_name: str = "") -> dict[str, Any]:
-    tool = str(result.get("tool") or tool_name or "tool")
+    tool = str(tool_name or result.get("tool") or "tool")
+    source_tool = str(result.get("tool") or "")
     compact: dict[str, Any] = {
         "tool": tool,
         "status": result.get("status"),
         "reason": result.get("reason") or result.get("message") or "",
     }
+    if source_tool and source_tool != tool:
+        compact["source_tool"] = source_tool
     for key in ("target_label", "region_label", "object_label", "waypoint_id", "detection_id"):
         if result.get(key) is not None:
             compact[key] = result.get(key)
