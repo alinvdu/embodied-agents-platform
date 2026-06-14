@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 import importlib.util
+import json
 import ssl
 import threading
 import subprocess
@@ -41,6 +43,40 @@ class OrbbecRgbConfig:
     height: int
     fps: int
     timeout_ms: int
+    log_every: int
+
+
+@dataclass
+class BaseSmoother:
+    max_linear: float
+    max_angular: float
+    linear_accel: float
+    angular_accel: float
+    deadzone: float
+    curve: float
+    x_vel: float = 0.0
+    theta_vel: float = 0.0
+    last_t: float | None = None
+
+
+@dataclass(frozen=True)
+class VrArmTuning:
+    vertical_sign: float
+    y_gain: float
+    z_gain: float
+    ik_alpha: float
+
+
+@dataclass(frozen=True)
+class VrStartupPoseConfig:
+    enabled: bool
+    stow_wait_s: float
+    stow_pose: dict[str, float]
+    action_ready_elbow_delta: float
+    action_ready_shoulder_delta: float
+    action_ready_wrist_delta: float
+    steps_per_stage: int
+    stage_delay_s: float
 
 
 _VR_CAMERA_FRAMES: dict[str, tuple[bytes, int, int, float]] = {}
@@ -49,8 +85,22 @@ _VR_CAMERA_JPEGS: dict[str, tuple[bytes, int, int, float]] = {}
 _VR_CAMERA_JPEGS_LOCK = threading.Lock()
 _ORBBEC_JPEG_CACHE: tuple[Path, int, int, bytes, float] | None = None
 _ORBBEC_JPEG_CACHE_LOCK = threading.Lock()
+_WEBRTC_LOOP: Any = None
+_WEBRTC_LOOP_THREAD: threading.Thread | None = None
+_WEBRTC_PEERS: set[Any] = set()
+_WEBRTC_PEERS_LOCK = threading.Lock()
 _JPEG_QUALITY = 85
 _MJPEG_BOUNDARY = b"frame"
+_NAV_STOW_ARM_POSE = {
+    # Captured from the physical robot's folded right arm on 2026-06-14.
+    # Applied to both arms because the captured left/right folded poses were nearly identical.
+    "shoulder_pan": -4.8316,
+    "shoulder_lift": -99.1708,
+    "elbow_flex": 100.0,
+    "wrist_flex": 76.2061,
+    "wrist_roll": 0.1709,
+    "gripper": 0.9466,
+}
 
 
 @dataclass(frozen=True)
@@ -115,6 +165,11 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--use-degrees", action="store_true")
     parser.add_argument("--xlevr-path", default=None)
     parser.add_argument(
+        "--manual-calibration-prompt",
+        action="store_true",
+        help="Show the XLeRobot calibration restore prompt instead of auto-restoring saved calibration.",
+    )
+    parser.add_argument(
         "--orbbec-rgb-vr",
         action="store_true",
         help="Show the Orbbec Gemini 2 RGB stream in the Quest/XLeVR scene.",
@@ -134,6 +189,66 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--orbbec-height", type=int, default=480)
     parser.add_argument("--orbbec-fps", type=int, default=30)
     parser.add_argument("--orbbec-timeout-ms", type=int, default=1000)
+    parser.add_argument(
+        "--orbbec-log-every",
+        type=int,
+        default=0,
+        help="Native Orbbec sidecar frame log interval. Use 0 to silence frame logs.",
+    )
+    parser.add_argument(
+        "--vr-input-scale",
+        type=float,
+        default=0.35,
+        help="Scale Quest controller movement before it reaches the robot. Lower is slower.",
+    )
+    parser.add_argument(
+        "--vr-kp",
+        type=float,
+        default=0.6,
+        help="VR joint proportional gain. Lower is smoother/slower.",
+    )
+    parser.add_argument(
+        "--vr-camera-hz",
+        type=float,
+        default=30.0,
+        help="How often to poll wrist cameras for the VR overlay.",
+    )
+    parser.add_argument("--vr-base-max-linear", type=float, default=0.25)
+    parser.add_argument("--vr-base-max-angular", type=float, default=75.0)
+    parser.add_argument("--vr-base-linear-accel", type=float, default=0.9)
+    parser.add_argument("--vr-base-angular-accel", type=float, default=240.0)
+    parser.add_argument("--vr-base-deadzone", type=float, default=0.14)
+    parser.add_argument("--vr-base-curve", type=float, default=1.5)
+    parser.add_argument("--vr-arm-vertical-sign", type=float, default=1.0)
+    parser.add_argument("--vr-arm-y-gain", type=float, default=1.4)
+    parser.add_argument("--vr-arm-z-gain", type=float, default=1.0)
+    parser.add_argument("--vr-arm-ik-alpha", type=float, default=0.25)
+    parser.add_argument(
+        "--no-vr-startup-pose",
+        action="store_true",
+        help="Skip NAV_STOW -> ACTION_READY startup pose routine.",
+    )
+    parser.add_argument("--vr-nav-stow-wait-s", type=float, default=10.0)
+    parser.add_argument(
+        "--vr-action-ready-elbow-delta",
+        type=float,
+        default=-80.0,
+        help="Elbow flex delta applied when moving from NAV_STOW to ACTION_READY.",
+    )
+    parser.add_argument(
+        "--vr-action-ready-shoulder-delta",
+        type=float,
+        default=90.0,
+        help="Shoulder lift delta applied after elbow when moving from NAV_STOW to ACTION_READY.",
+    )
+    parser.add_argument(
+        "--vr-action-ready-wrist-delta",
+        type=float,
+        default=-40.0,
+        help="Optional wrist flex delta applied during the elbow stage of ACTION_READY.",
+    )
+    parser.add_argument("--vr-startup-pose-steps", type=int, default=40)
+    parser.add_argument("--vr-startup-pose-stage-delay-s", type=float, default=0.02)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -180,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
             start_key=getattr(args, "start_key", "["),
             stop_key=getattr(args, "stop_key", "]"),
             quit_key=getattr(args, "quit_key", "\\"),
+            auto_restore_calibration=not args.manual_calibration_prompt,
         )
     return _run_vr_backend(
         interface=interface,
@@ -190,6 +306,7 @@ def main(argv: list[str] | None = None) -> int:
         stop_key=getattr(args, "stop_key", "]"),
         quit_key=getattr(args, "quit_key", "\\"),
         xlevr_path=args.xlevr_path,
+        auto_restore_calibration=not args.manual_calibration_prompt,
         orbbec_rgb=OrbbecRgbConfig(
             enabled=args.orbbec_rgb_vr,
             launch_capture=not args.orbbec_no_launch,
@@ -202,6 +319,34 @@ def main(argv: list[str] | None = None) -> int:
             height=args.orbbec_height,
             fps=args.orbbec_fps,
             timeout_ms=args.orbbec_timeout_ms,
+            log_every=args.orbbec_log_every,
+        ),
+        vr_input_scale=args.vr_input_scale,
+        vr_kp=args.vr_kp,
+        vr_camera_hz=args.vr_camera_hz,
+        base_smoother=BaseSmoother(
+            max_linear=args.vr_base_max_linear,
+            max_angular=args.vr_base_max_angular,
+            linear_accel=args.vr_base_linear_accel,
+            angular_accel=args.vr_base_angular_accel,
+            deadzone=args.vr_base_deadzone,
+            curve=args.vr_base_curve,
+        ),
+        arm_tuning=VrArmTuning(
+            vertical_sign=args.vr_arm_vertical_sign,
+            y_gain=args.vr_arm_y_gain,
+            z_gain=args.vr_arm_z_gain,
+            ik_alpha=args.vr_arm_ik_alpha,
+        ),
+        startup_pose=VrStartupPoseConfig(
+            enabled=not args.no_vr_startup_pose,
+            stow_wait_s=args.vr_nav_stow_wait_s,
+            stow_pose=_default_vr_nav_stow_pose(),
+            action_ready_elbow_delta=args.vr_action_ready_elbow_delta,
+            action_ready_shoulder_delta=args.vr_action_ready_shoulder_delta,
+            action_ready_wrist_delta=args.vr_action_ready_wrist_delta,
+            steps_per_stage=args.vr_startup_pose_steps,
+            stage_delay_s=args.vr_startup_pose_stage_delay_s,
         ),
     )
 
@@ -256,6 +401,14 @@ def _parse_camera_spec(raw_spec: str) -> CameraSpec:
     return CameraSpec(name=name.strip(), driver=driver.strip(), source=source.strip())
 
 
+def _default_vr_nav_stow_pose() -> dict[str, float]:
+    return {
+        f"{side}_arm_{joint}.pos": value
+        for side in ("left", "right")
+        for joint, value in _NAV_STOW_ARM_POSE.items()
+    }
+
+
 def _start_orbbec_rgb_sidecar(config: OrbbecRgbConfig) -> subprocess.Popen[bytes] | None:
     if not config.enabled or not config.launch_capture:
         return None
@@ -285,7 +438,7 @@ def _start_orbbec_rgb_sidecar(config: OrbbecRgbConfig) -> subprocess.Popen[bytes
         "--timeout-ms",
         str(config.timeout_ms),
         "--log-every",
-        str(max(1, config.fps)),
+        str(max(0, config.log_every)),
     ]
     print(f"Starting Orbbec RGB sidecar: {' '.join(cmd)}")
     return subprocess.Popen(cmd)
@@ -328,13 +481,20 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
         return True
 
     original_do_get = handler_cls.do_GET
+    original_do_post = getattr(handler_cls, "do_POST", None)
     original_serve_file = handler_cls.serve_file
     handler_cls.orbbec_output_dir = output_dir.resolve()
     handler_cls.orbbec_overlay_include_orbbec = include_orbbec
 
     def do_GET(self):
+        if self.path.startswith("/api/status"):
+            return _serve_xlevr_status(self)
+        if self.path.startswith("/api/config"):
+            return _serve_xlevr_config(self)
         if self.path.startswith("/orbbec/latest.mjpg"):
             return _serve_orbbec_mjpeg_stream(self)
+        if self.path.startswith("/orbbec/latest.jpg"):
+            return _serve_orbbec_jpeg_snapshot(self)
         if self.path.startswith("/orbbec/latest.ppm"):
             return _serve_orbbec_file(self, "latest.ppm", "image/x-portable-pixmap")
         if self.path.startswith("/orbbec/latest.json"):
@@ -342,6 +502,23 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
         if self.path.startswith("/vr-camera/"):
             return _serve_vr_camera_file(self)
         return original_do_get(self)
+
+    def do_POST(self):
+        if self.path.startswith("/api/robot"):
+            return _serve_xlevr_post_ack(self, "robot")
+        if self.path.startswith("/api/keyboard"):
+            return _serve_xlevr_post_ack(self, "keyboard")
+        if self.path.startswith("/api/keypress"):
+            return _serve_xlevr_post_ack(self, "keypress")
+        if self.path.startswith("/api/config"):
+            return _serve_xlevr_post_ack(self, "config")
+        if self.path.startswith("/api/restart"):
+            return _serve_xlevr_post_ack(self, "restart")
+        if self.path.startswith("/webrtc/offer"):
+            return _serve_webrtc_offer(self)
+        if original_do_post is not None:
+            return original_do_post(self)
+        self.send_error(404, "Unknown API endpoint")
 
     def serve_file(self, filename, content_type):
         if filename == "web-ui/vr_app.js":
@@ -364,6 +541,7 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
         return original_serve_file(self, filename, content_type)
 
     handler_cls.do_GET = do_GET
+    handler_cls.do_POST = do_POST
     handler_cls.serve_file = serve_file
     handler_cls._orbbec_overlay_installed = True
     return True
@@ -411,6 +589,143 @@ def _get_robot_observation(robot: Any, *, use_camera: bool = True) -> dict[str, 
         return robot.get_observation()
 
 
+def _get_robot_observation_best_effort(robot: Any) -> tuple[dict[str, Any], Exception | None]:
+    obs = _get_robot_observation(robot, use_camera=False)
+    cameras = getattr(robot, "cameras", None)
+    if not cameras:
+        return obs, None
+
+    first_error: Exception | None = None
+    for cam_key, cam in cameras.items():
+        try:
+            obs[cam_key] = cam.async_read()
+        except Exception as exc:
+            if first_error is None:
+                first_error = exc
+            continue
+    return obs, first_error
+
+
+def _run_vr_startup_pose(robot: Any, vr_teleop: Any, config: VrStartupPoseConfig) -> None:
+    if not config.enabled:
+        robot.send_action(vr_teleop.move_to_zero_position(robot))
+        _sync_vr_teleop_to_current_pose(robot, vr_teleop)
+        return
+
+    if config.stow_pose:
+        print("Moving to NAV_STOW.")
+        _move_to_joint_targets(robot, config.stow_pose, steps=config.steps_per_stage, delay_s=config.stage_delay_s)
+    else:
+        print("Using current robot pose as NAV_STOW.")
+
+    print("folded")
+    if config.stow_wait_s > 0:
+        print(f"Waiting {config.stow_wait_s:.1f}s before moving to ACTION_READY.")
+        time.sleep(config.stow_wait_s)
+
+    _move_to_action_ready(robot, vr_teleop, config)
+
+
+def _move_to_action_ready(robot: Any, vr_teleop: Any, config: VrStartupPoseConfig) -> None:
+    if not config.enabled:
+        robot.send_action(vr_teleop.move_to_zero_position(robot))
+        _sync_vr_teleop_to_current_pose(robot, vr_teleop)
+        return
+
+    print(
+        "Moving to ACTION_READY: "
+        f"elbow delta {config.action_ready_elbow_delta:+.1f}, "
+        f"shoulder delta {config.action_ready_shoulder_delta:+.1f}, "
+        f"wrist delta {config.action_ready_wrist_delta:+.1f}."
+    )
+
+    obs = _get_robot_observation(robot, use_camera=False)
+    elbow_targets: dict[str, float] = {}
+    for side in ("left", "right"):
+        elbow_key = f"{side}_arm_elbow_flex.pos"
+        wrist_key = f"{side}_arm_wrist_flex.pos"
+        if elbow_key in obs:
+            elbow_targets[elbow_key] = float(obs[elbow_key]) + config.action_ready_elbow_delta
+        if config.action_ready_wrist_delta and wrist_key in obs:
+            elbow_targets[wrist_key] = float(obs[wrist_key]) + config.action_ready_wrist_delta
+    if elbow_targets:
+        _move_to_joint_targets(robot, elbow_targets, steps=config.steps_per_stage, delay_s=config.stage_delay_s)
+
+    obs = _get_robot_observation(robot, use_camera=False)
+    shoulder_targets: dict[str, float] = {}
+    for side in ("left", "right"):
+        shoulder_key = f"{side}_arm_shoulder_lift.pos"
+        if shoulder_key in obs:
+            shoulder_targets[shoulder_key] = float(obs[shoulder_key]) + config.action_ready_shoulder_delta
+    if shoulder_targets:
+        _move_to_joint_targets(robot, shoulder_targets, steps=config.steps_per_stage, delay_s=config.stage_delay_s)
+
+    _sync_vr_teleop_to_current_pose(robot, vr_teleop)
+
+
+def _move_to_joint_targets(
+    robot: Any,
+    targets: dict[str, float],
+    *,
+    steps: int,
+    delay_s: float,
+) -> None:
+    if not targets:
+        return
+    obs = _get_robot_observation(robot, use_camera=False)
+    starts = {key: float(obs[key]) for key in targets if key in obs}
+    if not starts:
+        return
+    steps = max(1, steps)
+    for idx in range(1, steps + 1):
+        ratio = idx / steps
+        action = {
+            key: start + (float(targets[key]) - start) * ratio
+            for key, start in starts.items()
+        }
+        robot.send_action(action)
+        if delay_s > 0:
+            time.sleep(delay_s)
+
+
+def _sync_vr_teleop_to_current_pose(robot: Any, vr_teleop: Any) -> None:
+    obs = _get_robot_observation(robot, use_camera=False)
+    for side in ("left", "right"):
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is None:
+            continue
+        targets: dict[str, float] = {}
+        for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
+            obs_key = f"{side}_arm_{joint}.pos"
+            if obs_key in obs:
+                targets[joint] = float(obs[obs_key])
+        if targets:
+            arm.target_positions = targets
+            arm.pitch = targets.get("wrist_flex", 0.0) + targets.get("shoulder_lift", 0.0) + targets.get("elbow_flex", 0.0)
+            kin = getattr(arm, "kinematics", None)
+            if kin is not None and hasattr(kin, "forward_kinematics"):
+                try:
+                    arm.current_x, arm.current_y = kin.forward_kinematics(
+                        targets.get("shoulder_lift", 0.0),
+                        targets.get("elbow_flex", 0.0),
+                    )
+                except Exception:
+                    pass
+        for attr in ("prev_vr_pos", "prev_wrist_flex", "prev_wrist_roll"):
+            if hasattr(arm, attr):
+                delattr(arm, attr)
+
+    head = getattr(vr_teleop, "head_control", None)
+    if head is not None:
+        head_targets = {
+            motor: float(obs[f"{motor}.pos"])
+            for motor in ("head_motor_1", "head_motor_2")
+            if f"{motor}.pos" in obs
+        }
+        if head_targets:
+            head.target_positions = head_targets
+
+
 def _write_response(handler: Any, content: bytes, content_type: str) -> None:
     handler.send_response(200)
     handler.send_header("Content-Type", content_type)
@@ -420,16 +735,197 @@ def _write_response(handler: Any, content: bytes, content_type: str) -> None:
     handler.wfile.write(content)
 
 
+def _write_json_response(handler: Any, payload: str, *, status: int = 200) -> None:
+    content = payload.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(content)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.end_headers()
+    handler.wfile.write(content)
+
+
+def _serve_xlevr_status(handler: Any) -> None:
+    _write_json_response(
+        handler,
+        (
+            '{"left_arm_connected":true,"right_arm_connected":true,'
+            '"vrConnected":true,"keyboardEnabled":false,"robotEngaged":true}'
+        ),
+    )
+
+
+def _serve_xlevr_config(handler: Any) -> None:
+    _write_json_response(
+        handler,
+        (
+            '{"robot":{"left_arm":{"name":"left","port":"","enabled":true},'
+            '"right_arm":{"name":"right","port":"","enabled":true},'
+            '"vr_to_robot_scale":1.0,"send_interval":0.05},'
+            '"network":{"https_port":8443,"websocket_port":8442,"host_ip":"0.0.0.0"},'
+            '"control":{"keyboard":{"pos_step":0.01,"angle_step":1.0}}}'
+        ),
+    )
+
+
+def _serve_xlevr_post_ack(handler: Any, endpoint: str) -> None:
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except ValueError:
+        length = 0
+    if length > 0:
+        handler.rfile.read(length)
+    _write_json_response(handler, f'{{"success":true,"endpoint":"{endpoint}"}}')
+
+
+def _serve_webrtc_offer(handler: Any) -> None:
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except ValueError:
+        length = 0
+    try:
+        payload = json.loads(handler.rfile.read(length).decode("utf-8") if length else "{}")
+    except Exception as exc:
+        return _write_json_response(handler, json.dumps({"error": f"Invalid WebRTC offer: {exc}"}), status=400)
+
+    loop = _ensure_webrtc_loop()
+    future = _run_coroutine_threadsafe(
+        _create_webrtc_answer(
+            payload,
+            output_dir=getattr(handler.__class__, "orbbec_output_dir", None),
+            include_orbbec=getattr(handler.__class__, "orbbec_overlay_include_orbbec", True),
+        ),
+        loop,
+    )
+    try:
+        answer = future.result(timeout=10)
+    except ModuleNotFoundError as exc:
+        return _write_json_response(
+            handler,
+            json.dumps({"error": f"{exc.name} is not installed. Install aiortc in the xlerobot env."}),
+            status=503,
+        )
+    except Exception as exc:
+        return _write_json_response(handler, json.dumps({"error": f"WebRTC offer failed: {exc}"}), status=500)
+    _write_json_response(handler, json.dumps(answer))
+
+
+def _ensure_webrtc_loop() -> Any:
+    global _WEBRTC_LOOP, _WEBRTC_LOOP_THREAD
+    if _WEBRTC_LOOP is not None:
+        return _WEBRTC_LOOP
+
+    import asyncio
+
+    loop = asyncio.new_event_loop()
+
+    def run() -> None:
+        asyncio.set_event_loop(loop)
+        loop.run_forever()
+
+    thread = threading.Thread(target=run, name="robot42-webrtc", daemon=True)
+    thread.start()
+    _WEBRTC_LOOP = loop
+    _WEBRTC_LOOP_THREAD = thread
+    return loop
+
+
+def _run_coroutine_threadsafe(coro: Any, loop: Any) -> Any:
+    import asyncio
+
+    return asyncio.run_coroutine_threadsafe(coro, loop)
+
+
+async def _create_webrtc_answer(
+    offer_payload: dict[str, Any],
+    *,
+    output_dir: Path | None,
+    include_orbbec: bool,
+) -> dict[str, Any]:
+    from aiortc import RTCPeerConnection, RTCSessionDescription
+
+    offer = RTCSessionDescription(sdp=offer_payload["sdp"], type=offer_payload["type"])
+    requested = offer_payload.get("feeds") or ["orbbec", "left_wrist", "right_wrist"]
+    feeds = [name for name in requested if name in {"orbbec", "left_wrist", "right_wrist"}]
+    if not include_orbbec:
+        feeds = [name for name in feeds if name != "orbbec"]
+
+    pc = RTCPeerConnection()
+    with _WEBRTC_PEERS_LOCK:
+        _WEBRTC_PEERS.add(pc)
+
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange() -> None:
+        if pc.connectionState in {"failed", "closed", "disconnected"}:
+            with _WEBRTC_PEERS_LOCK:
+                _WEBRTC_PEERS.discard(pc)
+            await pc.close()
+
+    await pc.setRemoteDescription(offer)
+    for name in feeds:
+        pc.addTrack(_make_shared_jpeg_video_track(name, output_dir=output_dir))
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+    return {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type, "feeds": feeds}
+
+
+def _make_shared_jpeg_video_track(name: str, *, output_dir: Path | None) -> Any:
+    from aiortc import VideoStreamTrack
+
+    class SharedJpegVideoTrack(VideoStreamTrack):
+        def __init__(self, feed_name: str, feed_output_dir: Path | None) -> None:
+            super().__init__()
+            self.feed_name = feed_name
+            self.feed_output_dir = feed_output_dir
+            self.last_jpeg: bytes | None = None
+
+        async def recv(self) -> Any:
+            import cv2
+            import numpy as np
+            from av import VideoFrame
+
+            pts, time_base = await self.next_timestamp()
+            frame = _latest_webrtc_jpeg(self.feed_name, self.feed_output_dir)
+            if frame is not None:
+                self.last_jpeg = frame[0]
+
+            if self.last_jpeg is None:
+                rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+            else:
+                data = np.frombuffer(self.last_jpeg, dtype=np.uint8)
+                bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    rgb = np.zeros((480, 640, 3), dtype=np.uint8)
+                else:
+                    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            video_frame = VideoFrame.from_ndarray(rgb, format="rgb24")
+            video_frame.pts = pts
+            video_frame.time_base = time_base
+            return video_frame
+
+    return SharedJpegVideoTrack(name, output_dir)
+
+
+def _latest_webrtc_jpeg(name: str, output_dir: Path | None) -> tuple[bytes, int, int, float] | None:
+    if name == "orbbec":
+        return _latest_orbbec_jpeg_from_dir(output_dir)
+    return _latest_vr_camera_jpeg(name)
+
+
 def _serve_vr_camera_file(handler: Any) -> None:
     parsed = urllib.parse.urlparse(handler.path)
     rel = parsed.path.removeprefix("/vr-camera/")
     name, suffix = Path(rel).stem, Path(rel).suffix
-    if not name or suffix not in {".ppm", ".json", ".mjpg"}:
+    if not name or suffix not in {".ppm", ".json", ".mjpg", ".jpg"}:
         handler.send_error(404, "Unknown VR camera endpoint")
         return
 
     if suffix == ".mjpg":
         return _serve_vr_camera_mjpeg_stream(handler, name)
+    if suffix == ".jpg":
+        return _serve_vr_camera_jpeg_snapshot(handler, name)
 
     with _VR_CAMERA_FRAMES_LOCK:
         frame = _VR_CAMERA_FRAMES.get(name)
@@ -465,6 +961,18 @@ def _serve_vr_camera_mjpeg_stream(handler: Any, name: str) -> None:
     handler.send_header("Pragma", "no-cache")
     handler.end_headers()
     _stream_jpeg_frames(handler, lambda: _latest_vr_camera_jpeg(name), fps=30)
+
+
+def _serve_vr_camera_jpeg_snapshot(handler: Any, name: str) -> None:
+    frame = _latest_vr_camera_jpeg(name)
+    if frame is None:
+        handler.send_error(404, f"VR camera JPEG not ready: {name}")
+        return
+    jpeg, _width, _height, _captured_at = frame
+    try:
+        _write_response(handler, jpeg, "image/jpeg")
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+        return
 
 
 def _latest_vr_camera_jpeg(name: str) -> tuple[bytes, int, int, float] | None:
@@ -530,8 +1038,24 @@ def _serve_orbbec_mjpeg_stream(handler: Any) -> None:
     _stream_jpeg_frames(handler, lambda: _latest_orbbec_jpeg(handler), fps=30)
 
 
+def _serve_orbbec_jpeg_snapshot(handler: Any) -> None:
+    frame = _latest_orbbec_jpeg(handler)
+    if frame is None:
+        handler.send_error(404, "Orbbec RGB JPEG not ready")
+        return
+    jpeg, _width, _height, _captured_at = frame
+    try:
+        _write_response(handler, jpeg, "image/jpeg")
+    except (BrokenPipeError, ConnectionResetError, ssl.SSLError):
+        return
+
+
 def _latest_orbbec_jpeg(handler: Any) -> tuple[bytes, int, int, float] | None:
     output_dir = getattr(handler.__class__, "orbbec_output_dir", None)
+    return _latest_orbbec_jpeg_from_dir(output_dir)
+
+
+def _latest_orbbec_jpeg_from_dir(output_dir: Path | None) -> tuple[bytes, int, int, float] | None:
     if output_dir is None:
         return None
     path = Path(output_dir) / "latest.ppm"
@@ -609,39 +1133,45 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
   const FEEDS = [
     {
       name: 'orbbec',
-      url: '/orbbec/latest.mjpg',
+      url: '/orbbec/latest.jpg',
       canvasId: 'orbbec-rgb-canvas',
       width: 0.8,
       height: 0.6,
       position: [0, -0.18, -1.05],
       markerPosition: [-0.42, 0.32, -1.04],
-      logName: 'Orbbec RGB'
+      logName: 'Orbbec RGB',
+      pollMs: 120
     },
     {
       name: 'left_wrist',
-      url: '/vr-camera/left_wrist.mjpg',
+      url: '/vr-camera/left_wrist.jpg',
       canvasId: 'left-wrist-rgb-canvas',
       width: 0.32,
       height: 0.24,
       position: [-0.17, -0.56, -1.02],
       markerPosition: [-0.34, -0.42, -1.01],
-      logName: 'Left wrist'
+      logName: 'Left wrist',
+      pollMs: 160
     },
     {
       name: 'right_wrist',
-      url: '/vr-camera/right_wrist.mjpg',
+      url: '/vr-camera/right_wrist.jpg',
       canvasId: 'right-wrist-rgb-canvas',
       width: 0.32,
       height: 0.24,
       position: [0.17, -0.56, -1.02],
       markerPosition: [0.0, -0.42, -1.01],
-      logName: 'Right wrist'
+      logName: 'Right wrist',
+      pollMs: 160
     }
   ];
   const INCLUDE_ORBBEC = __INCLUDE_ORBBEC__;
   const ACTIVE_FEEDS = FEEDS.filter(feed => INCLUDE_ORBBEC || feed.name !== 'orbbec');
   const overlays = new Map();
   let lastStatusLog = 0;
+  let webRtcStarted = false;
+  let webRtcFailed = false;
+  let webRtcPc = null;
 
   function ensurePanel(feed) {
     const headset = document.querySelector('#headset');
@@ -658,11 +1188,17 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
     }
 
     if (!overlays.has(feed.name)) {
-      const image = new Image();
-      image.crossOrigin = 'anonymous';
-      image.src = `${feed.url}?t=${Date.now()}`;
+      const video = document.createElement('video');
+      video.id = `${feed.name}-webrtc-video`;
+      video.autoplay = true;
+      video.muted = true;
+      video.playsInline = true;
+      video.setAttribute('playsinline', '');
+      video.setAttribute('webkit-playsinline', '');
+      video.style.display = 'none';
+      document.body.appendChild(video);
 
-      const texture = new THREE.CanvasTexture(canvas);
+      const texture = new THREE.VideoTexture(video);
       texture.minFilter = THREE.LinearFilter;
       texture.magFilter = THREE.LinearFilter;
       texture.generateMipmaps = false;
@@ -688,46 +1224,113 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       marker.renderOrder = 1000;
       headset.object3D.add(marker);
 
-      overlays.set(feed.name, { canvas, texture, mesh, marker, image });
-      console.log(`[${feed.logName}] MJPEG headset overlay created`);
+      overlays.set(feed.name, {
+        canvas,
+        video,
+        texture,
+        mesh,
+        marker,
+        loading: false,
+        lastRequestAt: 0,
+        frameCount: 0
+      });
+      console.log(`[${feed.logName}] WebRTC headset overlay created`);
     }
 
     return overlays.get(feed.name);
   }
 
-  function updateFrame(feed) {
+  function updateVideoTexture(feed) {
     const nodes = ensurePanel(feed);
     if (!nodes) return;
+    const videoReady = nodes.video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+    if (videoReady) {
+      nodes.texture.needsUpdate = true;
+      nodes.frameCount += 1;
+      if (nodes.marker) nodes.marker.material.color.setHex(0x00ff00);
+      if (Date.now() - lastStatusLog > 3000) {
+        console.log(`[${feed.logName}] WebRTC video ${nodes.video.videoWidth || 0}x${nodes.video.videoHeight || 0}`);
+        lastStatusLog = Date.now();
+      }
+    } else if (nodes.marker) {
+      nodes.marker.material.color.setHex(webRtcFailed ? 0xff0000 : 0xffff00);
+    }
+  }
+
+  function waitForIceGatheringComplete(pc) {
+    if (pc.iceGatheringState === 'complete') return Promise.resolve();
+    return new Promise(resolve => {
+      const check = () => {
+        if (pc.iceGatheringState === 'complete') {
+          pc.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }
+      };
+      pc.addEventListener('icegatheringstatechange', check);
+    });
+  }
+
+  async function startWebRtc() {
+    if (webRtcStarted || webRtcFailed) return;
+    webRtcStarted = true;
     try {
-      const { canvas, texture, marker, image } = nodes;
-      if (!image.naturalWidth || !image.naturalHeight) {
-        throw new Error('MJPEG image not ready');
+      ACTIVE_FEEDS.forEach(ensurePanel);
+      const pc = new RTCPeerConnection({ iceServers: [] });
+      webRtcPc = pc;
+      let trackIndex = 0;
+
+      ACTIVE_FEEDS.forEach(() => {
+        pc.addTransceiver('video', { direction: 'recvonly' });
+      });
+
+      pc.ontrack = (event) => {
+        const feed = ACTIVE_FEEDS[trackIndex++];
+        if (!feed) return;
+        const nodes = ensurePanel(feed);
+        if (!nodes) return;
+        nodes.video.srcObject = new MediaStream([event.track]);
+        nodes.video.play().catch(error => {
+          console.warn(`[${feed.logName}] Video play was delayed`, error);
+        });
+        console.log(`[${feed.logName}] WebRTC track attached`);
+      };
+
+      pc.onconnectionstatechange = () => {
+        console.log(`[Robot42 WebRTC] connection state: ${pc.connectionState}`);
+        if (['failed', 'disconnected', 'closed'].includes(pc.connectionState)) {
+          webRtcFailed = true;
+        }
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await waitForIceGatheringComplete(pc);
+
+      const response = await fetch('/webrtc/offer', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sdp: pc.localDescription.sdp,
+          type: pc.localDescription.type,
+          feeds: ACTIVE_FEEDS.map(feed => feed.name)
+        })
+      });
+      const answer = await response.json();
+      if (!response.ok) {
+        throw new Error(answer.error || `WebRTC signaling failed with HTTP ${response.status}`);
       }
-      if (canvas.width !== image.naturalWidth || canvas.height !== image.naturalHeight) {
-        canvas.width = image.naturalWidth;
-        canvas.height = image.naturalHeight;
-      }
-      const ctx = canvas.getContext('2d');
-      ctx.drawImage(image, 0, 0, canvas.width, canvas.height);
-      texture.image = canvas;
-      texture.needsUpdate = true;
-      if (marker) marker.material.color.setHex(0x00ff00);
-      if (Date.now() - lastStatusLog > 3000) {
-        console.log(`[${feed.logName}] Streaming ${canvas.width}x${canvas.height}`);
-        lastStatusLog = Date.now();
-      }
+      await pc.setRemoteDescription(answer);
+      console.log('[Robot42 WebRTC] video answer installed', answer.feeds || []);
     } catch (error) {
-      if (nodes.marker) nodes.marker.material.color.setHex(0xff0000);
-      if (Date.now() - lastStatusLog > 3000) {
-        console.warn(`[${feed.logName}] Waiting for frame`, error);
-        lastStatusLog = Date.now();
-      }
+      webRtcFailed = true;
+      console.error('[Robot42 WebRTC] video setup failed', error);
     }
   }
 
   function start() {
+    startWebRtc();
     function renderStreams() {
-      ACTIVE_FEEDS.forEach(updateFrame);
+      ACTIVE_FEEDS.forEach(updateVideoTexture);
       requestAnimationFrame(renderStreams);
     }
     renderStreams();
@@ -751,6 +1354,7 @@ def _run_keyboard_backend(
     start_key: str,
     stop_key: str,
     quit_key: str,
+    auto_restore_calibration: bool,
 ) -> int:
     from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
     from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
@@ -768,7 +1372,7 @@ def _run_keyboard_backend(
     keyboard = KeyboardTeleop(keyboard_config)
     previous_pressed_keys: set[str] = set()
 
-    robot.connect()
+    _connect_robot(robot, auto_restore_calibration=auto_restore_calibration)
     init_rerun(session_name="xlerobot_real_keyboard_playground")
     keyboard.connect()
 
@@ -864,7 +1468,14 @@ def _run_vr_backend(
     stop_key: str,
     quit_key: str,
     xlevr_path: str | None,
+    auto_restore_calibration: bool,
     orbbec_rgb: OrbbecRgbConfig,
+    vr_input_scale: float,
+    vr_kp: float,
+    vr_camera_hz: float,
+    base_smoother: BaseSmoother,
+    arm_tuning: VrArmTuning,
+    startup_pose: VrStartupPoseConfig,
 ) -> int:
     from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
     from lerobot.teleoperators.keyboard.teleop_keyboard import KeyboardTeleop
@@ -876,17 +1487,26 @@ def _run_vr_backend(
     previous_pressed_keys: set[str] = set()
 
     orbbec_process = _start_orbbec_rgb_sidecar(orbbec_rgb)
-    robot.connect()
+    _connect_robot(robot, auto_restore_calibration=auto_restore_calibration)
     init_rerun(session_name="xlerobot_real_vr_playground")
     hotkeys.connect()
 
-    vr_overrides = {}
+    vr_overrides = {"kp": vr_kp}
     if xlevr_path is not None:
         vr_overrides["xlevr_path"] = xlevr_path
     vr_teleop = interface.make_vr_teleop(**vr_overrides)
     if _enable_threaded_vr_http(vr_teleop):
         print("XLeVR HTTPS server patched to ThreadingHTTPServer for camera streams.")
     vr_teleop.connect(robot=robot)
+    _configure_vr_runtime(vr_teleop, input_scale=vr_input_scale)
+    _install_vr_arm_tuning(vr_teleop, arm_tuning)
+    print(
+        "VR base smoothing: "
+        f"max {base_smoother.max_linear:.2f} m/s, "
+        f"{base_smoother.max_angular:.0f} deg/s; "
+        f"accel {base_smoother.linear_accel:.2f} m/s^2, "
+        f"{base_smoother.angular_accel:.0f} deg/s^2."
+    )
     installed = _install_orbbec_vr_overlay(
         vr_teleop,
         orbbec_rgb.output_dir,
@@ -898,8 +1518,8 @@ def _run_vr_backend(
         print("VR arm camera panels enabled for camera names: left_wrist and right_wrist.")
     elif orbbec_rgb.enabled:
         print("Orbbec RGB sidecar is running, but the XLeVR web overlay could not be installed.")
-    vr_teleop.send_feedback()
-    robot.send_action(vr_teleop.move_to_zero_position(robot))
+    _run_vr_startup_pose(robot, vr_teleop, startup_pose)
+    print("Robot moved to ACTION_READY. Open the Quest page and start controller tracking.")
     _print_recording_guide(
         recording,
         start_key=start_key,
@@ -907,6 +1527,10 @@ def _run_vr_backend(
         quit_key=quit_key,
         controller="vr",
     )
+
+    camera_interval_s = 1.0 / max(0.1, vr_camera_hz)
+    next_camera_t = 0.0
+    last_camera_warn_t = 0.0
 
     try:
         while True:
@@ -926,11 +1550,12 @@ def _run_vr_backend(
                 stop_key=stop_key,
             )
 
-            vr_decision = VRRecordingDecision()
+            vr_controls = _map_vr_events_to_recording_controls(vr_teleop.get_vr_events())
+            vr_decision = VRRecordingDecision(reset_robot=vr_controls.reset_robot)
             if recording is not None:
                 vr_decision = _decide_vr_recording_action(
                     recording.active,
-                    _map_vr_events_to_recording_controls(vr_teleop.get_vr_events()),
+                    vr_controls,
                 )
                 _apply_vr_recording_decision(recording, vr_decision)
                 if vr_decision.quit_session:
@@ -938,15 +1563,25 @@ def _run_vr_backend(
 
             obs = _get_robot_observation(robot, use_camera=False)
             if vr_decision.reset_robot:
-                action = vr_teleop.move_to_zero_position(robot)
+                _move_to_action_ready(robot, vr_teleop, startup_pose)
+                action = {}
             else:
                 action = vr_teleop.get_action(obs, robot)
+            action = _smooth_vr_base_action(action, base_smoother)
             if action:
                 sent_action = robot.send_action(action)
             else:
                 sent_action = {}
-            obs = _get_robot_observation(robot, use_camera=True)
-            _publish_vr_camera_frames(obs)
+            now = time.perf_counter()
+            if now >= next_camera_t:
+                next_camera_t = now + camera_interval_s
+                camera_obs, camera_error = _get_robot_observation_best_effort(robot)
+                if camera_error is not None and now - last_camera_warn_t >= 5.0:
+                    print(f"VR camera read skipped: {camera_error}")
+                    last_camera_warn_t = now
+                _publish_vr_camera_frames(camera_obs)
+                if recording is not None:
+                    obs = camera_obs
             log_rerun_data(obs, sent_action)
             _record_frame_if_needed(recording, obs, sent_action)
 
@@ -965,6 +1600,193 @@ def _run_vr_backend(
             if hotkeys.is_connected:
                 hotkeys.disconnect()
     return 0
+
+
+def _configure_vr_runtime(vr_teleop: Any, *, input_scale: float) -> None:
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    config = getattr(monitor, "config", None)
+    if config is not None and hasattr(config, "vr_to_robot_scale"):
+        config.vr_to_robot_scale = input_scale
+    print(f"VR input scale set to {input_scale:.3f}.")
+
+
+def _install_vr_arm_tuning(vr_teleop: Any, tuning: VrArmTuning) -> None:
+    import types
+
+    for arm_name in ("left_arm", "right_arm"):
+        arm = getattr(vr_teleop, arm_name, None)
+        if arm is None:
+            continue
+        arm.handle_vr_input = types.MethodType(_tuned_vr_arm_input(tuning), arm)
+    print(
+        "VR arm tuning: "
+        f"vertical_sign={tuning.vertical_sign:g}, "
+        f"y_gain={tuning.y_gain:.2f}, "
+        f"z_gain={tuning.z_gain:.2f}, "
+        f"ik_alpha={tuning.ik_alpha:.2f}."
+    )
+
+
+def _tuned_vr_arm_input(tuning: VrArmTuning) -> Any:
+    def handle_vr_input(self: Any, vr_goal: Any, gripper_state: Any) -> None:
+        if vr_goal is None or not hasattr(vr_goal, "target_position") or vr_goal.target_position is None:
+            return
+
+        current_vr_pos = vr_goal.target_position
+        if not hasattr(self, "prev_vr_pos"):
+            self.prev_vr_pos = current_vr_pos
+            return
+
+        vr_x = (current_vr_pos[0] - self.prev_vr_pos[0]) * 170
+        vr_y = (current_vr_pos[1] - self.prev_vr_pos[1]) * 80 * tuning.y_gain
+        vr_z = (current_vr_pos[2] - self.prev_vr_pos[2]) * 80 * tuning.z_gain
+        self.prev_vr_pos = current_vr_pos
+
+        pos_scale = 0.015
+        angle_scale = 3.0
+        delta_limit = 0.02
+        angle_limit = 6.0
+
+        delta_x = _deadzone_clip(vr_x * pos_scale, deadzone=0.001, limit=delta_limit)
+        delta_y = _deadzone_clip(vr_y * pos_scale, deadzone=0.001, limit=delta_limit)
+        delta_z = _deadzone_clip(vr_z * pos_scale, deadzone=0.001, limit=delta_limit)
+
+        self.current_x += -delta_z
+        self.current_y += tuning.vertical_sign * delta_y
+
+        if hasattr(vr_goal, "wrist_flex_deg") and vr_goal.wrist_flex_deg is not None:
+            if not hasattr(self, "prev_wrist_flex"):
+                self.prev_wrist_flex = vr_goal.wrist_flex_deg
+            else:
+                delta_pitch = (vr_goal.wrist_flex_deg - self.prev_wrist_flex) * angle_scale
+                delta_pitch = _deadzone_clip(delta_pitch, deadzone=1.0, limit=angle_limit)
+                self.pitch += delta_pitch
+                self.pitch = max(-90, min(90, self.pitch))
+                self.prev_wrist_flex = vr_goal.wrist_flex_deg
+
+        if hasattr(vr_goal, "wrist_roll_deg") and vr_goal.wrist_roll_deg is not None:
+            if not hasattr(self, "prev_wrist_roll"):
+                self.prev_wrist_roll = vr_goal.wrist_roll_deg
+            else:
+                delta_roll = (vr_goal.wrist_roll_deg - self.prev_wrist_roll) * angle_scale
+                delta_roll = _deadzone_clip(delta_roll, deadzone=1.0, limit=angle_limit)
+                current_roll = self.target_positions.get("wrist_roll", 0.0)
+                self.target_positions["wrist_roll"] = max(-90, min(90, current_roll + delta_roll))
+                self.prev_wrist_roll = vr_goal.wrist_roll_deg
+
+        if abs(delta_x) > 0.001:
+            delta_pan = max(-angle_limit, min(angle_limit, delta_x * 200.0))
+            current_pan = self.target_positions.get("shoulder_pan", 0.0)
+            self.target_positions["shoulder_pan"] = max(-180, min(180, current_pan + delta_pan))
+
+        try:
+            joint2_target, joint3_target = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
+            alpha = max(0.01, min(1.0, tuning.ik_alpha))
+            self.target_positions["shoulder_lift"] = (
+                (1 - alpha) * self.target_positions.get("shoulder_lift", 0.0) + alpha * joint2_target
+            )
+            self.target_positions["elbow_flex"] = (
+                (1 - alpha) * self.target_positions.get("elbow_flex", 0.0) + alpha * joint3_target
+            )
+        except Exception as exc:
+            print(f"[{self.prefix}] VR IK failed: {exc}")
+
+        self.target_positions["wrist_flex"] = (
+            -self.target_positions["shoulder_lift"] - self.target_positions["elbow_flex"] + self.pitch
+        )
+        self.target_positions["gripper"] = 45 if vr_goal.metadata.get("trigger", 0) > 0.5 else 0.0
+
+    return handle_vr_input
+
+
+def _deadzone_clip(value: float, *, deadzone: float, limit: float) -> float:
+    if -deadzone < value < deadzone:
+        return 0.0
+    return max(-limit, min(limit, value))
+
+
+def _smooth_vr_base_action(action: dict[str, Any], smoother: BaseSmoother) -> dict[str, Any]:
+    if not action:
+        return action
+    if "x.vel" not in action and "theta.vel" not in action:
+        return action
+
+    now = time.perf_counter()
+    dt = 1.0 / 30.0 if smoother.last_t is None else max(0.001, min(0.1, now - smoother.last_t))
+    smoother.last_t = now
+
+    target_x = _shape_axis(
+        float(action.get("x.vel", 0.0) or 0.0),
+        source_max=0.5,
+        target_max=smoother.max_linear,
+        deadzone=smoother.deadzone,
+        curve=smoother.curve,
+    )
+    target_theta = _shape_axis(
+        float(action.get("theta.vel", 0.0) or 0.0),
+        source_max=120.0,
+        target_max=smoother.max_angular,
+        deadzone=smoother.deadzone,
+        curve=smoother.curve,
+    )
+
+    smoother.x_vel = _slew(smoother.x_vel, target_x, smoother.linear_accel * dt)
+    smoother.theta_vel = _slew(smoother.theta_vel, target_theta, smoother.angular_accel * dt)
+
+    smoothed = dict(action)
+    smoothed["x.vel"] = smoother.x_vel
+    smoothed["theta.vel"] = smoother.theta_vel
+    return smoothed
+
+
+def _shape_axis(
+    value: float,
+    *,
+    source_max: float,
+    target_max: float,
+    deadzone: float,
+    curve: float,
+) -> float:
+    if source_max <= 0 or target_max <= 0:
+        return 0.0
+    normalized = max(-1.0, min(1.0, value / source_max))
+    magnitude = abs(normalized)
+    if magnitude <= deadzone:
+        return 0.0
+    scaled = (magnitude - deadzone) / max(1e-6, 1.0 - deadzone)
+    shaped = scaled ** max(1.0, curve)
+    return (1.0 if normalized >= 0 else -1.0) * shaped * target_max
+
+
+def _slew(current: float, target: float, max_step: float) -> float:
+    if max_step <= 0:
+        return target
+    delta = target - current
+    if delta > max_step:
+        return current + max_step
+    if delta < -max_step:
+        return current - max_step
+    return target
+
+
+def _connect_robot(robot: Any, *, auto_restore_calibration: bool) -> None:
+    if not auto_restore_calibration:
+        robot.connect()
+        return
+
+    original_input = builtins.input
+
+    def auto_input(prompt: str = "") -> str:
+        if "restore calibration from file" in prompt:
+            print(prompt)
+            return ""
+        return original_input(prompt)
+
+    try:
+        builtins.input = auto_input
+        robot.connect()
+    finally:
+        builtins.input = original_input
 
 
 def _create_dataset(
