@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import builtins
+import importlib
 import importlib.util
 import json
+import math
 import ssl
 import threading
 import subprocess
@@ -24,6 +27,9 @@ class CameraSpec:
     name: str
     driver: str
     source: str
+    width: int | None = None
+    height: int | None = None
+    fps: int | None = None
 
 
 @dataclass
@@ -31,6 +37,9 @@ class RecordingSession:
     dataset: Any
     task: str
     active: bool = False
+    orbbec_output_dir: Path | None = None
+    orbbec_camera_key: str = "head"
+    last_missing_feature_warn_t: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -61,10 +70,32 @@ class BaseSmoother:
 
 @dataclass(frozen=True)
 class VrArmTuning:
+    ik_mode: str
     vertical_sign: float
     y_gain: float
     z_gain: float
     ik_alpha: float
+    yawed_forward_gain: float
+    yawed_lateral_gain: float
+    yawed_pan_sign: float
+    yawed_pan_limit: float
+    shoulder_lift_min: float
+    shoulder_lift_max: float
+    elbow_flex_min: float
+    elbow_flex_max: float
+    enforce_joint_limits: bool
+    debug: bool
+    debug_hz: float
+
+
+@dataclass(frozen=True)
+class VrVideoDisplayConfig:
+    wrist_gain: float
+    wrist_gamma: float
+    wrist_bias: float
+    orbbec_gain: float
+    orbbec_gamma: float
+    orbbec_bias: float
 
 
 @dataclass(frozen=True)
@@ -101,6 +132,22 @@ _NAV_STOW_ARM_POSE = {
     "wrist_roll": 0.1709,
     "gripper": 0.9466,
 }
+_VR_ARM_CLUTCH_RELEASE_HOLD_FRAMES = 3
+_VR_BASKET_POSE_DEFAULTS = {
+    # Captured from physical basket-placement poses on 2026-06-21.
+    "left_arm_shoulder_pan.pos": 17.5510,
+    "left_arm_shoulder_lift.pos": -38.5593,
+    "left_arm_elbow_flex.pos": 72.3118,
+    "left_arm_wrist_flex.pos": 64.8387,
+    "left_arm_wrist_roll.pos": -5.9111,
+    "left_arm_gripper.pos": 1.3889,
+    "right_arm_shoulder_pan.pos": -21.0835,
+    "right_arm_shoulder_lift.pos": -30.9287,
+    "right_arm_elbow_flex.pos": 70.2739,
+    "right_arm_wrist_flex.pos": 63.2052,
+    "right_arm_wrist_roll.pos": -2.7595,
+    "right_arm_gripper.pos": 1.7579,
+}
 
 
 @dataclass(frozen=True)
@@ -120,6 +167,40 @@ class VRRecordingDecision:
     reset_robot: bool = False
 
 
+@dataclass(frozen=True)
+class VrArmClutchKeys:
+    left: str
+    right: str
+
+
+@dataclass(frozen=True)
+class VrBasketPoseConfig:
+    enabled: bool
+    skill_arm: str
+    full_reset_key: str
+    right_basket_key: str
+    right_action_key: str
+    left_basket_key: str
+    left_action_key: str
+    right_basket_button: str
+    right_action_button: str
+    left_basket_button: str
+    left_action_button: str
+    targets: dict[str, float]
+    release_gripper: float
+    basket_motion_s: float
+    action_ready_motion_s: float
+
+
+@dataclass(frozen=True)
+class FixedArmMotionState:
+    mode: str
+    start_targets: dict[str, float]
+    goal_targets: dict[str, float]
+    started_at: float
+    duration_s: float
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Backend launcher for XLeRobot real teleop and local LeRobot recording."
@@ -129,18 +210,43 @@ def build_parser() -> argparse.ArgumentParser:
     manipulate = subparsers.add_parser("manipulate", help="Launch real teleoperation.")
     _add_shared_args(manipulate)
     manipulate.add_argument("--controller", choices=("keyboard", "vr"), default="keyboard")
+    manipulate.add_argument(
+        "--record-training",
+        action="store_true",
+        help="Enable local LeRobot recording while staying in manipulate mode.",
+    )
+    _add_recording_args(manipulate)
 
     record = subparsers.add_parser("record", help="Launch real teleop with local LeRobot recording.")
     _add_shared_args(record)
     record.add_argument("--controller", choices=("keyboard", "vr"), default="keyboard")
-    record.add_argument("--dataset-id", default="local/xlerobot_playground")
-    record.add_argument("--dataset-root", default="./datasets")
-    record.add_argument("--task", default="XLeRobot teleoperation")
-    record.add_argument("--use-videos", action="store_true")
-    record.add_argument("--start-key", default="[")
-    record.add_argument("--stop-key", default="]")
-    record.add_argument("--quit-key", default="\\")
+    _add_recording_args(record)
     return parser
+
+
+def _add_recording_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--dataset-id", default="local/xlerobot_playground")
+    parser.add_argument("--dataset-root", default="./datasets")
+    parser.add_argument("--task", default="XLeRobot teleoperation")
+    parser.add_argument("--use-videos", action="store_true")
+    parser.add_argument("--start-key", default="[")
+    parser.add_argument("--stop-key", default="]")
+    parser.add_argument("--quit-key", default="\\")
+    parser.add_argument(
+        "--no-resume-dataset",
+        action="store_true",
+        help="Create a fresh dataset and fail if the dataset root already exists.",
+    )
+    parser.add_argument(
+        "--record-training-toggle-vr-button",
+        default="right:thumbstick",
+        help="Quest button that toggles training episode start/save, e.g. `right:thumbstick`.",
+    )
+    parser.add_argument(
+        "--record-training-discard-vr-button",
+        default="left:thumbstick",
+        help="Quest button that discards/cancels the active training episode, e.g. `left:thumbstick`.",
+    )
 
 
 def _add_shared_args(parser: argparse.ArgumentParser) -> None:
@@ -156,7 +262,8 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         metavar="NAME=DRIVER:SOURCE",
         help=(
             "Camera config. Example: `head=realsense:125322060037` or "
-            "`left_wrist=opencv:/dev/video0`."
+            "`left_wrist=opencv:/dev/video0`. Optional per-camera overrides: "
+            "`left_wrist=opencv:0,fps=30`."
         ),
     )
     parser.add_argument("--camera-width", type=int, default=640)
@@ -213,6 +320,82 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         default=30.0,
         help="How often to poll wrist cameras for the VR overlay.",
     )
+    parser.add_argument(
+        "--vr-left-arm-clutch-key",
+        default="1",
+        help="Hold this keyboard key to pause/rebaseline left-arm VR IK without moving the robot arm.",
+    )
+    parser.add_argument(
+        "--vr-right-arm-clutch-key",
+        default="2",
+        help="Hold this keyboard key to pause/rebaseline right-arm VR IK without moving the robot arm.",
+    )
+    parser.add_argument(
+        "--no-vr-squeeze-clutch",
+        action="store_true",
+        help="Disable Quest squeeze/grip as an IK clutch. Keyboard clutch keys remain available.",
+    )
+    parser.add_argument(
+        "--vr-skill-mode",
+        choices=("free", "grab_to_basket"),
+        default="free",
+        help="Optional higher-level VR manipulation mode. `grab_to_basket` adds a fixed basket placement pose.",
+    )
+    parser.add_argument(
+        "--vr-skill-arm",
+        choices=("left", "right", "both"),
+        default="both",
+        help="Arm(s) active in grab_to_basket mode. The inactive arm is held at ACTION_READY.",
+    )
+    parser.add_argument(
+        "--vr-basket-pose-key",
+        default="b",
+        help="Keyboard key that moves the right arm from IK grabbing to the fixed basket pose.",
+    )
+    parser.add_argument(
+        "--vr-skill-reset-key",
+        default="r",
+        help="Keyboard key that resets all grab_to_basket arms back to ACTION_READY.",
+    )
+    parser.add_argument("--vr-right-action-key", default="a")
+    parser.add_argument("--vr-left-basket-key", default="y")
+    parser.add_argument("--vr-left-action-key", default="x")
+    parser.add_argument(
+        "--vr-basket-pose-vr-button",
+        default="right:b",
+        help="Quest button that moves the right arm to the fixed basket pose, formatted as `left:name` or `right:name`.",
+    )
+    parser.add_argument("--vr-right-action-vr-button", default="right:a")
+    parser.add_argument("--vr-left-basket-vr-button", default="left:y")
+    parser.add_argument("--vr-left-action-vr-button", default="left:x")
+    parser.add_argument(
+        "--vr-basket-target",
+        action="append",
+        default=[],
+        metavar="JOINT=DEG",
+        help=(
+            "Override a basket pose target, repeatable. Example: "
+            "`--vr-basket-target right_arm_shoulder_pan.pos=-30`."
+        ),
+    )
+    parser.add_argument(
+        "--vr-basket-release-gripper",
+        type=float,
+        default=45.0,
+        help="Gripper target sent for the pressed trigger while holding the fixed basket pose.",
+    )
+    parser.add_argument(
+        "--vr-basket-motion-s",
+        type=float,
+        default=2.5,
+        help="Seconds used to ramp from the current pose to the fixed basket pose after pressing the basket button.",
+    )
+    parser.add_argument(
+        "--vr-action-ready-motion-s",
+        type=float,
+        default=2.0,
+        help="Seconds used to ramp back to ACTION_READY after pressing the action-ready button.",
+    )
     parser.add_argument("--vr-base-max-linear", type=float, default=0.25)
     parser.add_argument("--vr-base-max-angular", type=float, default=75.0)
     parser.add_argument("--vr-base-linear-accel", type=float, default=0.9)
@@ -224,11 +407,90 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--vr-arm-z-gain", type=float, default=1.0)
     parser.add_argument("--vr-arm-ik-alpha", type=float, default=0.25)
     parser.add_argument(
+        "--vr-arm-ik-mode",
+        choices=("planar", "yawed"),
+        default="planar",
+        help="Arm IK mode. `yawed` treats controller side motion as part of a 3D target.",
+    )
+    parser.add_argument(
+        "--vr-arm-yawed-forward-gain",
+        type=float,
+        default=1.0,
+        help="Forward/back gain for yawed 3D arm IK.",
+    )
+    parser.add_argument(
+        "--vr-arm-yawed-lateral-gain",
+        type=float,
+        default=0.5,
+        help="Sideways gain for yawed 3D arm IK. Use a negative value to flip lateral direction.",
+    )
+    parser.add_argument(
+        "--vr-arm-yawed-pan-sign",
+        type=float,
+        default=1.0,
+        help="Sign applied to computed shoulder pan in yawed 3D arm IK.",
+    )
+    parser.add_argument(
+        "--vr-arm-yawed-pan-limit",
+        type=float,
+        default=120.0,
+        help="Absolute shoulder pan limit used by yawed 3D arm IK.",
+    )
+    parser.add_argument(
+        "--vr-arm-debug",
+        action="store_true",
+        help="Print throttled per-arm VR IK diagnostics while teleoperating.",
+    )
+    parser.add_argument("--vr-arm-debug-hz", type=float, default=2.0)
+    parser.add_argument(
+        "--vr-wrist-video-gain",
+        type=float,
+        default=1.65,
+        help="Display-only brightness gain for wrist camera panels in the Quest overlay.",
+    )
+    parser.add_argument(
+        "--vr-wrist-video-gamma",
+        type=float,
+        default=0.78,
+        help="Display-only gamma for wrist camera panels. Values below 1 brighten shadows.",
+    )
+    parser.add_argument(
+        "--vr-wrist-video-bias",
+        type=float,
+        default=0.02,
+        help="Display-only brightness offset for wrist camera panels.",
+    )
+    parser.add_argument("--vr-orbbec-video-gain", type=float, default=1.0)
+    parser.add_argument("--vr-orbbec-video-gamma", type=float, default=1.0)
+    parser.add_argument("--vr-orbbec-video-bias", type=float, default=0.0)
+    parser.add_argument("--vr-arm-shoulder-lift-min", type=float, default=-108.0)
+    parser.add_argument("--vr-arm-shoulder-lift-max", type=float, default=96.0)
+    parser.add_argument(
+        "--vr-arm-elbow-flex-min",
+        type=float,
+        default=-115.0,
+        help="Minimum elbow flex target produced by VR IK. Lower values extend the negative/tucked side.",
+    )
+    parser.add_argument(
+        "--vr-arm-elbow-flex-max",
+        type=float,
+        default=106.0,
+        help="Maximum elbow flex target produced by VR IK. Original SO101 IK positive side is about 106 degrees.",
+    )
+    parser.add_argument(
+        "--vr-arm-unbounded-ik-joints",
+        action="store_true",
+        help=(
+            "Do not clip IK shoulder_lift/elbow_flex outputs to the configured software limits. "
+            "Physical motor/calibration limits may still apply."
+        ),
+    )
+    parser.add_argument(
         "--no-vr-startup-pose",
         action="store_true",
         help="Skip NAV_STOW -> ACTION_READY startup pose routine.",
     )
-    parser.add_argument("--vr-nav-stow-wait-s", type=float, default=10.0)
+    parser.add_argument("--vr-nav-stow-wait-s", type=float, default=5.0)
     parser.add_argument(
         "--vr-action-ready-elbow-delta",
         type=float,
@@ -255,6 +517,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     bootstrap_xlerobot(args.repo_root)
 
+    recording_enabled = args.mode == "record" or bool(getattr(args, "record_training", False))
+    if recording_enabled and args.controller == "vr":
+        args.orbbec_rgb_vr = True
+    orbbec_rgb = OrbbecRgbConfig(
+        enabled=args.orbbec_rgb_vr,
+        launch_capture=not args.orbbec_no_launch,
+        capture_bin=Path(
+            args.orbbec_capture_bin
+            or Path(__file__).resolve().parents[1] / "build" / "orbbec_rgb_test" / "orbbec_rgb_test"
+        ).expanduser().resolve(),
+        output_dir=Path(args.orbbec_output_dir).expanduser().resolve(),
+        width=args.orbbec_width,
+        height=args.orbbec_height,
+        fps=args.orbbec_fps,
+        timeout_ms=args.orbbec_timeout_ms,
+        log_every=args.orbbec_log_every,
+    )
+
     interface = XLeRobotInterface(args.repo_root)
     if args.robot_kind == "xlerobot_2wheels":
         config_cls, robot_cls = interface.robot_2wheels_classes()
@@ -274,7 +554,12 @@ def main(argv: list[str] | None = None) -> int:
     robot = robot_cls(robot_config)
 
     recording = None
-    if args.mode == "record":
+    if recording_enabled:
+        extra_observation_features = {}
+        orbbec_output_dir = None
+        if args.controller == "vr" and orbbec_rgb.enabled:
+            extra_observation_features["head"] = (orbbec_rgb.height, orbbec_rgb.width, 3)
+            orbbec_output_dir = orbbec_rgb.output_dir
         recording = RecordingSession(
             dataset=_create_dataset(
                 robot,
@@ -282,8 +567,11 @@ def main(argv: list[str] | None = None) -> int:
                 dataset_root=args.dataset_root,
                 fps=args.fps,
                 use_videos=args.use_videos,
+                resume=not args.no_resume_dataset,
+                extra_observation_features=extra_observation_features,
             ),
             task=args.task,
+            orbbec_output_dir=orbbec_output_dir,
         )
 
     if args.controller == "keyboard":
@@ -307,23 +595,34 @@ def main(argv: list[str] | None = None) -> int:
         quit_key=getattr(args, "quit_key", "\\"),
         xlevr_path=args.xlevr_path,
         auto_restore_calibration=not args.manual_calibration_prompt,
-        orbbec_rgb=OrbbecRgbConfig(
-            enabled=args.orbbec_rgb_vr,
-            launch_capture=not args.orbbec_no_launch,
-            capture_bin=Path(
-                args.orbbec_capture_bin
-                or Path(__file__).resolve().parents[1] / "build" / "orbbec_rgb_test" / "orbbec_rgb_test"
-            ).expanduser().resolve(),
-            output_dir=Path(args.orbbec_output_dir).expanduser().resolve(),
-            width=args.orbbec_width,
-            height=args.orbbec_height,
-            fps=args.orbbec_fps,
-            timeout_ms=args.orbbec_timeout_ms,
-            log_every=args.orbbec_log_every,
-        ),
+        orbbec_rgb=orbbec_rgb,
+        training_toggle_vr_button=getattr(args, "record_training_toggle_vr_button", "right:thumbstick"),
+        training_discard_vr_button=getattr(args, "record_training_discard_vr_button", "left:thumbstick"),
         vr_input_scale=args.vr_input_scale,
         vr_kp=args.vr_kp,
         vr_camera_hz=args.vr_camera_hz,
+        enable_squeeze_clutch=not args.no_vr_squeeze_clutch,
+        arm_clutch_keys=VrArmClutchKeys(
+            left=args.vr_left_arm_clutch_key,
+            right=args.vr_right_arm_clutch_key,
+        ),
+        basket_pose=VrBasketPoseConfig(
+            enabled=args.vr_skill_mode == "grab_to_basket",
+            skill_arm=args.vr_skill_arm,
+            full_reset_key=args.vr_skill_reset_key,
+            right_basket_key=args.vr_basket_pose_key,
+            right_action_key=args.vr_right_action_key,
+            left_basket_key=args.vr_left_basket_key,
+            left_action_key=args.vr_left_action_key,
+            right_basket_button=args.vr_basket_pose_vr_button,
+            right_action_button=args.vr_right_action_vr_button,
+            left_basket_button=args.vr_left_basket_vr_button,
+            left_action_button=args.vr_left_action_vr_button,
+            targets=_build_vr_basket_pose_targets(args.vr_basket_target),
+            release_gripper=args.vr_basket_release_gripper,
+            basket_motion_s=args.vr_basket_motion_s,
+            action_ready_motion_s=args.vr_action_ready_motion_s,
+        ),
         base_smoother=BaseSmoother(
             max_linear=args.vr_base_max_linear,
             max_angular=args.vr_base_max_angular,
@@ -333,10 +632,30 @@ def main(argv: list[str] | None = None) -> int:
             curve=args.vr_base_curve,
         ),
         arm_tuning=VrArmTuning(
+            ik_mode=args.vr_arm_ik_mode,
             vertical_sign=args.vr_arm_vertical_sign,
             y_gain=args.vr_arm_y_gain,
             z_gain=args.vr_arm_z_gain,
             ik_alpha=args.vr_arm_ik_alpha,
+            yawed_forward_gain=args.vr_arm_yawed_forward_gain,
+            yawed_lateral_gain=args.vr_arm_yawed_lateral_gain,
+            yawed_pan_sign=args.vr_arm_yawed_pan_sign,
+            yawed_pan_limit=args.vr_arm_yawed_pan_limit,
+            shoulder_lift_min=args.vr_arm_shoulder_lift_min,
+            shoulder_lift_max=args.vr_arm_shoulder_lift_max,
+            elbow_flex_min=args.vr_arm_elbow_flex_min,
+            elbow_flex_max=args.vr_arm_elbow_flex_max,
+            enforce_joint_limits=not args.vr_arm_unbounded_ik_joints,
+            debug=args.vr_arm_debug,
+            debug_hz=args.vr_arm_debug_hz,
+        ),
+        video_display=VrVideoDisplayConfig(
+            wrist_gain=args.vr_wrist_video_gain,
+            wrist_gamma=args.vr_wrist_video_gamma,
+            wrist_bias=args.vr_wrist_video_bias,
+            orbbec_gain=args.vr_orbbec_video_gain,
+            orbbec_gamma=args.vr_orbbec_video_gamma,
+            orbbec_bias=args.vr_orbbec_video_bias,
         ),
         startup_pose=VrStartupPoseConfig(
             enabled=not args.no_vr_startup_pose,
@@ -365,22 +684,25 @@ def _build_camera_configs(
     cameras: dict[str, Any] = {}
     for raw_spec in camera_specs:
         spec = _parse_camera_spec(raw_spec)
+        spec_width = spec.width or width
+        spec_height = spec.height or height
+        spec_fps = spec.fps or fps
         if spec.driver == "opencv":
             source: Any = int(spec.source) if spec.source.isdigit() else spec.source
             cameras[spec.name] = OpenCVCameraConfig(
                 index_or_path=source,
-                fps=fps,
-                width=width,
-                height=height,
+                fps=spec_fps,
+                width=spec_width,
+                height=spec_height,
                 rotation=Cv2Rotation.NO_ROTATION,
             )
             continue
         if spec.driver == "realsense":
             cameras[spec.name] = RealSenseCameraConfig(
                 serial_number_or_name=spec.source,
-                fps=fps,
-                width=width,
-                height=height,
+                fps=spec_fps,
+                width=spec_width,
+                height=spec_height,
                 color_mode=ColorMode.BGR,
                 rotation=Cv2Rotation.NO_ROTATION,
                 use_depth=True,
@@ -397,8 +719,27 @@ def _parse_camera_spec(raw_spec: str) -> CameraSpec:
             "for example `head=realsense:125322060037`."
         )
     name, remainder = raw_spec.split("=", 1)
-    driver, source = remainder.split(":", 1)
-    return CameraSpec(name=name.strip(), driver=driver.strip(), source=source.strip())
+    driver, source_and_options = remainder.split(":", 1)
+    source, *option_parts = source_and_options.split(",")
+    options: dict[str, int] = {}
+    for option in option_parts:
+        if not option.strip():
+            continue
+        if "=" not in option:
+            raise ValueError(f"Invalid camera option `{option}` in `{raw_spec}`. Use key=value.")
+        option_key, option_value = option.split("=", 1)
+        option_key = option_key.strip()
+        if option_key not in {"width", "height", "fps"}:
+            raise ValueError(f"Unsupported camera option `{option_key}` in `{raw_spec}`.")
+        options[option_key] = int(option_value)
+    return CameraSpec(
+        name=name.strip(),
+        driver=driver.strip(),
+        source=source.strip(),
+        width=options.get("width"),
+        height=options.get("height"),
+        fps=options.get("fps"),
+    )
 
 
 def _default_vr_nav_stow_pose() -> dict[str, float]:
@@ -468,7 +809,13 @@ def _enable_threaded_vr_http(vr_teleop: Any) -> bool:
     return True
 
 
-def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbbec: bool) -> bool:
+def _install_orbbec_vr_overlay(
+    vr_teleop: Any,
+    output_dir: Path,
+    *,
+    include_orbbec: bool,
+    video_display: VrVideoDisplayConfig,
+) -> bool:
     monitor = getattr(vr_teleop, "vr_monitor", None)
     if monitor is None:
         return False
@@ -478,6 +825,7 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
     if getattr(handler_cls, "_orbbec_overlay_installed", False):
         handler_cls.orbbec_output_dir = output_dir.resolve()
         handler_cls.orbbec_overlay_include_orbbec = include_orbbec
+        handler_cls.robot42_video_display = video_display
         return True
 
     original_do_get = handler_cls.do_GET
@@ -485,6 +833,7 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
     original_serve_file = handler_cls.serve_file
     handler_cls.orbbec_output_dir = output_dir.resolve()
     handler_cls.orbbec_overlay_include_orbbec = include_orbbec
+    handler_cls.robot42_video_display = video_display
 
     def do_GET(self):
         if self.path.startswith("/api/status"):
@@ -527,8 +876,10 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
                 root = Path(web_root) if web_root else Path.cwd()
                 js_path = root / filename
                 content = js_path.read_text()
+                content = _patch_xlevr_controller_button_js(content)
                 content += "\n\n" + _orbbec_vr_overlay_js(
-                    include_orbbec=getattr(handler_cls, "orbbec_overlay_include_orbbec", True)
+                    include_orbbec=getattr(handler_cls, "orbbec_overlay_include_orbbec", True),
+                    video_display=getattr(handler_cls, "robot42_video_display", video_display),
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -545,6 +896,40 @@ def _install_orbbec_vr_overlay(vr_teleop: Any, output_dir: Path, *, include_orbb
     handler_cls.serve_file = serve_file
     handler_cls._orbbec_overlay_installed = True
     return True
+
+
+def _patch_xlevr_controller_button_js(content: str) -> str:
+    left_old = """                leftController.buttons = {
+                    a: !!leftGamepad.buttons[3]?.pressed,
+                    b: !!leftGamepad.buttons[4]?.pressed,
+                    squeeze: !!leftGamepad.buttons[1]?.pressed,
+                    thumbstick: !!leftGamepad.buttons[2]?.pressed,
+                    menu: !!leftGamepad.buttons[6]?.pressed
+                };"""
+    left_new = """                leftController.buttons = {
+                    x: !!leftGamepad.buttons[4]?.pressed,
+                    y: !!leftGamepad.buttons[5]?.pressed,
+                    a: !!leftGamepad.buttons[4]?.pressed,
+                    b: !!leftGamepad.buttons[5]?.pressed,
+                    squeeze: !!leftGamepad.buttons[1]?.pressed,
+                    thumbstick: !!leftGamepad.buttons[2]?.pressed,
+                    menu: !!leftGamepad.buttons[6]?.pressed
+                };"""
+    right_old = """                rightController.buttons = {
+                    a: !!rightGamepad.buttons[3]?.pressed,
+                    b: !!rightGamepad.buttons[4]?.pressed,
+                    squeeze: !!rightGamepad.buttons[1]?.pressed,
+                    thumbstick: !!rightGamepad.buttons[2]?.pressed,
+                    menu: !!rightGamepad.buttons[6]?.pressed
+                };"""
+    right_new = """                rightController.buttons = {
+                    a: !!rightGamepad.buttons[4]?.pressed,
+                    b: !!rightGamepad.buttons[5]?.pressed,
+                    squeeze: !!rightGamepad.buttons[1]?.pressed,
+                    thumbstick: !!rightGamepad.buttons[2]?.pressed,
+                    menu: !!rightGamepad.buttons[6]?.pressed
+                };"""
+    return content.replace(left_old, left_new).replace(right_old, right_new)
 
 
 def _publish_vr_camera_frames(obs: dict[str, Any]) -> None:
@@ -691,29 +1076,7 @@ def _move_to_joint_targets(
 def _sync_vr_teleop_to_current_pose(robot: Any, vr_teleop: Any) -> None:
     obs = _get_robot_observation(robot, use_camera=False)
     for side in ("left", "right"):
-        arm = getattr(vr_teleop, f"{side}_arm", None)
-        if arm is None:
-            continue
-        targets: dict[str, float] = {}
-        for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
-            obs_key = f"{side}_arm_{joint}.pos"
-            if obs_key in obs:
-                targets[joint] = float(obs[obs_key])
-        if targets:
-            arm.target_positions = targets
-            arm.pitch = targets.get("wrist_flex", 0.0) + targets.get("shoulder_lift", 0.0) + targets.get("elbow_flex", 0.0)
-            kin = getattr(arm, "kinematics", None)
-            if kin is not None and hasattr(kin, "forward_kinematics"):
-                try:
-                    arm.current_x, arm.current_y = kin.forward_kinematics(
-                        targets.get("shoulder_lift", 0.0),
-                        targets.get("elbow_flex", 0.0),
-                    )
-                except Exception:
-                    pass
-        for attr in ("prev_vr_pos", "prev_wrist_flex", "prev_wrist_roll"):
-            if hasattr(arm, attr):
-                delattr(arm, attr)
+        _sync_vr_arm_to_observation(vr_teleop, side, obs)
 
     head = getattr(vr_teleop, "head_control", None)
     if head is not None:
@@ -724,6 +1087,48 @@ def _sync_vr_teleop_to_current_pose(robot: Any, vr_teleop: Any) -> None:
         }
         if head_targets:
             head.target_positions = head_targets
+
+
+def _sync_vr_arm_to_observation(vr_teleop: Any, side: str, obs: dict[str, Any]) -> None:
+    arm = getattr(vr_teleop, f"{side}_arm", None)
+    if arm is None:
+        return
+    targets: dict[str, float] = {}
+    for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
+        obs_key = f"{side}_arm_{joint}.pos"
+        if obs_key in obs:
+            targets[joint] = float(obs[obs_key])
+    if targets:
+        arm.target_positions = targets
+        arm.pitch = targets.get("wrist_flex", 0.0) + targets.get("shoulder_lift", 0.0) + targets.get("elbow_flex", 0.0)
+        kin = getattr(arm, "kinematics", None)
+        if kin is not None and hasattr(kin, "forward_kinematics"):
+            try:
+                arm.current_x, arm.current_y = kin.forward_kinematics(
+                    targets.get("shoulder_lift", 0.0),
+                    targets.get("elbow_flex", 0.0),
+                )
+            except Exception:
+                pass
+        _sync_vr_arm_yawed_target_from_pose(arm, targets)
+    _clear_vr_arm_controller_baseline(arm)
+
+
+def _sync_vr_arm_yawed_target_from_pose(arm: Any, targets: dict[str, float]) -> None:
+    planar_x = float(getattr(arm, "current_x", 0.0) or 0.0)
+    planar_y = float(getattr(arm, "current_y", 0.0) or 0.0)
+    radial = abs(planar_x)
+    pan_sign = float(getattr(arm, "_robot42_yawed_pan_sign", 1.0) or 1.0)
+    pan_rad = math.radians(float(targets.get("shoulder_pan", 0.0) or 0.0) / pan_sign)
+    arm.current_forward = radial * math.cos(pan_rad)
+    arm.current_lateral = radial * math.sin(pan_rad)
+    arm.current_height = planar_y
+
+
+def _clear_vr_arm_controller_baseline(arm: Any) -> None:
+    for attr in ("prev_vr_pos", "prev_wrist_flex", "prev_wrist_roll"):
+        if hasattr(arm, attr):
+            delattr(arm, attr)
 
 
 def _write_response(handler: Any, content: bytes, content_type: str) -> None:
@@ -1127,8 +1532,8 @@ def _ppm_file_to_jpeg(path: Path) -> tuple[bytes, int, int]:
     return encoded.tobytes(), width, height
 
 
-def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
-    return r"""
+def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplayConfig) -> str:
+    script = r"""
 (function () {
   const FEEDS = [
     {
@@ -1140,6 +1545,9 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       position: [0, -0.18, -1.05],
       markerPosition: [-0.42, 0.32, -1.04],
       logName: 'Orbbec RGB',
+      displayGain: __ORBBEC_GAIN__,
+      displayGamma: __ORBBEC_GAMMA__,
+      displayBias: __ORBBEC_BIAS__,
       pollMs: 120
     },
     {
@@ -1151,6 +1559,9 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       position: [-0.17, -0.56, -1.02],
       markerPosition: [-0.34, -0.42, -1.01],
       logName: 'Left wrist',
+      displayGain: __WRIST_GAIN__,
+      displayGamma: __WRIST_GAMMA__,
+      displayBias: __WRIST_BIAS__,
       pollMs: 160
     },
     {
@@ -1162,6 +1573,9 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       position: [0.17, -0.56, -1.02],
       markerPosition: [0.0, -0.42, -1.01],
       logName: 'Right wrist',
+      displayGain: __WRIST_GAIN__,
+      displayGamma: __WRIST_GAMMA__,
+      displayBias: __WRIST_BIAS__,
       pollMs: 160
     }
   ];
@@ -1172,6 +1586,84 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
   let webRtcStarted = false;
   let webRtcFailed = false;
   let webRtcPc = null;
+  let feedsVisible = true;
+
+  function setFeedNodesVisible(nodes, visible) {
+    if (!nodes) return;
+    if (nodes.mesh) nodes.mesh.visible = visible;
+    if (nodes.marker) nodes.marker.visible = visible;
+  }
+
+  function applyFeedsVisibility() {
+    overlays.forEach(nodes => setFeedNodesVisible(nodes, feedsVisible));
+    const pageButton = document.getElementById('robot42-video-toggle-button');
+    if (pageButton) {
+      pageButton.textContent = feedsVisible ? 'Hide video feeds' : 'Show video feeds';
+      pageButton.setAttribute('aria-pressed', feedsVisible ? 'true' : 'false');
+    }
+    const vrLabel = document.getElementById('robot42-video-toggle-vr-label');
+    if (vrLabel) {
+      vrLabel.setAttribute('value', feedsVisible ? 'Hide feeds' : 'Show feeds');
+    }
+    const vrButton = document.getElementById('robot42-video-toggle-vr-button');
+    if (vrButton) {
+      vrButton.setAttribute('color', feedsVisible ? '#1f8b4c' : '#555');
+    }
+  }
+
+  function toggleFeedsVisibility() {
+    feedsVisible = !feedsVisible;
+    applyFeedsVisibility();
+    console.log(`[Robot42 WebRTC] video feeds ${feedsVisible ? 'shown' : 'hidden'}`);
+  }
+
+  function ensurePageToggle() {
+    if (document.getElementById('robot42-video-toggle-button')) return;
+    const button = document.createElement('button');
+    button.id = 'robot42-video-toggle-button';
+    button.type = 'button';
+    button.textContent = 'Hide video feeds';
+    button.style.position = 'fixed';
+    button.style.right = '18px';
+    button.style.bottom = '18px';
+    button.style.zIndex = '10000';
+    button.style.padding = '10px 14px';
+    button.style.border = '0';
+    button.style.borderRadius = '8px';
+    button.style.background = '#1f8b4c';
+    button.style.color = '#fff';
+    button.style.font = '600 14px system-ui, -apple-system, BlinkMacSystemFont, sans-serif';
+    button.style.boxShadow = '0 2px 10px rgba(0,0,0,0.25)';
+    button.style.cursor = 'pointer';
+    button.addEventListener('click', toggleFeedsVisibility);
+    document.body.appendChild(button);
+  }
+
+  function ensureVrToggle() {
+    if (document.getElementById('robot42-video-toggle-vr-button')) return;
+    const headset = document.querySelector('#headset');
+    if (!headset) return;
+
+    const button = document.createElement('a-plane');
+    button.id = 'robot42-video-toggle-vr-button';
+    button.setAttribute('width', '0.28');
+    button.setAttribute('height', '0.075');
+    button.setAttribute('position', '0.43 -0.42 -1.0');
+    button.setAttribute('material', 'color: #1f8b4c; shader: flat; side: double');
+    button.classList.add('clickable');
+    button.addEventListener('click', toggleFeedsVisibility);
+
+    const label = document.createElement('a-text');
+    label.id = 'robot42-video-toggle-vr-label';
+    label.setAttribute('value', 'Hide feeds');
+    label.setAttribute('align', 'center');
+    label.setAttribute('width', '0.9');
+    label.setAttribute('color', '#fff');
+    label.setAttribute('position', '0 0 0.006');
+    label.setAttribute('side', 'double');
+    button.appendChild(label);
+    headset.appendChild(button);
+  }
 
   function ensurePanel(feed) {
     const headset = document.querySelector('#headset');
@@ -1204,9 +1696,35 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       texture.generateMipmaps = false;
       if ('SRGBColorSpace' in THREE) texture.colorSpace = THREE.SRGBColorSpace;
 
-      const material = new THREE.MeshBasicMaterial({
-        map: texture,
+      const material = new THREE.ShaderMaterial({
+        uniforms: {
+          map: { value: texture },
+          displayGain: { value: feed.displayGain || 1.0 },
+          displayGamma: { value: feed.displayGamma || 1.0 },
+          displayBias: { value: feed.displayBias || 0.0 }
+        },
+        vertexShader: `
+          varying vec2 vUv;
+          void main() {
+            vUv = uv;
+            gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+          }
+        `,
+        fragmentShader: `
+          uniform sampler2D map;
+          uniform float displayGain;
+          uniform float displayGamma;
+          uniform float displayBias;
+          varying vec2 vUv;
+          void main() {
+            vec4 color = texture2D(map, vUv);
+            vec3 rgb = max(color.rgb * displayGain + vec3(displayBias), vec3(0.0));
+            rgb = pow(rgb, vec3(max(displayGamma, 0.01)));
+            gl_FragColor = vec4(clamp(rgb, 0.0, 1.0), color.a);
+          }
+        `,
         side: THREE.DoubleSide,
+        transparent: false,
         toneMapped: false
       });
       const mesh = new THREE.Mesh(new THREE.PlaneGeometry(feed.width, feed.height), material);
@@ -1224,16 +1742,17 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
       marker.renderOrder = 1000;
       headset.object3D.add(marker);
 
-      overlays.set(feed.name, {
-        canvas,
-        video,
-        texture,
-        mesh,
-        marker,
-        loading: false,
-        lastRequestAt: 0,
-        frameCount: 0
-      });
+	      overlays.set(feed.name, {
+	        canvas,
+	        video,
+	        texture,
+	        mesh,
+	        marker,
+	        loading: false,
+	        lastRequestAt: 0,
+	        frameCount: 0
+	      });
+      setFeedNodesVisible(overlays.get(feed.name), feedsVisible);
       console.log(`[${feed.logName}] WebRTC headset overlay created`);
     }
 
@@ -1328,8 +1847,11 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
   }
 
   function start() {
+    ensurePageToggle();
+    ensureVrToggle();
     startWebRtc();
     function renderStreams() {
+      ensureVrToggle();
       ACTIVE_FEEDS.forEach(updateVideoTexture);
       requestAnimationFrame(renderStreams);
     }
@@ -1342,7 +1864,23 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool) -> str:
     start();
   }
 })();
-""".replace("__INCLUDE_ORBBEC__", "true" if include_orbbec else "false")
+"""
+    replacements = {
+        "__INCLUDE_ORBBEC__": "true" if include_orbbec else "false",
+        "__WRIST_GAIN__": _js_float(video_display.wrist_gain),
+        "__WRIST_GAMMA__": _js_float(video_display.wrist_gamma),
+        "__WRIST_BIAS__": _js_float(video_display.wrist_bias),
+        "__ORBBEC_GAIN__": _js_float(video_display.orbbec_gain),
+        "__ORBBEC_GAMMA__": _js_float(video_display.orbbec_gamma),
+        "__ORBBEC_BIAS__": _js_float(video_display.orbbec_bias),
+    }
+    for key, value in replacements.items():
+        script = script.replace(key, value)
+    return script
+
+
+def _js_float(value: float) -> str:
+    return format(float(value), ".6g")
 
 
 def _run_keyboard_backend(
@@ -1470,11 +2008,17 @@ def _run_vr_backend(
     xlevr_path: str | None,
     auto_restore_calibration: bool,
     orbbec_rgb: OrbbecRgbConfig,
+    training_toggle_vr_button: str,
+    training_discard_vr_button: str,
     vr_input_scale: float,
     vr_kp: float,
     vr_camera_hz: float,
+    enable_squeeze_clutch: bool,
+    arm_clutch_keys: VrArmClutchKeys,
+    basket_pose: VrBasketPoseConfig,
     base_smoother: BaseSmoother,
     arm_tuning: VrArmTuning,
+    video_display: VrVideoDisplayConfig,
     startup_pose: VrStartupPoseConfig,
 ) -> int:
     from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
@@ -1495,6 +2039,8 @@ def _run_vr_backend(
     if xlevr_path is not None:
         vr_overrides["xlevr_path"] = xlevr_path
     vr_teleop = interface.make_vr_teleop(**vr_overrides)
+    if enable_squeeze_clutch and _install_xlevr_squeeze_metadata_patch(vr_teleop, xlevr_path=xlevr_path):
+        print("Quest squeeze metadata patch enabled for VR IK clutch.")
     if _enable_threaded_vr_http(vr_teleop):
         print("XLeVR HTTPS server patched to ThreadingHTTPServer for camera streams.")
     vr_teleop.connect(robot=robot)
@@ -1511,6 +2057,7 @@ def _run_vr_backend(
         vr_teleop,
         orbbec_rgb.output_dir,
         include_orbbec=orbbec_rgb.enabled,
+        video_display=video_display,
     )
     if installed:
         if orbbec_rgb.enabled:
@@ -1527,10 +2074,23 @@ def _run_vr_backend(
         quit_key=quit_key,
         controller="vr",
     )
+    if basket_pose.enabled:
+        print(
+            "VR skill mode grab_to_basket: "
+            f"active_arm={basket_pose.skill_arm}; "
+            f"right B -> right basket, right A -> right ACTION_READY; "
+            f"left Y -> left basket, left X -> left ACTION_READY; "
+            f"`{basket_pose.full_reset_key}` or left thumbstick down resets both."
+        )
 
+    action_ready_targets = _capture_arm_pose_targets(robot)
     camera_interval_s = 1.0 / max(0.1, vr_camera_hz)
     next_camera_t = 0.0
     last_camera_warn_t = 0.0
+    arm_clutch_state = {"left": False, "right": False}
+    previous_vr_buttons: set[str] = set()
+    fixed_arm_modes: dict[str, str] = {}
+    fixed_arm_motion_states: dict[str, FixedArmMotionState] = {}
 
     try:
         while True:
@@ -1550,6 +2110,21 @@ def _run_vr_backend(
                 stop_key=stop_key,
             )
 
+            current_vr_buttons = _current_vr_button_state(vr_teleop)
+            newly_pressed_vr_buttons = current_vr_buttons - previous_vr_buttons
+            previous_vr_buttons = current_vr_buttons
+            if arm_tuning.debug and newly_pressed_vr_buttons:
+                print(f"VR buttons pressed: {', '.join(sorted(newly_pressed_vr_buttons))}")
+            if (
+                recording is not None
+                and _vr_button_spec_pressed(training_discard_vr_button, newly_pressed_vr_buttons)
+            ):
+                _discard_recording_from_vr_button(recording, training_discard_vr_button)
+            elif (
+                recording is not None
+                and _vr_button_spec_pressed(training_toggle_vr_button, newly_pressed_vr_buttons)
+            ):
+                _toggle_recording_from_vr_button(recording, training_toggle_vr_button)
             vr_controls = _map_vr_events_to_recording_controls(vr_teleop.get_vr_events())
             vr_decision = VRRecordingDecision(reset_robot=vr_controls.reset_robot)
             if recording is not None:
@@ -1562,11 +2137,51 @@ def _run_vr_backend(
                     break
 
             obs = _get_robot_observation(robot, use_camera=False)
-            if vr_decision.reset_robot:
+            if basket_pose.enabled:
+                _update_fixed_arm_modes_from_controls(
+                    fixed_arm_modes,
+                    basket_pose,
+                    newly_pressed,
+                    newly_pressed_vr_buttons,
+                )
+            basket_reset_requested = basket_pose.enabled and basket_pose.full_reset_key in newly_pressed
+            if vr_decision.reset_robot or basket_reset_requested:
                 _move_to_action_ready(robot, vr_teleop, startup_pose)
+                action_ready_targets = _capture_arm_pose_targets(robot)
+                fixed_arm_modes.clear()
+                fixed_arm_motion_states.clear()
+                _set_fixed_arm_ik_pauses(vr_teleop, {})
                 action = {}
+                if basket_reset_requested:
+                    print("Grab-to-basket reset: both arms returned to ACTION_READY.")
             else:
+                effective_fixed_arm_modes = _effective_fixed_arm_modes(fixed_arm_modes, basket_pose)
+                _set_fixed_arm_ik_pauses(vr_teleop, effective_fixed_arm_modes)
+                _update_vr_arm_clutch(
+                    vr_teleop,
+                    obs,
+                    arm_clutch_keys,
+                    pressed_keys,
+                    arm_clutch_state,
+                )
                 action = vr_teleop.get_action(obs, robot)
+                action = _freeze_vr_clutched_arm_actions(action, obs, vr_teleop)
+                action = _apply_fixed_arm_pose_action(
+                    action,
+                    vr_teleop,
+                    basket_pose,
+                    effective_fixed_arm_modes,
+                    action_ready_targets,
+                    fixed_arm_motion_states,
+                    obs,
+                )
+                _clear_reached_action_ready_modes(
+                    fixed_arm_modes,
+                    fixed_arm_motion_states,
+                    vr_teleop,
+                    obs,
+                    action_ready_targets,
+                )
             action = _smooth_vr_base_action(action, base_smoother)
             if action:
                 sent_action = robot.send_action(action)
@@ -1581,7 +2196,7 @@ def _run_vr_backend(
                     last_camera_warn_t = now
                 _publish_vr_camera_frames(camera_obs)
                 if recording is not None:
-                    obs = camera_obs
+                    obs = _augment_recording_observation(recording, camera_obs)
             log_rerun_data(obs, sent_action)
             _record_frame_if_needed(recording, obs, sent_action)
 
@@ -1593,6 +2208,7 @@ def _run_vr_backend(
         try:
             robot.disconnect()
         finally:
+            _force_stop_vr_runtime(vr_teleop)
             try:
                 vr_teleop.disconnect()
             except Exception:
@@ -1600,6 +2216,71 @@ def _run_vr_backend(
             if hotkeys.is_connected:
                 hotkeys.disconnect()
     return 0
+
+
+def _force_stop_vr_runtime(vr_teleop: Any) -> None:
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    if monitor is None:
+        return
+
+    print("Stopping VR monitor/runtime...")
+    try:
+        monitor.is_running = False
+    except Exception:
+        pass
+
+    vr_server = getattr(monitor, "vr_server", None)
+    if vr_server is not None:
+        _force_stop_vr_websocket_server(vr_server)
+
+    https_server = getattr(monitor, "https_server", None)
+    if https_server is not None:
+        _force_stop_vr_https_server(https_server)
+
+    vr_thread = getattr(vr_teleop, "vr_thread", None)
+    if vr_thread is not None and hasattr(vr_thread, "join"):
+        try:
+            vr_thread.join(timeout=2.0)
+        except Exception:
+            pass
+
+
+def _force_stop_vr_websocket_server(vr_server: Any) -> None:
+    async def stop_server() -> None:
+        try:
+            await asyncio.wait_for(vr_server.stop(), timeout=2.0)
+        except Exception as exc:
+            print(f"VR websocket stop skipped/failed: {exc}")
+
+    try:
+        asyncio.run(stop_server())
+    except RuntimeError:
+        server = getattr(vr_server, "server", None)
+        if server is not None:
+            try:
+                server.close()
+            except Exception:
+                pass
+
+
+def _force_stop_vr_https_server(https_server: Any) -> None:
+    httpd = getattr(https_server, "httpd", None)
+    if httpd is not None:
+        try:
+            httpd.shutdown()
+        except Exception as exc:
+            print(f"VR HTTPS shutdown skipped/failed: {exc}")
+        try:
+            httpd.server_close()
+        except Exception:
+            pass
+
+    server_thread = getattr(https_server, "server_thread", None)
+    if server_thread is not None and hasattr(server_thread, "join"):
+        try:
+            server_thread.join(timeout=2.0)
+        except Exception:
+            pass
 
 
 def _configure_vr_runtime(vr_teleop: Any, *, input_scale: float) -> None:
@@ -1610,6 +2291,471 @@ def _configure_vr_runtime(vr_teleop: Any, *, input_scale: float) -> None:
     print(f"VR input scale set to {input_scale:.3f}.")
 
 
+def _install_xlevr_squeeze_metadata_patch(vr_teleop: Any, *, xlevr_path: str | None) -> bool:
+    module_prefix = vr_teleop.__class__.__module__.rsplit(".", 1)[0]
+    monitor_module = sys.modules.get(f"{module_prefix}.vr_monitor")
+    root_value = xlevr_path or getattr(monitor_module, "XLEVR_PATH", None)
+    if root_value:
+        xlevr_root = Path(root_value).expanduser().resolve()
+        if str(xlevr_root) not in sys.path:
+            sys.path.insert(0, str(xlevr_root))
+
+    try:
+        ws_module = importlib.import_module("xlevr.inputs.vr_ws_server")
+    except Exception as exc:
+        print(f"Could not patch Quest squeeze metadata: {exc}")
+        return False
+
+    server_cls = getattr(ws_module, "VRWebSocketServer", None)
+    if server_cls is None:
+        return False
+    if getattr(server_cls, "_robot42_squeeze_metadata_patched", False):
+        return True
+
+    original_process_controller_data = server_cls.process_controller_data
+    original_process_single_controller = server_cls.process_single_controller
+    original_handle_grip_release = getattr(server_cls, "handle_grip_release", None)
+    original_send_goal = server_cls.send_goal
+
+    def set_button_state(
+        server: Any,
+        hand: str,
+        *,
+        buttons: dict[str, Any] | None = None,
+        grip_active: bool = False,
+    ) -> None:
+        if hand not in {"left", "right"}:
+            return
+        button_state = dict(buttons or {})
+        squeeze_active = bool(button_state.get("squeeze", False) or grip_active)
+        if not hasattr(server, "_robot42_controller_button_state"):
+            server._robot42_controller_button_state = {}
+        server._robot42_controller_button_state[hand] = {
+            "buttons": button_state,
+            "grip_active": bool(grip_active),
+            "squeeze": squeeze_active,
+        }
+
+    async def process_controller_data(self: Any, data: dict[str, Any]) -> Any:
+        if isinstance(data, dict):
+            hand = data.get("hand")
+            if hand in {"left", "right"} and data.get("gripReleased", False):
+                set_button_state(self, hand, grip_active=False)
+                if original_handle_grip_release is not None:
+                    await original_handle_grip_release(self, hand)
+                return None
+        return await original_process_controller_data(self, data)
+
+    async def process_single_controller(self: Any, hand: str, data: dict[str, Any]) -> Any:
+        buttons = dict(data.get("buttons") or {}) if isinstance(data, dict) else {}
+        grip_active = bool(data.get("gripActive", False)) if isinstance(data, dict) else False
+        set_button_state(self, hand, buttons=buttons, grip_active=grip_active)
+        return await original_process_single_controller(self, hand, data)
+
+    async def handle_grip_release(self: Any, hand: str) -> Any:
+        set_button_state(self, hand, grip_active=False)
+        if original_handle_grip_release is not None:
+            return await original_handle_grip_release(self, hand)
+        return None
+
+    async def send_goal(self: Any, goal: Any) -> Any:
+        arm = getattr(goal, "arm", None)
+        if arm in {"left", "right"}:
+            state = getattr(self, "_robot42_controller_button_state", {}).get(arm, {})
+            metadata = dict(getattr(goal, "metadata", None) or {})
+            buttons = dict(metadata.get("buttons") or {})
+            buttons.update(state.get("buttons") or {})
+            if buttons:
+                metadata["buttons"] = buttons
+            metadata["grip_active"] = bool(state.get("grip_active", False))
+            metadata["squeeze"] = bool(state.get("squeeze", False))
+            goal.metadata = metadata
+        return await original_send_goal(self, goal)
+
+    server_cls.process_controller_data = process_controller_data
+    server_cls.process_single_controller = process_single_controller
+    server_cls.handle_grip_release = handle_grip_release
+    server_cls.send_goal = send_goal
+    server_cls._robot42_squeeze_metadata_patched = True
+    return True
+
+
+def _update_vr_arm_clutch(
+    vr_teleop: Any,
+    obs: dict[str, Any],
+    keys: VrArmClutchKeys,
+    pressed_keys: set[str],
+    state: dict[str, bool],
+) -> None:
+    key_by_side = {"left": keys.left, "right": keys.right}
+    for side, key in key_by_side.items():
+        key_active = bool(key) and key in pressed_keys
+        squeeze_active = _vr_arm_squeeze_active(vr_teleop, side)
+        active = key_active or squeeze_active
+        was_active = state.get(side, False)
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is None:
+            state[side] = active
+            continue
+        if active:
+            _sync_vr_arm_to_observation(vr_teleop, side, obs)
+            setattr(arm, "ik_clutch_paused", True)
+            if not was_active:
+                source = "Quest squeeze" if squeeze_active else f"keyboard `{key}`"
+                print(f"{side.capitalize()} arm IK clutch engaged from {source}; freezing observed pose.")
+        elif was_active and not active:
+            _sync_vr_arm_to_observation(vr_teleop, side, obs)
+            setattr(arm, "ik_clutch_rebaseline_frames", _VR_ARM_CLUTCH_RELEASE_HOLD_FRAMES)
+            _clear_vr_arm_controller_baseline(arm)
+            setattr(arm, "ik_clutch_paused", False)
+            print(f"{side.capitalize()} arm IK clutch released; freezing observed pose and re-baselining controller.")
+        state[side] = active
+
+
+def _vr_arm_squeeze_active(vr_teleop: Any, side: str) -> bool:
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    if monitor is None:
+        return False
+    server = getattr(monitor, "vr_server", None)
+    controller_state = getattr(server, "_robot42_controller_button_state", {}) if server is not None else {}
+    if isinstance(controller_state, dict):
+        state = controller_state.get(side)
+        if isinstance(state, dict):
+            buttons = state.get("buttons", {}) or {}
+            return bool(state.get("squeeze", False) or state.get("grip_active", False) or buttons.get("squeeze", False))
+    if not hasattr(monitor, "get_latest_goal_nowait"):
+        return False
+    try:
+        goal = monitor.get_latest_goal_nowait(side)
+    except Exception:
+        return False
+    metadata = getattr(goal, "metadata", {}) if goal is not None else {}
+    if not isinstance(metadata, dict):
+        return False
+    buttons = metadata.get("buttons", {}) or {}
+    return bool(metadata.get("squeeze", False) or metadata.get("grip_active", False) or buttons.get("squeeze", False))
+
+
+def _freeze_vr_clutched_arm_actions(action: dict[str, Any], obs: dict[str, Any], vr_teleop: Any) -> dict[str, Any]:
+    if not action:
+        return action
+    frozen = dict(action)
+    for side in ("left", "right"):
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is None:
+            continue
+        should_freeze = bool(getattr(arm, "ik_clutch_paused", False)) or int(
+            getattr(arm, "ik_clutch_rebaseline_frames", 0) or 0
+        ) > 0
+        if not should_freeze:
+            continue
+        for joint in ("shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"):
+            key = f"{side}_arm_{joint}.pos"
+            if key in obs:
+                frozen[key] = float(obs[key])
+    return frozen
+
+
+def _build_vr_basket_pose_targets(raw_targets: list[str]) -> dict[str, float]:
+    targets = dict(_VR_BASKET_POSE_DEFAULTS)
+    for raw in raw_targets:
+        if "=" not in raw:
+            raise ValueError(f"Invalid --vr-basket-target `{raw}`. Use JOINT=DEG.")
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key.endswith(".pos"):
+            key = f"{key}.pos"
+        if not (key.startswith("left_arm_") or key.startswith("right_arm_")):
+            raise ValueError(f"Invalid --vr-basket-target joint `{key}`. Use left_arm_* or right_arm_* position keys.")
+        targets[key] = float(value)
+    return targets
+
+
+def _update_fixed_arm_modes_from_controls(
+    fixed_modes: dict[str, str],
+    config: VrBasketPoseConfig,
+    newly_pressed_keys: set[str],
+    newly_pressed_vr_buttons: set[str],
+) -> None:
+    allowed_sides = _vr_skill_allowed_sides(config)
+    requests = (
+        ("right", "basket", config.right_basket_key, config.right_basket_button),
+        ("right", "action_ready", config.right_action_key, config.right_action_button),
+        ("left", "basket", config.left_basket_key, config.left_basket_button),
+        ("left", "action_ready", config.left_action_key, config.left_action_button),
+    )
+    for side, mode, key, button in requests:
+        if side not in allowed_sides:
+            continue
+        if key in newly_pressed_keys or _vr_button_spec_pressed(button, newly_pressed_vr_buttons):
+            fixed_modes[side] = mode
+            if mode == "basket":
+                print(f"{side.capitalize()} arm basket pose active: IK disabled for that arm. Press trigger to release.")
+            else:
+                print(f"{side.capitalize()} arm returning to ACTION_READY.")
+
+
+def _effective_fixed_arm_modes(fixed_modes: dict[str, str], config: VrBasketPoseConfig) -> dict[str, str]:
+    if not config.enabled:
+        return dict(fixed_modes)
+    effective = dict(fixed_modes)
+    for side in {"left", "right"} - _vr_skill_allowed_sides(config):
+        effective[side] = "parked_action_ready"
+    return effective
+
+
+def _vr_skill_allowed_sides(config: VrBasketPoseConfig) -> set[str]:
+    if config.skill_arm == "both":
+        return {"left", "right"}
+    return {config.skill_arm}
+
+
+def _set_fixed_arm_ik_pauses(vr_teleop: Any, fixed_modes: dict[str, str]) -> None:
+    for side in ("left", "right"):
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is not None:
+            setattr(arm, "ik_fixed_pose_paused", side in fixed_modes)
+
+
+def _apply_fixed_arm_pose_action(
+    action: dict[str, Any],
+    vr_teleop: Any,
+    config: VrBasketPoseConfig,
+    fixed_modes: dict[str, str],
+    action_ready_targets: dict[str, float],
+    motion_states: dict[str, FixedArmMotionState],
+    obs: dict[str, Any],
+) -> dict[str, Any]:
+    if not fixed_modes:
+        return action
+    fixed_action = dict(action)
+    now = time.perf_counter()
+    for side, mode in fixed_modes.items():
+        if mode == "basket":
+            targets = _side_arm_targets(config.targets, side)
+            fixed_action.update(
+                _fixed_arm_motion_targets(
+                    side,
+                    mode,
+                    targets,
+                    motion_states,
+                    obs,
+                    fixed_action,
+                    now=now,
+                    duration_s=config.basket_motion_s,
+                )
+            )
+            if _vr_trigger_active(vr_teleop, side):
+                fixed_action[f"{side}_arm_gripper.pos"] = config.release_gripper
+        elif mode == "action_ready":
+            targets = _side_arm_targets(action_ready_targets, side)
+            fixed_action.update(
+                _fixed_arm_motion_targets(
+                    side,
+                    mode,
+                    targets,
+                    motion_states,
+                    obs,
+                    fixed_action,
+                    now=now,
+                    duration_s=config.action_ready_motion_s,
+                )
+            )
+        elif mode == "parked_action_ready":
+            motion_states.pop(side, None)
+            fixed_action.update(_side_arm_targets(action_ready_targets, side))
+    return fixed_action
+
+
+def _fixed_arm_motion_targets(
+    side: str,
+    mode: str,
+    targets: dict[str, float],
+    motion_states: dict[str, FixedArmMotionState],
+    obs: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    now: float,
+    duration_s: float,
+) -> dict[str, float]:
+    state = motion_states.get(side)
+    if state is None or state.mode != mode or not _same_joint_targets(state.goal_targets, targets):
+        state = _start_fixed_arm_motion(side, mode, targets, obs, action, now=now, duration_s=duration_s)
+        motion_states[side] = state
+        print(f"{side.capitalize()} arm {mode.replace('_', ' ')} motion over {state.duration_s:.1f}s.")
+    return _interpolate_fixed_arm_motion(state, now)
+
+
+def _start_fixed_arm_motion(
+    side: str,
+    mode: str,
+    targets: dict[str, float],
+    obs: dict[str, Any],
+    action: dict[str, Any],
+    *,
+    now: float,
+    duration_s: float,
+) -> FixedArmMotionState:
+    start_targets: dict[str, float] = {}
+    for key, target in targets.items():
+        value = obs.get(key, action.get(key, target))
+        try:
+            start_targets[key] = float(value)
+        except (TypeError, ValueError):
+            start_targets[key] = float(target)
+    return FixedArmMotionState(
+        mode=mode,
+        start_targets=start_targets,
+        goal_targets=dict(targets),
+        started_at=now,
+        duration_s=max(0.0, float(duration_s)),
+    )
+
+
+def _interpolate_fixed_arm_motion(state: FixedArmMotionState, now: float) -> dict[str, float]:
+    if state.duration_s <= 0:
+        return dict(state.goal_targets)
+    progress = _clip((now - state.started_at) / state.duration_s, 0.0, 1.0)
+    eased = progress * progress * (3.0 - 2.0 * progress)
+    return {
+        key: start + (float(state.goal_targets[key]) - start) * eased
+        for key, start in state.start_targets.items()
+    }
+
+
+def _same_joint_targets(left: dict[str, float], right: dict[str, float], *, tolerance: float = 1e-4) -> bool:
+    if left.keys() != right.keys():
+        return False
+    return all(abs(float(left[key]) - float(right[key])) <= tolerance for key in left)
+
+
+def _clear_reached_action_ready_modes(
+    fixed_modes: dict[str, str],
+    motion_states: dict[str, FixedArmMotionState],
+    vr_teleop: Any,
+    obs: dict[str, Any],
+    action_ready_targets: dict[str, float],
+    *,
+    tolerance_deg: float = 2.0,
+) -> None:
+    now = time.perf_counter()
+    for side, mode in list(fixed_modes.items()):
+        if mode != "action_ready":
+            continue
+        targets = _side_arm_targets(action_ready_targets, side)
+        motion_done = _fixed_arm_motion_done(motion_states.get(side), now)
+        reached = _arm_targets_reached(obs, targets, tolerance_deg=tolerance_deg)
+        if not (motion_done or reached):
+            continue
+        fixed_modes.pop(side, None)
+        motion_states.pop(side, None)
+        _sync_vr_arm_to_observation(vr_teleop, side, obs)
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is not None:
+            setattr(arm, "ik_fixed_pose_paused", False)
+        print(f"{side.capitalize()} arm ACTION_READY motion complete; IK resumed.")
+
+
+def _fixed_arm_motion_done(state: FixedArmMotionState | None, now: float, *, settle_s: float = 0.15) -> bool:
+    if state is None or state.mode != "action_ready":
+        return False
+    return now >= state.started_at + state.duration_s + settle_s
+
+
+def _arm_targets_reached(obs: dict[str, Any], targets: dict[str, float], *, tolerance_deg: float) -> bool:
+    if not targets:
+        return False
+    for key, target in targets.items():
+        if key.endswith("_gripper.pos"):
+            continue
+        if key not in obs:
+            continue
+        if abs(float(obs[key]) - float(target)) > tolerance_deg:
+            return False
+    return True
+
+
+def _side_arm_targets(targets: dict[str, float], side: str) -> dict[str, float]:
+    prefix = f"{side}_arm_"
+    return {key: value for key, value in targets.items() if key.startswith(prefix)}
+
+
+def _capture_arm_pose_targets(robot: Any) -> dict[str, float]:
+    obs = _get_robot_observation(robot, use_camera=False)
+    return {
+        key: float(value)
+        for key, value in obs.items()
+        if key.endswith(".pos") and (key.startswith("left_arm_") or key.startswith("right_arm_"))
+    }
+
+
+def _current_vr_button_state(vr_teleop: Any) -> set[str]:
+    pressed: set[str] = set()
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    server = getattr(monitor, "vr_server", None) if monitor is not None else None
+    controller_state = getattr(server, "_robot42_controller_button_state", {}) if server is not None else {}
+    for side in ("left", "right"):
+        state = controller_state.get(side) if isinstance(controller_state, dict) else None
+        if isinstance(state, dict):
+            _add_vr_buttons_from_metadata(pressed, side, state)
+        metadata = _vr_controller_metadata(vr_teleop, side)
+        if metadata:
+            _add_vr_buttons_from_metadata(pressed, side, metadata)
+    return pressed
+
+
+def _add_vr_buttons_from_metadata(pressed: set[str], side: str, metadata: dict[str, Any]) -> None:
+    buttons = metadata.get("buttons", {}) or {}
+    if isinstance(buttons, dict):
+        for name, is_pressed in buttons.items():
+            if is_pressed:
+                button_name = str(name).strip().lower()
+                pressed.add(f"{side}:{button_name}")
+                if side == "left":
+                    if button_name == "a":
+                        pressed.add("left:x")
+                    elif button_name == "b":
+                        pressed.add("left:y")
+    if metadata.get("squeeze", False):
+        pressed.add(f"{side}:squeeze")
+    if metadata.get("grip_active", False):
+        pressed.add(f"{side}:grip")
+
+
+def _vr_button_spec_pressed(spec: str, newly_pressed: set[str]) -> bool:
+    normalized = _normalize_vr_button_spec(spec)
+    return bool(normalized and normalized in newly_pressed)
+
+
+def _normalize_vr_button_spec(spec: str) -> str:
+    value = (spec or "").strip().lower()
+    if not value:
+        return ""
+    if ":" not in value:
+        return f"right:{value}"
+    side, button = value.split(":", 1)
+    return f"{side.strip()}:{button.strip()}"
+
+
+def _vr_trigger_active(vr_teleop: Any, side: str) -> bool:
+    metadata = _vr_controller_metadata(vr_teleop, side)
+    if not metadata:
+        return False
+    return bool(float(metadata.get("trigger", 0.0) or 0.0) > 0.5 or metadata.get("trigger_active", False))
+
+
+def _vr_controller_metadata(vr_teleop: Any, side: str) -> dict[str, Any]:
+    monitor = getattr(vr_teleop, "vr_monitor", None)
+    if monitor is None or not hasattr(monitor, "get_latest_goal_nowait"):
+        return {}
+    try:
+        goal = monitor.get_latest_goal_nowait(side)
+    except Exception:
+        return {}
+    metadata = getattr(goal, "metadata", {}) if goal is not None else {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
 def _install_vr_arm_tuning(vr_teleop: Any, tuning: VrArmTuning) -> None:
     import types
 
@@ -1617,13 +2763,21 @@ def _install_vr_arm_tuning(vr_teleop: Any, tuning: VrArmTuning) -> None:
         arm = getattr(vr_teleop, arm_name, None)
         if arm is None:
             continue
+        arm._robot42_yawed_pan_sign = tuning.yawed_pan_sign
         arm.handle_vr_input = types.MethodType(_tuned_vr_arm_input(tuning), arm)
     print(
         "VR arm tuning: "
+        f"ik_mode={tuning.ik_mode}, "
         f"vertical_sign={tuning.vertical_sign:g}, "
         f"y_gain={tuning.y_gain:.2f}, "
         f"z_gain={tuning.z_gain:.2f}, "
-        f"ik_alpha={tuning.ik_alpha:.2f}."
+        f"ik_alpha={tuning.ik_alpha:.2f}, "
+        f"yawed_forward_gain={tuning.yawed_forward_gain:.2f}, "
+        f"yawed_lateral_gain={tuning.yawed_lateral_gain:.2f}, "
+        f"yawed_pan_sign={tuning.yawed_pan_sign:g}, "
+        f"shoulder_lift=[{tuning.shoulder_lift_min:.1f}, {tuning.shoulder_lift_max:.1f}], "
+        f"elbow_flex=[{tuning.elbow_flex_min:.1f}, {tuning.elbow_flex_max:.1f}], "
+        f"joint_limits={'on' if tuning.enforce_joint_limits else 'off'}."
     )
 
 
@@ -1633,6 +2787,42 @@ def _tuned_vr_arm_input(tuning: VrArmTuning) -> Any:
             return
 
         current_vr_pos = vr_goal.target_position
+        metadata = getattr(vr_goal, "metadata", {}) or {}
+        rebaseline_frames = int(getattr(self, "ik_clutch_rebaseline_frames", 0) or 0)
+        if rebaseline_frames > 0:
+            setattr(self, "ik_clutch_rebaseline_frames", rebaseline_frames - 1)
+            setattr(self, "ik_clutch_rebaseline_once", False)
+            self.prev_vr_pos = current_vr_pos
+            if hasattr(vr_goal, "wrist_flex_deg") and vr_goal.wrist_flex_deg is not None:
+                self.prev_wrist_flex = vr_goal.wrist_flex_deg
+            if hasattr(vr_goal, "wrist_roll_deg") and vr_goal.wrist_roll_deg is not None:
+                self.prev_wrist_roll = vr_goal.wrist_roll_deg
+            self.target_positions["gripper"] = 45 if metadata.get("trigger", 0) > 0.5 else 0.0
+            _maybe_print_vr_arm_debug(self, tuning, phase="rebaseline")
+            return
+
+        if getattr(self, "ik_clutch_rebaseline_once", False):
+            setattr(self, "ik_clutch_rebaseline_once", False)
+            self.prev_vr_pos = current_vr_pos
+            if hasattr(vr_goal, "wrist_flex_deg") and vr_goal.wrist_flex_deg is not None:
+                self.prev_wrist_flex = vr_goal.wrist_flex_deg
+            if hasattr(vr_goal, "wrist_roll_deg") and vr_goal.wrist_roll_deg is not None:
+                self.prev_wrist_roll = vr_goal.wrist_roll_deg
+            self.target_positions["gripper"] = 45 if metadata.get("trigger", 0) > 0.5 else 0.0
+            _maybe_print_vr_arm_debug(self, tuning, phase="rebaseline")
+            return
+
+        if getattr(self, "ik_clutch_paused", False) or getattr(self, "ik_fixed_pose_paused", False):
+            self.prev_vr_pos = current_vr_pos
+            if hasattr(vr_goal, "wrist_flex_deg") and vr_goal.wrist_flex_deg is not None:
+                self.prev_wrist_flex = vr_goal.wrist_flex_deg
+            if hasattr(vr_goal, "wrist_roll_deg") and vr_goal.wrist_roll_deg is not None:
+                self.prev_wrist_roll = vr_goal.wrist_roll_deg
+            self.target_positions["gripper"] = 45 if metadata.get("trigger", 0) > 0.5 else 0.0
+            phase = "fixed_pose" if getattr(self, "ik_fixed_pose_paused", False) else "paused"
+            _maybe_print_vr_arm_debug(self, tuning, phase=phase)
+            return
+
         if not hasattr(self, "prev_vr_pos"):
             self.prev_vr_pos = current_vr_pos
             return
@@ -1651,8 +2841,11 @@ def _tuned_vr_arm_input(tuning: VrArmTuning) -> Any:
         delta_y = _deadzone_clip(vr_y * pos_scale, deadzone=0.001, limit=delta_limit)
         delta_z = _deadzone_clip(vr_z * pos_scale, deadzone=0.001, limit=delta_limit)
 
-        self.current_x += -delta_z
-        self.current_y += tuning.vertical_sign * delta_y
+        if tuning.ik_mode == "yawed":
+            _update_yawed_vr_arm_target(self, tuning, delta_x=delta_x, delta_y=delta_y, delta_z=delta_z)
+        else:
+            self.current_x += -delta_z
+            self.current_y += tuning.vertical_sign * delta_y
 
         if hasattr(vr_goal, "wrist_flex_deg") and vr_goal.wrist_flex_deg is not None:
             if not hasattr(self, "prev_wrist_flex"):
@@ -1674,13 +2867,21 @@ def _tuned_vr_arm_input(tuning: VrArmTuning) -> Any:
                 self.target_positions["wrist_roll"] = max(-90, min(90, current_roll + delta_roll))
                 self.prev_wrist_roll = vr_goal.wrist_roll_deg
 
-        if abs(delta_x) > 0.001:
+        if tuning.ik_mode != "yawed" and abs(delta_x) > 0.001:
             delta_pan = max(-angle_limit, min(angle_limit, delta_x * 200.0))
             current_pan = self.target_positions.get("shoulder_pan", 0.0)
             self.target_positions["shoulder_pan"] = max(-180, min(180, current_pan + delta_pan))
 
+        joint2_target = None
+        joint3_target = None
+        ik_error = None
         try:
-            joint2_target, joint3_target = self.kinematics.inverse_kinematics(self.current_x, self.current_y)
+            joint2_target, joint3_target = _so101_inverse_kinematics_with_limits(
+                self.kinematics,
+                self.current_x,
+                self.current_y,
+                tuning,
+            )
             alpha = max(0.01, min(1.0, tuning.ik_alpha))
             self.target_positions["shoulder_lift"] = (
                 (1 - alpha) * self.target_positions.get("shoulder_lift", 0.0) + alpha * joint2_target
@@ -1689,14 +2890,187 @@ def _tuned_vr_arm_input(tuning: VrArmTuning) -> Any:
                 (1 - alpha) * self.target_positions.get("elbow_flex", 0.0) + alpha * joint3_target
             )
         except Exception as exc:
+            ik_error = str(exc)
             print(f"[{self.prefix}] VR IK failed: {exc}")
 
         self.target_positions["wrist_flex"] = (
             -self.target_positions["shoulder_lift"] - self.target_positions["elbow_flex"] + self.pitch
         )
-        self.target_positions["gripper"] = 45 if vr_goal.metadata.get("trigger", 0) > 0.5 else 0.0
+        self.target_positions["gripper"] = 45 if metadata.get("trigger", 0) > 0.5 else 0.0
+        _maybe_print_vr_arm_debug(
+            self,
+            tuning,
+            phase="track",
+            delta_x=delta_x,
+            delta_y=delta_y,
+            delta_z=delta_z,
+            ik_shoulder=joint2_target,
+            ik_elbow=joint3_target,
+            ik_error=ik_error,
+        )
 
     return handle_vr_input
+
+
+def _update_yawed_vr_arm_target(
+    arm: Any,
+    tuning: VrArmTuning,
+    *,
+    delta_x: float,
+    delta_y: float,
+    delta_z: float,
+) -> None:
+    _ensure_yawed_vr_arm_state(arm)
+
+    arm.current_forward += (-delta_z) * tuning.yawed_forward_gain
+    arm.current_lateral += delta_x * tuning.yawed_lateral_gain
+    arm.current_height += tuning.vertical_sign * delta_y
+
+    radial = math.hypot(arm.current_forward, arm.current_lateral)
+    pan_target = math.degrees(math.atan2(arm.current_lateral, arm.current_forward)) * tuning.yawed_pan_sign
+    pan_limit = abs(float(tuning.yawed_pan_limit))
+    arm.target_positions["shoulder_pan"] = _clip(pan_target, -pan_limit, pan_limit)
+
+    arm.current_x = radial
+    arm.current_y = arm.current_height
+
+
+def _ensure_yawed_vr_arm_state(arm: Any) -> None:
+    if all(hasattr(arm, attr) for attr in ("current_forward", "current_lateral", "current_height")):
+        return
+    radial = abs(float(getattr(arm, "current_x", 0.0) or 0.0))
+    pan_rad = math.radians(float(getattr(arm, "target_positions", {}).get("shoulder_pan", 0.0) or 0.0))
+    arm.current_forward = radial * math.cos(pan_rad)
+    arm.current_lateral = radial * math.sin(pan_rad)
+    arm.current_height = float(getattr(arm, "current_y", 0.0) or 0.0)
+
+
+def _maybe_print_vr_arm_debug(
+    arm: Any,
+    tuning: VrArmTuning,
+    *,
+    phase: str,
+    delta_x: float = 0.0,
+    delta_y: float = 0.0,
+    delta_z: float = 0.0,
+    ik_shoulder: float | None = None,
+    ik_elbow: float | None = None,
+    ik_error: str | None = None,
+) -> None:
+    if not tuning.debug:
+        return
+    now = time.perf_counter()
+    interval_s = 1.0 / max(0.1, tuning.debug_hz)
+    last_t = float(getattr(arm, "_robot42_last_ik_debug_t", 0.0) or 0.0)
+    if now - last_t < interval_s:
+        return
+    setattr(arm, "_robot42_last_ik_debug_t", now)
+
+    x = float(getattr(arm, "current_x", 0.0) or 0.0)
+    y = float(getattr(arm, "current_y", 0.0) or 0.0)
+    r = math.hypot(x, y)
+    kin = getattr(arm, "kinematics", None)
+    l1 = float(getattr(kin, "l1", 0.1159))
+    l2 = float(getattr(kin, "l2", 0.1350))
+    r_min = abs(l1 - l2)
+    r_max = l1 + l2
+
+    notes: list[str] = []
+    if r <= r_min + 0.003:
+        notes.append("near_min_radius")
+    if r >= r_max - 0.003:
+        notes.append("near_max_radius")
+    limit_prefix = "" if tuning.enforce_joint_limits else "would_"
+    if ik_shoulder is not None and ik_shoulder <= tuning.shoulder_lift_min + 0.5:
+        notes.append(f"{limit_prefix}shoulder_min")
+    if ik_shoulder is not None and ik_shoulder >= tuning.shoulder_lift_max - 0.5:
+        notes.append(f"{limit_prefix}shoulder_max")
+    if ik_elbow is not None and ik_elbow <= tuning.elbow_flex_min + 0.5:
+        notes.append(f"{limit_prefix}elbow_min")
+    if ik_elbow is not None and ik_elbow >= tuning.elbow_flex_max - 0.5:
+        notes.append(f"{limit_prefix}elbow_max")
+    if ik_error:
+        notes.append(f"ik_error={ik_error}")
+
+    targets = getattr(arm, "target_positions", {}) or {}
+    prefix = getattr(arm, "prefix", "arm")
+    ik_text = (
+        f"ik=({ik_shoulder:.1f},{ik_elbow:.1f})"
+        if ik_shoulder is not None and ik_elbow is not None
+        else "ik=(none)"
+    )
+    yawed_text = ""
+    if tuning.ik_mode == "yawed" and all(
+        hasattr(arm, attr) for attr in ("current_forward", "current_lateral", "current_height")
+    ):
+        yawed_text = (
+            f" target3d=(fwd={float(getattr(arm, 'current_forward')):.3f},"
+            f"lat={float(getattr(arm, 'current_lateral')):.3f},"
+            f"h={float(getattr(arm, 'current_height')):.3f},"
+            f"pan={float(targets.get('shoulder_pan', 0.0)):.1f})"
+        )
+    print(
+        f"[VR_IK {prefix}] mode={tuning.ik_mode} phase={phase} "
+        f"xy=({x:.3f},{y:.3f}) r={r:.3f} "
+        f"d=({delta_x:+.3f},{delta_y:+.3f},{delta_z:+.3f}) "
+        f"{ik_text} "
+        f"target=(shoulder={float(targets.get('shoulder_lift', 0.0)):.1f},"
+        f"elbow={float(targets.get('elbow_flex', 0.0)):.1f},"
+        f"wrist={float(targets.get('wrist_flex', 0.0)):.1f}) "
+        f"pitch={float(getattr(arm, 'pitch', 0.0) or 0.0):.1f} "
+        f"{yawed_text} "
+        f"notes={','.join(notes) if notes else 'ok'}"
+    )
+
+
+def _so101_inverse_kinematics_with_limits(
+    kinematics: Any,
+    x: float,
+    y: float,
+    tuning: VrArmTuning,
+) -> tuple[float, float]:
+    l1 = float(getattr(kinematics, "l1", 0.1159))
+    l2 = float(getattr(kinematics, "l2", 0.1350))
+
+    theta1_offset = math.atan2(0.028, 0.11257)
+    theta2_offset = math.atan2(0.0052, 0.1349) + theta1_offset
+
+    r = math.sqrt(x**2 + y**2)
+    r_max = l1 + l2
+    if r > r_max:
+        scale_factor = r_max / r
+        x *= scale_factor
+        y *= scale_factor
+        r = r_max
+
+    r_min = abs(l1 - l2)
+    if 0 < r < r_min:
+        scale_factor = r_min / r
+        x *= scale_factor
+        y *= scale_factor
+        r = r_min
+
+    cos_theta2 = -(r**2 - l1**2 - l2**2) / (2 * l1 * l2)
+    cos_theta2 = max(-1.0, min(1.0, cos_theta2))
+
+    theta2 = math.pi - math.acos(cos_theta2)
+    beta = math.atan2(y, x)
+    gamma = math.atan2(l2 * math.sin(theta2), l1 + l2 * math.cos(theta2))
+    theta1 = beta + gamma
+
+    shoulder_lift = 90.0 - math.degrees(theta1 + theta1_offset)
+    elbow_flex = math.degrees(theta2 + theta2_offset) - 90.0
+
+    if tuning.enforce_joint_limits:
+        shoulder_lift = _clip(shoulder_lift, tuning.shoulder_lift_min, tuning.shoulder_lift_max)
+        elbow_flex = _clip(elbow_flex, tuning.elbow_flex_min, tuning.elbow_flex_max)
+    return shoulder_lift, elbow_flex
+
+
+def _clip(value: float, lower: float, upper: float) -> float:
+    if lower > upper:
+        lower, upper = upper, lower
+    return max(lower, min(upper, value))
 
 
 def _deadzone_clip(value: float, *, deadzone: float, limit: float) -> float:
@@ -1796,18 +3170,33 @@ def _create_dataset(
     dataset_root: str,
     fps: int,
     use_videos: bool,
+    resume: bool,
+    extra_observation_features: dict[str, type | tuple] | None = None,
 ) -> Any:
+    from lerobot.datasets.feature_utils import hw_to_dataset_features
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
-    from lerobot.datasets.utils import hw_to_dataset_features
+    from lerobot.datasets.utils import INFO_PATH
     from lerobot.utils.constants import ACTION, OBS_STR
 
+    dataset_root_path = Path(dataset_root).expanduser()
+    if resume and (dataset_root_path / INFO_PATH).exists():
+        print(f"Resuming LeRobot dataset `{dataset_id}` at {dataset_root_path}.")
+        return LeRobotDataset.resume(
+            dataset_id,
+            root=dataset_root_path,
+        )
+
+    observation_features = dict(robot.observation_features)
+    if extra_observation_features:
+        observation_features.update(extra_observation_features)
     action_features = hw_to_dataset_features(robot.action_features, ACTION, use_video=use_videos)
-    obs_features = hw_to_dataset_features(robot.observation_features, OBS_STR, use_video=use_videos)
+    obs_features = hw_to_dataset_features(observation_features, OBS_STR, use_video=use_videos)
     dataset_features = {**action_features, **obs_features}
+    print(f"Creating LeRobot dataset `{dataset_id}` at {dataset_root_path}.")
     return LeRobotDataset.create(
         dataset_id,
         fps,
-        root=dataset_root,
+        root=dataset_root_path,
         robot_type=robot.name,
         features=dataset_features,
         use_videos=use_videos,
@@ -1817,8 +3206,15 @@ def _create_dataset(
 def _record_frame_if_needed(recording: RecordingSession | None, observation: dict[str, Any], action: dict[str, Any]) -> None:
     if recording is None or not recording.active:
         return
+    missing = _missing_dataset_observation_values(recording.dataset.features, observation)
+    if missing:
+        now = time.time()
+        if now - recording.last_missing_feature_warn_t >= 5.0:
+            print(f"Recording frame skipped; missing observation values: {', '.join(missing)}")
+            recording.last_missing_feature_warn_t = now
+        return
 
-    from lerobot.datasets.utils import build_dataset_frame
+    from lerobot.datasets.feature_utils import build_dataset_frame
     from lerobot.utils.constants import ACTION, OBS_STR
 
     observation_frame = build_dataset_frame(recording.dataset.features, observation, prefix=OBS_STR)
@@ -1843,6 +3239,80 @@ def _record_frame_if_needed(recording: RecordingSession | None, observation: dic
     recording.dataset.add_frame(frame)
 
 
+def _augment_recording_observation(recording: RecordingSession, observation: dict[str, Any]) -> dict[str, Any]:
+    if recording.orbbec_output_dir is None:
+        return observation
+    augmented = dict(observation)
+    if recording.orbbec_camera_key not in augmented:
+        frame = _latest_orbbec_rgb_array(recording.orbbec_output_dir)
+        if frame is not None:
+            augmented[recording.orbbec_camera_key] = frame
+    return augmented
+
+
+def _latest_orbbec_rgb_array(output_dir: Path) -> Any | None:
+    path = output_dir / "latest.ppm"
+    if not path.exists():
+        return None
+    try:
+        return _ppm_file_to_rgb_array(path)
+    except Exception:
+        return None
+
+
+def _ppm_file_to_rgb_array(path: Path) -> Any:
+    import numpy as np
+
+    data = path.read_bytes()
+    offset = 0
+
+    def skip_ws_and_comments() -> None:
+        nonlocal offset
+        while offset < len(data):
+            value = data[offset]
+            if value == 35:
+                while offset < len(data) and data[offset] != 10:
+                    offset += 1
+            elif value in (9, 10, 13, 32):
+                offset += 1
+            else:
+                break
+
+    def token() -> bytes:
+        nonlocal offset
+        skip_ws_and_comments()
+        start = offset
+        while offset < len(data) and data[offset] not in (9, 10, 13, 32, 35):
+            offset += 1
+        return data[start:offset]
+
+    magic = token()
+    width = int(token())
+    height = int(token())
+    max_value = int(token())
+    skip_ws_and_comments()
+    if magic != b"P6" or max_value != 255:
+        raise ValueError(f"Unsupported PPM header in {path}")
+    rgb = np.frombuffer(data, dtype=np.uint8, count=width * height * 3, offset=offset)
+    return np.ascontiguousarray(rgb.reshape((height, width, 3)))
+
+
+def _missing_dataset_observation_values(features: dict[str, dict], observation: dict[str, Any]) -> list[str]:
+    from lerobot.utils.constants import OBS_STR
+
+    missing: list[str] = []
+    for key, ft in features.items():
+        if not key.startswith(OBS_STR):
+            continue
+        if ft["dtype"] == "float32" and len(ft["shape"]) == 1:
+            missing.extend(name for name in ft["names"] if name not in observation)
+        elif ft["dtype"] in {"image", "video"}:
+            raw_key = key.removeprefix(f"{OBS_STR}.images.")
+            if raw_key not in observation:
+                missing.append(raw_key)
+    return missing
+
+
 def _handle_recording_hotkeys(
     recording: RecordingSession | None,
     pressed_keys: set[str],
@@ -1860,6 +3330,23 @@ def _handle_recording_hotkeys(
 
     if stop_key in pressed_keys and recording.active:
         _save_episode(recording)
+
+
+def _toggle_recording_from_vr_button(recording: RecordingSession, button_spec: str) -> None:
+    if recording.active:
+        print(f"Training recording toggle `{button_spec}` pressed: saving episode.")
+        _save_episode(recording)
+        return
+    recording.active = True
+    print(f"Training recording toggle `{button_spec}` pressed: recording started.")
+
+
+def _discard_recording_from_vr_button(recording: RecordingSession, button_spec: str) -> None:
+    if not recording.active:
+        print(f"Training discard `{button_spec}` pressed, but no episode is active.")
+        return
+    print(f"Training discard `{button_spec}` pressed: discarding active episode.")
+    _discard_episode(recording)
 
 
 def _save_episode(recording: RecordingSession) -> None:
@@ -1912,9 +3399,14 @@ def _print_recording_guide(
     print(f"Quit key: `{quit_key}`")
     if controller == "vr":
         print(
-            "VR controls: left thumbstick right start/stop and save, "
-            "left thumbstick left discard, left thumbstick up save and quit, "
+            "VR controls: right thumbstick press start/stop and save, "
+            "left thumbstick press discard, left thumbstick right fallback start/save, "
+            "left thumbstick left fallback discard, left thumbstick up save and quit, "
             "left thumbstick down reset robot pose"
+        )
+        print(
+            "VR IK clutch: hold Quest squeeze/grip to freeze that arm; "
+            "keyboard `1`/`2` remain left/right fallbacks."
         )
     if recording is None:
         return
@@ -1965,7 +3457,7 @@ def _apply_vr_recording_decision(
 ) -> None:
     if decision.start_recording:
         recording.active = True
-        print("Recording started from VR. Push left thumbstick right again to save.")
+        print("Recording started from VR. Press right thumbstick to save, or left thumbstick to discard.")
     if decision.save_episode:
         _save_episode(recording)
     if decision.discard_episode:
