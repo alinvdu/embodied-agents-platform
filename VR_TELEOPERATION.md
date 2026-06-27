@@ -69,7 +69,7 @@ It then waits 5 seconds and moves to `ACTION_READY` using staged deltas:
 
 ```text
 elbow_flex    -80
-shoulder_lift +90
+shoulder_lift +80
 wrist_flex    -40
 ```
 
@@ -89,7 +89,7 @@ The default ACTION_READY deltas are already baked in. Override them only when te
 
 ```bash
 --vr-action-ready-elbow-delta -80 \
---vr-action-ready-shoulder-delta 90 \
+--vr-action-ready-shoulder-delta 80 \
 --vr-action-ready-wrist-delta -40
 ```
 
@@ -256,7 +256,7 @@ To disable Quest squeeze/grip clutch and keep only keyboard fallback:
 
 ## Grab To Basket Mode
 
-For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press an arm's basket control, Robot42 disables IK for that arm and follows a direct joint-space path: increase elbow flex at the current pose, move toward an elbow-raised version of the basket pose, then lower into the captured basket pose. Pressing that arm's action-ready control sends the arm back to the captured `ACTION_READY` pose and then resumes IK.
+For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press the right arm's basket control, Robot42 disables IK for that arm and follows a captured waypoint path: a relative clearance pose from the actual grasp, a fixed over-basket pose close to the base, then the final basket placement pose. Pressing that arm's action-ready control sends the arm back to the captured `ACTION_READY` pose and then resumes IK.
 
 ```bash
 --vr-skill-mode grab_to_basket --vr-skill-arm right
@@ -281,18 +281,19 @@ Button-triggered fixed-pose motions are ramped by default so carrying an object 
 ```bash
 --vr-basket-motion-s 4.0
 --vr-basket-elbow-lift-deg -25
+--vr-basket-shoulder-back-deg 65
 --vr-action-ready-motion-s 2.0
 ```
 
-The basket trajectory uses 25% of its duration for the elbow-only lift, 50% for the raised transfer, and 25% for lowering into the final pose. The phases advance on time rather than observed servo error, so object weight cannot leave the sequence waiting forever. Adjust the signed `--vr-basket-elbow-lift-deg` to tune clearance; this robot currently uses a negative value to lift.
+The right-arm basket trajectory uses 35% of its duration for the relative clearance pose, 40% for the over-basket transfer pose, and 25% for lowering into the final basket pose. The phases advance on time rather than observed servo error, so object weight cannot leave the sequence waiting forever. The shoulder/elbow heuristic flags are kept for fallback paths, but the right-arm dataset path now follows the captured waypoints.
 
 These settings only affect the `B/Y` basket move. `--vr-action-ready-motion-s` controls the `A/X` return-to-`ACTION_READY` move. None of them change the startup `NAV_STOW` -> `ACTION_READY` routine.
 
-The baked basket poses are the captured right/left placement poses for the current physical basket. If you capture a better pose later, override any joint with repeated target flags:
+The baked basket poses are the captured right/left placement poses for the current physical basket. If you capture a better final pose later, override any joint with repeated target flags:
 
 ```bash
---vr-basket-target right_arm_shoulder_pan.pos=-21.0835 \
---vr-basket-target right_arm_shoulder_lift.pos=-30.9287
+--vr-basket-target right_arm_shoulder_pan.pos=-26.8668 \
+--vr-basket-target right_arm_shoulder_lift.pos=-42.3715
 ```
 
 While recording, all three joint-space stages are produced inside the main control loop, so the full trajectory is captured frame-by-frame in the episode. Live trigger/gripper commands pass through during the automatic move, ACTION_READY return, and boundary hold.

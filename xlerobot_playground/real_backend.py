@@ -142,12 +142,33 @@ _VR_BASKET_POSE_DEFAULTS = {
     "left_arm_wrist_flex.pos": 64.8387,
     "left_arm_wrist_roll.pos": -5.9111,
     "left_arm_gripper.pos": 1.3889,
-    "right_arm_shoulder_pan.pos": -21.0835,
-    "right_arm_shoulder_lift.pos": -30.9287,
-    "right_arm_elbow_flex.pos": 70.2739,
-    "right_arm_wrist_flex.pos": 63.2052,
+    "right_arm_shoulder_pan.pos": -26.8668,
+    "right_arm_shoulder_lift.pos": -42.3715,
+    "right_arm_elbow_flex.pos": 84.8226,
+    "right_arm_wrist_flex.pos": 44.9714,
+    "right_arm_wrist_roll.pos": -2.9548,
+    "right_arm_gripper.pos": 6.4909,
+}
+_RIGHT_BASKET_PATH_REFERENCE_GRASP = {
+    "right_arm_shoulder_pan.pos": -10.1757,
+    "right_arm_shoulder_lift.pos": 15.6716,
+    "right_arm_elbow_flex.pos": -25.3705,
+    "right_arm_wrist_flex.pos": 35.4865,
     "right_arm_wrist_roll.pos": -2.7595,
-    "right_arm_gripper.pos": 1.7579,
+}
+_RIGHT_BASKET_PATH_CLEARANCE = {
+    "right_arm_shoulder_pan.pos": -10.2489,
+    "right_arm_shoulder_lift.pos": -47.4295,
+    "right_arm_elbow_flex.pos": 9.7441,
+    "right_arm_wrist_flex.pos": 54.1292,
+    "right_arm_wrist_roll.pos": -3.0525,
+}
+_RIGHT_BASKET_PATH_OVER_BASKET = {
+    "right_arm_shoulder_pan.pos": -23.7921,
+    "right_arm_shoulder_lift.pos": -87.8109,
+    "right_arm_elbow_flex.pos": 86.2595,
+    "right_arm_wrist_flex.pos": 54.1292,
+    "right_arm_wrist_roll.pos": -3.0037,
 }
 
 
@@ -191,6 +212,8 @@ class VrBasketPoseConfig:
     release_gripper: float
     basket_motion_s: float
     basket_elbow_lift_deg: float
+    basket_shoulder_back_deg: float
+    basket_elbow_compensation_deg: float | None
     action_ready_motion_s: float
 
 
@@ -410,6 +433,21 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         ),
     )
     parser.add_argument(
+        "--vr-basket-shoulder-back-deg",
+        type=float,
+        default=65.0,
+        help="Degrees to move shoulder_lift back toward NAV_STOW after the initial elbow lift.",
+    )
+    parser.add_argument(
+        "--vr-basket-elbow-compensation-deg",
+        type=float,
+        default=None,
+        help=(
+            "Elbow-flex degrees moved opposite the initial lift while shoulder_lift moves back. "
+            "Defaults to 2x the shoulder-back amount."
+        ),
+    )
+    parser.add_argument(
         "--vr-action-ready-motion-s",
         type=float,
         default=2.0,
@@ -519,7 +557,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--vr-action-ready-shoulder-delta",
         type=float,
-        default=90.0,
+        default=80.0,
         help="Shoulder lift delta applied after elbow when moving from NAV_STOW to ACTION_READY.",
     )
     parser.add_argument(
@@ -641,6 +679,8 @@ def main(argv: list[str] | None = None) -> int:
             release_gripper=args.vr_basket_release_gripper,
             basket_motion_s=args.vr_basket_motion_s,
             basket_elbow_lift_deg=args.vr_basket_elbow_lift_deg,
+            basket_shoulder_back_deg=args.vr_basket_shoulder_back_deg,
+            basket_elbow_compensation_deg=args.vr_basket_elbow_compensation_deg,
             action_ready_motion_s=args.vr_action_ready_motion_s,
         ),
         base_smoother=BaseSmoother(
@@ -2708,6 +2748,8 @@ def _apply_fixed_arm_pose_action(
                     now=now,
                     duration_s=config.basket_motion_s,
                     basket_elbow_lift_deg=config.basket_elbow_lift_deg,
+                    basket_shoulder_back_deg=config.basket_shoulder_back_deg,
+                    basket_elbow_compensation_deg=config.basket_elbow_compensation_deg,
                 )
             )
         elif mode == "action_ready":
@@ -2756,6 +2798,8 @@ def _fixed_arm_motion_targets(
     now: float,
     duration_s: float,
     basket_elbow_lift_deg: float = 0.0,
+    basket_shoulder_back_deg: float = 0.0,
+    basket_elbow_compensation_deg: float | None = None,
 ) -> dict[str, float]:
     state = motion_states.get(side)
     if state is None or state.mode != mode or not _same_joint_targets(state.goal_targets, targets):
@@ -2768,19 +2812,23 @@ def _fixed_arm_motion_targets(
             now=now,
             duration_s=duration_s,
             basket_elbow_lift_deg=basket_elbow_lift_deg,
+            basket_shoulder_back_deg=basket_shoulder_back_deg,
+            basket_elbow_compensation_deg=basket_elbow_compensation_deg,
         )
         motion_states[side] = state
         if mode == "basket" and state.waypoint_targets:
             elbow_key = f"{side}_arm_elbow_flex.pos"
-            lift_elbow = state.waypoint_targets[0].get(elbow_key)
-            raised_basket_elbow = state.waypoint_targets[1].get(elbow_key)
+            shoulder_key = f"{side}_arm_shoulder_lift.pos"
+            first_elbow = state.waypoint_targets[0].get(elbow_key)
+            last_elbow = state.waypoint_targets[-1].get(elbow_key)
+            last_shoulder = state.waypoint_targets[-1].get(shoulder_key)
             final_elbow = state.goal_targets.get(elbow_key)
             print(
                 f"{side.capitalize()} arm basket motion over {state.duration_s:.1f}s: "
                 f"elbow {float(state.start_targets.get(elbow_key, 0.0)):.1f}"
-                f" -> {float(lift_elbow):.1f}; "
-                f"raised basket elbow {float(raised_basket_elbow):.1f}; "
-                f"final elbow {float(final_elbow):.1f}."
+                f" -> first {float(first_elbow):.1f}; "
+                f"last waypoint elbow {float(last_elbow):.1f}, shoulder {float(last_shoulder):.1f}; "
+                f"{len(state.waypoint_targets)} waypoints; final elbow {float(final_elbow):.1f}."
             )
         else:
             print(f"{side.capitalize()} arm {mode.replace('_', ' ')} motion over {state.duration_s:.1f}s.")
@@ -2797,6 +2845,8 @@ def _start_fixed_arm_motion(
     now: float,
     duration_s: float,
     basket_elbow_lift_deg: float = 0.0,
+    basket_shoulder_back_deg: float = 0.0,
+    basket_elbow_compensation_deg: float | None = None,
 ) -> FixedArmMotionState:
     start_targets: dict[str, float] = {}
     for key, target in targets.items():
@@ -2813,9 +2863,11 @@ def _start_fixed_arm_motion(
             start_targets,
             targets,
             elbow_lift_deg=basket_elbow_lift_deg,
+            shoulder_back_deg=basket_shoulder_back_deg,
+            elbow_compensation_deg=basket_elbow_compensation_deg,
         )
         if waypoint_targets:
-            segment_weights = (0.25, 0.50, 0.25)
+            segment_weights = _basket_motion_segment_weights(len(waypoint_targets))
     return FixedArmMotionState(
         mode=mode,
         start_targets=start_targets,
@@ -2869,8 +2921,14 @@ def _build_basket_joint_waypoints(
     goal_targets: dict[str, float],
     *,
     elbow_lift_deg: float,
+    shoulder_back_deg: float,
+    elbow_compensation_deg: float | None,
 ) -> tuple[dict[str, float], ...]:
+    if side == "right":
+        return _build_right_captured_basket_waypoints(start_targets, goal_targets)
+
     elbow_key = f"{side}_arm_elbow_flex.pos"
+    shoulder_key = f"{side}_arm_shoulder_lift.pos"
     if elbow_key not in start_targets or elbow_key not in goal_targets:
         return ()
 
@@ -2882,13 +2940,87 @@ def _build_basket_joint_waypoints(
         106.0,
     )
 
+    compensation_deg = (
+        abs(float(shoulder_back_deg)) * 2.0
+        if elbow_compensation_deg is None
+        else abs(float(elbow_compensation_deg))
+    )
+    clearance_targets = dict(lift_targets)
+    if shoulder_key in clearance_targets:
+        clearance_targets[shoulder_key] = _clip(
+            _step_toward(
+                float(lift_targets[shoulder_key]),
+                float(_NAV_STOW_ARM_POSE["shoulder_lift"]),
+                abs(float(shoulder_back_deg)),
+            ),
+            -108.0,
+            96.0,
+        )
+    if lift_offset:
+        clearance_targets[elbow_key] = _clip(
+            float(lift_targets[elbow_key]) - math.copysign(compensation_deg, lift_offset),
+            -115.0,
+            106.0,
+        )
+
+    travel_targets = dict(clearance_targets)
+    for suffix in ("shoulder_pan.pos", "wrist_roll.pos"):
+        joint_key = f"{side}_arm_{suffix}"
+        if joint_key in travel_targets and joint_key in goal_targets:
+            travel_targets[joint_key] = float(goal_targets[joint_key])
+
     raised_basket_targets = dict(goal_targets)
     raised_basket_targets[elbow_key] = _clip(
         float(goal_targets[elbow_key]) + lift_offset,
         -115.0,
         106.0,
     )
-    return (lift_targets, raised_basket_targets)
+    return (lift_targets, clearance_targets, travel_targets, raised_basket_targets)
+
+
+def _basket_motion_segment_weights(waypoint_count: int) -> tuple[float, ...]:
+    if waypoint_count == 4:
+        return (0.20, 0.30, 0.25, 0.15, 0.10)
+    if waypoint_count == 3:
+        return (0.25, 0.35, 0.25, 0.15)
+    if waypoint_count == 2:
+        return (0.35, 0.40, 0.25)
+    return tuple(1.0 for _ in range(max(1, waypoint_count + 1)))
+
+
+def _build_right_captured_basket_waypoints(
+    start_targets: dict[str, float],
+    goal_targets: dict[str, float],
+) -> tuple[dict[str, float], ...]:
+    clearance_targets = dict(start_targets)
+    for key, reference_value in _RIGHT_BASKET_PATH_REFERENCE_GRASP.items():
+        if key not in clearance_targets or key not in _RIGHT_BASKET_PATH_CLEARANCE:
+            continue
+        delta = float(_RIGHT_BASKET_PATH_CLEARANCE[key]) - float(reference_value)
+        clearance_targets[key] = _clip_arm_joint_target(key, float(start_targets[key]) + delta)
+
+    over_basket_targets = dict(goal_targets)
+    for key, value in _RIGHT_BASKET_PATH_OVER_BASKET.items():
+        if key in over_basket_targets:
+            over_basket_targets[key] = _clip_arm_joint_target(key, float(value))
+
+    return (clearance_targets, over_basket_targets)
+
+
+def _clip_arm_joint_target(key: str, value: float) -> float:
+    if key.endswith("_shoulder_lift.pos"):
+        return _clip(value, -108.0, 96.0)
+    if key.endswith("_elbow_flex.pos"):
+        return _clip(value, -115.0, 106.0)
+    return value
+
+
+def _step_toward(current: float, target: float, amount: float) -> float:
+    if amount <= 0:
+        return current
+    if current < target:
+        return min(target, current + amount)
+    return max(target, current - amount)
 
 
 def _same_joint_targets(left: dict[str, float], right: dict[str, float], *, tolerance: float = 1e-4) -> bool:

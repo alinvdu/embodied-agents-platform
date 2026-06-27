@@ -123,7 +123,7 @@ left thumbstick up      save active episode and quit session
 left thumbstick down    reset robot pose to ACTION_READY
 ```
 
-The basket move follows a direct timed joint-space sequence: subtract `25` degrees from elbow flex while every other joint remains at the current grasp pose, move toward the basket pose while keeping the same elbow offset, then lower the elbow into the exact basket pose. It continues after each timed phase even if object weight causes some servo tracking error. Trigger control remains live throughout every fixed motion and hold. The complete motion takes `4.0s`; the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
+The right-arm basket move follows a captured timed waypoint sequence: move from the actual grasp into a relative clearance pose, move close to the base into an over-basket pose, then lower into the exact basket pose. It continues after each timed phase even if object weight causes some servo tracking error. Trigger control remains live throughout every fixed motion and hold. The complete motion takes `4.0s`; the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
 
 After right A reaches `ACTION_READY`, IK remains locked:
 
