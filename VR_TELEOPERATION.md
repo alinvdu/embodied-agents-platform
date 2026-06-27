@@ -256,7 +256,7 @@ To disable Quest squeeze/grip clutch and keep only keyboard fallback:
 
 ## Grab To Basket Mode
 
-For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press an arm's basket control, Robot42 disables IK for that arm only and repeatedly sends fixed basket joint targets. Pressing that arm's action-ready control sends the arm back to the captured `ACTION_READY` pose and then resumes IK.
+For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press an arm's basket control, Robot42 disables IK for that arm and follows a direct joint-space path: increase elbow flex at the current pose, move toward an elbow-raised version of the basket pose, then lower into the captured basket pose. Pressing that arm's action-ready control sends the arm back to the captured `ACTION_READY` pose and then resumes IK.
 
 ```bash
 --vr-skill-mode grab_to_basket --vr-skill-arm right
@@ -267,23 +267,26 @@ Use `--vr-skill-arm left`, `right`, or `both`. When one side is selected, the in
 Controls:
 
 ```text
-right B             right arm to fixed basket pose
-right A             right arm back to ACTION_READY, then resume IK
+right B             right arm lifts, transfers above basket, then descends
+right A             right arm back to ACTION_READY, then boundary-lock IK
 left Y              left arm to fixed basket pose
-left X              left arm back to ACTION_READY, then resume IK
+left X              left arm back to ACTION_READY, then boundary-lock IK
 keyboard r          reset both arms to ACTION_READY
 left thumbstick down reset both arms to ACTION_READY
-trigger             release gripper while that arm's basket pose is active
+trigger             control gripper during any fixed motion or hold
 ```
 
 Button-triggered fixed-pose motions are ramped by default so carrying an object to the basket is not a snap move:
 
 ```bash
---vr-basket-motion-s 2.5
+--vr-basket-motion-s 4.0
+--vr-basket-elbow-lift-deg -25
 --vr-action-ready-motion-s 2.0
 ```
 
-These durations only affect the `B/Y` basket move and the `A/X` return-to-`ACTION_READY` move. They do not change the startup `NAV_STOW` -> `ACTION_READY` routine.
+The basket trajectory uses 25% of its duration for the elbow-only lift, 50% for the raised transfer, and 25% for lowering into the final pose. The phases advance on time rather than observed servo error, so object weight cannot leave the sequence waiting forever. Adjust the signed `--vr-basket-elbow-lift-deg` to tune clearance; this robot currently uses a negative value to lift.
+
+These settings only affect the `B/Y` basket move. `--vr-action-ready-motion-s` controls the `A/X` return-to-`ACTION_READY` move. None of them change the startup `NAV_STOW` -> `ACTION_READY` routine.
 
 The baked basket poses are the captured right/left placement poses for the current physical basket. If you capture a better pose later, override any joint with repeated target flags:
 
@@ -292,7 +295,9 @@ The baked basket poses are the captured right/left placement poses for the curre
 --vr-basket-target right_arm_shoulder_lift.pos=-30.9287
 ```
 
-While recording, the fixed-pose motion is produced inside the main control loop, so the transition toward the basket pose is captured frame-by-frame in the episode.
+While recording, all three joint-space stages are produced inside the main control loop, so the full trajectory is captured frame-by-frame in the episode. Live trigger/gripper commands pass through during the automatic move, ACTION_READY return, and boundary hold.
+
+After `A/X` reaches `ACTION_READY`, the arm stays locked there. Press the right thumbstick once to save/end the current episode, or the left thumbstick once to cancel it. The next right-thumbstick press starts the next episode and releases IK from the captured `ACTION_READY` pose. This two-step boundary also works without dataset recording.
 
 ## Dataset Practice
 
@@ -303,11 +308,11 @@ For VLA data collection:
 2. Move to ACTION_READY outside the recorded episode.
 3. Start recording.
 4. Demonstrate grab and basket drop.
-5. Stop/save immediately after success.
-6. Reset outside the episode.
+5. Return to ACTION_READY and let the boundary lock engage.
+6. Save or cancel with one thumbstick press.
+7. Reset the object while the arm remains locked.
+8. Start the next episode with the right thumbstick; IK resumes.
 ```
-
-Do not include reset/stow motions inside the task episode unless intentionally training a reset skill.
 
 ## Pose Utilities
 

@@ -3,6 +3,7 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -29,7 +30,7 @@ from xlerobot_agent.home_memory import (
 
 TEST_PNG_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/axJ4qkAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAAHgAAABaCAIAAAD8YgW4AAAA30lEQVR4nO3SQQ0AMAwDsW78wRbCUOxeNoFIp5zdHf67wQZCdzw6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SOCB0ROiJ0ROiI0BGhI0JHhI4IHRE6InRE6IjQEaEjQkeEjggdEToidEToiNARoSNCR4SexgMhPAOE1NBcAQAAAABJRU5ErkJggg=="
 )
 
 
@@ -795,6 +796,49 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("events", snapshot["report"])
         self.assertEqual(snapshot["home_memory"]["context"]["memory_id"], "house_v1")
 
+    def test_controller_object_confirmation_waits_for_ui_response(self) -> None:
+        controller = HomeAgentController.from_config(
+            HomeAgentConfig(model=HomeAgentModelConfig(provider="mock", model="mock"))
+        )
+        responses = []
+
+        def wait_for_confirmation() -> None:
+            responses.append(
+                controller.request_object_detection_confirmation(
+                    {
+                        "confirmation_id": "confirm_1",
+                        "object_label": "hot sauce bottle",
+                        "detected_label": "hot sauce bottle",
+                        "confidence_percent": 91.2,
+                        "annotated_artifact_url": "/api/artifacts/run/shot_detections.png",
+                    }
+                )
+            )
+
+        thread = threading.Thread(target=wait_for_confirmation)
+        thread.start()
+        deadline = time.time() + 3
+        snapshot = controller.snapshot()
+        while snapshot.get("pending_object_confirmation") is None and time.time() < deadline:
+            time.sleep(0.02)
+            snapshot = controller.snapshot()
+
+        pending = snapshot.get("pending_object_confirmation")
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending["confirmation_id"], "confirm_1")
+        response = controller.respond_object_detection_confirmation(
+            confirmation_id="confirm_1",
+            accepted=False,
+            reason="wrong object",
+        )
+        thread.join(timeout=3)
+
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(response["status"], "rejected")
+        self.assertEqual(responses[0]["status"], "rejected")
+        self.assertIsNone(controller.snapshot()["pending_object_confirmation"])
+
     def test_optional_specialist_hook_can_be_configured(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_path = Path(tmpdir) / "house.home_memory.json"
@@ -1288,7 +1332,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                     {
                         "status": "succeeded",
                         "reason": "captured",
-                        "image_data_url": "data:image/png;base64,cG5n",
+                        "image_data_url": TEST_PNG_DATA_URL,
                         "robot_pose": dict(current_pose),
                         "captured_at": 123.0,
                     }
@@ -1328,6 +1372,115 @@ class HomeTaskAgentTests(unittest.TestCase):
             self.assertIn("annotated_artifact_url", capture)
             self.assertTrue(Path(capture["annotated_image_path"]).is_file())
             self.assertEqual(manifest["captures"][0]["annotated_artifact_url"], capture["annotated_artifact_url"])
+
+    def test_runtime_execute_region_exploration_plan_rejects_candidate_and_continues(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        confirmations = []
+
+        def confirm(payload):
+            confirmations.append(dict(payload))
+            if len(confirmations) == 1:
+                return {"status": "rejected", "accepted": False, "reason": "wrong bottle"}
+            return {"status": "accepted", "accepted": True, "reason": "correct bottle"}
+
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="test_detection_confirmation_run",
+            confirm_object_detection=confirm,
+        )
+        current_pose = dict(runtime.current_pose)
+        calls = []
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            calls.append((request.full_url, body))
+            if request.full_url.endswith("/api/nav/waypoint"):
+                pose = body["pose"]
+                current_pose.update({"x": pose["x"], "y": pose["y"], "yaw": 0.0})
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "Nav2 reached the requested goal pose",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "Nav2 reached the requested goal pose",
+                            "reached_pose": pose,
+                            "feedback_samples": [{"remaining_distance_m": 0.0}],
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                current_pose["yaw"] = round(
+                    current_pose.get("yaw", 0.0)
+                    + float(body.get("delta_yaw_deg", 0.0)) * math.pi / 180.0,
+                    3,
+                )
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "local motion succeeded",
+                        "local_motion": {
+                            "primitive": body.get("primitive"),
+                            "status": "succeeded",
+                            "end_pose": dict(current_pose),
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/camera_pan"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "camera pan reached target",
+                        "camera_pan": {"status": "succeeded", "pan_rad": body.get("pan_rad")},
+                        "robot_pose": dict(current_pose),
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0,
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.execute_region_exploration_plan(
+                region_label="kitchen",
+                object_label="hot sauce bottle",
+                constraints={
+                    "max_stops": 1,
+                    "shots_per_stop": 2,
+                    "allow_auto_rotate": False,
+                    "allow_remote_region_exploration": True,
+                },
+            )
+
+        self.assertEqual(result["status"], "object_found")
+        self.assertEqual(result["detection_status"], "matched")
+        self.assertEqual(result["captured_shot_count"], 2)
+        self.assertEqual(len(confirmations), 2)
+        self.assertEqual(result["stops"][0]["shots"][0]["detection"]["status"], "rejected")
+        self.assertEqual(result["stops"][0]["shots"][0]["detection_confirmation"]["status"], "rejected")
+        self.assertEqual(result["stops"][0]["shots"][1]["detection"]["status"], "matched")
+        self.assertEqual(result["detection_confirmation"]["status"], "accepted")
+        self.assertEqual(
+            len([url for url, _body in calls if url.endswith("/api/nav/capture_rgb")]),
+            2,
+        )
 
     def test_runtime_execute_region_exploration_plan_aborts_when_detector_unavailable(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
@@ -1403,7 +1556,7 @@ class HomeTaskAgentTests(unittest.TestCase):
                     {
                         "status": "succeeded",
                         "reason": "captured",
-                        "image_data_url": "data:image/png;base64,cG5n",
+                        "image_data_url": TEST_PNG_DATA_URL,
                         "robot_pose": dict(current_pose),
                         "captured_at": 123.0,
                     }

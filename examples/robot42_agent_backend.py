@@ -47,6 +47,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--object-detector-timeout-s", type=float, default=None)
     parser.add_argument("--object-detector-max-image-edge-px", type=int, default=None)
     parser.add_argument("--object-detector-jpeg-quality", type=int, default=None)
+    parser.add_argument("--no-object-confirmation", action="store_false", dest="object_confirmation_required", default=None)
+    parser.add_argument("--object-confirmation-timeout-s", type=float, default=None)
     parser.add_argument("--object-focus-horizontal-fov-deg", type=float, default=None)
     parser.add_argument("--object-focus-center-tolerance-norm", type=float, default=None)
     parser.add_argument("--object-focus-max-attempts", type=int, default=None)
@@ -92,6 +94,15 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
     print(f"Agent artifacts: {config.agent_artifacts_root}")
     print(f"Object detector: {config.object_detector_provider}")
+    print(
+        "Object confirmation: "
+        f"{'required' if config.object_detection_confirmation_required else 'disabled'}"
+        + (
+            f", timeout={config.object_detection_confirmation_timeout_s:g}s"
+            if config.object_detection_confirmation_timeout_s > 0
+            else ", no timeout"
+        )
+    )
     if config.object_detector_provider == "replicate_grounding_dino":
         print(
             "Object detector thresholds: "
@@ -208,6 +219,16 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.object_detector_jpeg_quality
             if args.object_detector_jpeg_quality is not None
             else config.object_detector_jpeg_quality
+        ),
+        object_detection_confirmation_required=(
+            args.object_confirmation_required
+            if args.object_confirmation_required is not None
+            else config.object_detection_confirmation_required
+        ),
+        object_detection_confirmation_timeout_s=(
+            args.object_confirmation_timeout_s
+            if args.object_confirmation_timeout_s is not None
+            else config.object_detection_confirmation_timeout_s
         ),
         object_focus_horizontal_fov_deg=(
             args.object_focus_horizontal_fov_deg

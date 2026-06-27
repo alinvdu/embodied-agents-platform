@@ -38,7 +38,8 @@ sudo /Users/alindumitru/miniconda3/envs/xlerobot/bin/python -m xlerobot_playgrou
   --vr-arm-ik-mode yawed \
   --vr-skill-mode grab_to_basket \
   --vr-skill-arm right \
-  --vr-basket-motion-s 2.5 \
+  --vr-basket-motion-s 4.0 \
+  --vr-basket-elbow-lift-deg -25 \
   --vr-action-ready-motion-s 2.0 \
   --vr-arm-debug \
   --vr-arm-debug-hz 2
@@ -75,7 +76,8 @@ sudo /Users/alindumitru/miniconda3/envs/xlerobot/bin/python -m xlerobot_playgrou
   --vr-arm-ik-mode yawed \
   --vr-skill-mode grab_to_basket \
   --vr-skill-arm right \
-  --vr-basket-motion-s 2.5 \
+  --vr-basket-motion-s 4.0 \
+  --vr-basket-elbow-lift-deg -25 \
   --vr-action-ready-motion-s 2.0 \
   --vr-arm-debug \
   --vr-arm-debug-hz 2
@@ -104,9 +106,9 @@ Do not start recording during startup. Wait until `ACTION_READY` is complete and
 Right-arm grab-to-basket controls:
 
 ```text
-right B       move right arm to fixed basket pose
-trigger       open gripper while in basket pose
-right A       return right arm to ACTION_READY, then resume IK
+right B       lift, move above basket, then descend to fixed basket pose
+trigger       control gripper during any automatic or held arm motion
+right A       return to ACTION_READY and lock there at the episode boundary
 right grip    IK clutch/rebaseline for the right arm
 ```
 
@@ -121,7 +123,17 @@ left thumbstick up      save active episode and quit session
 left thumbstick down    reset robot pose to ACTION_READY
 ```
 
-The fixed basket move is intentionally slowed to `2.5s`, and the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
+The basket move follows a direct timed joint-space sequence: subtract `25` degrees from elbow flex while every other joint remains at the current grasp pose, move toward the basket pose while keeping the same elbow offset, then lower the elbow into the exact basket pose. It continues after each timed phase even if object weight causes some servo tracking error. Trigger control remains live throughout every fixed motion and hold. The complete motion takes `4.0s`; the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
+
+After right A reaches `ACTION_READY`, IK remains locked:
+
+```text
+first right thumbstick press  save/end the completed episode
+or left thumbstick press      cancel the completed episode
+next right thumbstick press   start the next episode and resume IK
+```
+
+Without `--record-training`, use the same sequence. The first right/left thumbstick press acknowledges the completed attempt, and the next right thumbstick press releases IK.
 
 ## Episode Recipe
 
@@ -132,14 +144,15 @@ For each successful episode:
 2. Make sure the robot is at ACTION_READY.
 3. Press the right thumbstick to start recording.
 4. Use IK to grab the object.
-5. Press right B to move to the basket pose.
+5. Press right B to lift the object, move it above the basket, and descend to the basket pose.
 6. Press trigger to release the object into the basket.
-7. Press the right thumbstick immediately after success to save.
-8. Outside the episode, press right A to return to ACTION_READY.
-9. Put the object back by hand and repeat.
+7. Press right A to return to ACTION_READY and lock the arm.
+8. Press the right thumbstick to save, or the left thumbstick to cancel.
+9. Put the object back while the arm remains locked at ACTION_READY.
+10. Press the right thumbstick to start the next episode and resume IK.
 ```
 
-Keep reset, return-to-ready, and object replacement outside the recorded episode unless intentionally training a reset skill.
+This workflow intentionally keeps the arm fixed while the object and episode boundary are reset, ensuring every new demonstration begins from the captured `ACTION_READY` pose.
 
 ## Dataset Shape
 

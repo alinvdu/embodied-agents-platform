@@ -38,6 +38,7 @@ from .perception_service import execute_perception_tool
 
 
 EventSink = Callable[[str, str, str, dict[str, Any] | None], None]
+ObjectDetectionConfirmation = Callable[[dict[str, Any]], dict[str, Any]]
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,8 @@ class HomeAgentConfig:
     object_detector_timeout_s: float = 90.0
     object_detector_max_image_edge_px: int = 1280
     object_detector_jpeg_quality: int = 85
+    object_detection_confirmation_required: bool = True
+    object_detection_confirmation_timeout_s: float = 0.0
     object_focus_horizontal_fov_deg: float = 65.0
     object_focus_center_tolerance_norm: float = 0.08
     object_focus_max_attempts: int = 3
@@ -133,6 +136,7 @@ class HomeAgentToolRuntime:
         config: HomeAgentConfig,
         emit: EventSink,
         run_id: str | None = None,
+        confirm_object_detection: ObjectDetectionConfirmation | None = None,
     ) -> None:
         self.memory = memory or {}
         self.config = config
@@ -143,6 +147,7 @@ class HomeAgentToolRuntime:
         self.detection_tracking: dict[str, dict[str, Any]] = {}
         self.selected_detection_id: str | None = None
         self.object_approach_state: dict[str, dict[str, Any]] = {}
+        self.confirm_object_detection = confirm_object_detection
 
     def preview_path_to_pose(
         self,
@@ -442,13 +447,31 @@ class HomeAgentToolRuntime:
                     )
                     shot_execution["detection"] = detection
                     if detection.get("status") == "matched":
+                        confirmation = self._confirm_object_detection_candidate(
+                            region_label=region_label,
+                            object_label=object_label,
+                            stop_id=stop_id,
+                            shot_id=shot_id,
+                            capture=capture,
+                            detection=detection,
+                            constraints=constraints,
+                        )
+                        shot_execution["detection_confirmation"] = confirmation
+                        detection["confirmation"] = confirmation
+                        if confirmation.get("status") == "rejected":
+                            detection["detector_status"] = "matched"
+                            detection["status"] = "rejected"
+                            detection["reason"] = confirmation.get("reason") or "Operator rejected this detection candidate."
+                            self._discard_tracked_detection(str(detection.get("selected_detection_id") or ""))
+                            captured_shot_count += 1
+                            continue
                         selected_detection = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else None
                         result = {
                             "tool": "execute_region_exploration_plan",
                             "status": "object_found",
                             "region_label": region_label,
                             "object_label": object_label,
-                            "reason": f"Detected `{object_label}` during shot `{shot_id}`; remaining region exploration was aborted.",
+                            "reason": f"Detected and confirmed `{object_label}` during shot `{shot_id}`; remaining region exploration was aborted.",
                             "plan": plan,
                             "stops": executed_stops,
                             "visited_stop_count": len(executed_stops),
@@ -458,11 +481,12 @@ class HomeAgentToolRuntime:
                             "selected_detection": selected_detection,
                             "selected_detection_id": detection.get("selected_detection_id"),
                             "detection": detection,
+                            "detection_confirmation": confirmation,
                         }
                         self.emit(
                             "tool_executed",
                             "Region Exploration",
-                            f"Detected `{object_label}` during region exploration; stopped the remaining shots.",
+                            f"Detected and confirmed `{object_label}` during region exploration; stopped the remaining shots.",
                             result,
                         )
                         return result
@@ -560,6 +584,109 @@ class HomeAgentToolRuntime:
             )
         _record_capture_detection(config=self.config, run_id=self.run_id, capture=capture, detection=detection)
         return detection
+
+    def _confirm_object_detection_candidate(
+        self,
+        *,
+        region_label: str,
+        object_label: str,
+        stop_id: str,
+        shot_id: str,
+        capture: dict[str, Any],
+        detection: dict[str, Any],
+        constraints: dict[str, Any],
+    ) -> dict[str, Any]:
+        selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
+        detection_id = str(detection.get("selected_detection_id") or selected.get("detection_id") or "")
+        if not self._object_detection_confirmation_enabled(object_label=object_label, constraints=constraints):
+            return {
+                "status": "accepted",
+                "accepted": True,
+                "auto_accepted": True,
+                "reason": "Object detection confirmation is disabled for this run.",
+            }
+        if self.confirm_object_detection is None:
+            return {
+                "status": "accepted",
+                "accepted": True,
+                "auto_accepted": True,
+                "reason": "No object detection confirmation UI is attached.",
+            }
+
+        confidence = selected.get("confidence")
+        try:
+            confidence_percent = round(float(confidence) * 100.0, 1)
+        except Exception:
+            confidence_percent = None
+        payload = {
+            "confirmation_id": f"objconf_{uuid.uuid4().hex[:12]}",
+            "type": "object_detection",
+            "status": "pending",
+            "run_id": self.run_id,
+            "region_label": region_label,
+            "object_label": object_label,
+            "detected_label": selected.get("label") or detection.get("object_label") or object_label,
+            "stop_id": stop_id,
+            "shot_id": shot_id,
+            "detection_id": detection_id,
+            "selected_detection": selected,
+            "selected_detection_id": detection_id,
+            "confidence": confidence,
+            "confidence_percent": confidence_percent,
+            "bbox_xyxy": selected.get("bbox_xyxy"),
+            "image_width": capture.get("image_width"),
+            "image_height": capture.get("image_height"),
+            "artifact_url": capture.get("artifact_url"),
+            "annotated_artifact_url": capture.get("annotated_artifact_url"),
+            "image_url": capture.get("annotated_artifact_url") or capture.get("artifact_url"),
+            "metadata_url": capture.get("metadata_url"),
+            "captured_at": capture.get("captured_at"),
+            "robot_pose": capture.get("robot_pose"),
+            "candidate_count": len(detection.get("detections") or []),
+        }
+        self.emit(
+            "object_confirmation_requested",
+            "Confirm Object",
+            f"Confirm whether this detection is the requested `{object_label}`.",
+            {"confirmation": payload},
+        )
+        try:
+            response = self.confirm_object_detection(payload)
+        except Exception as exc:
+            response = {
+                "status": "rejected",
+                "accepted": False,
+                "reason": f"Object confirmation failed: {exc}",
+            }
+        status = str(response.get("status") or "").strip().lower()
+        accepted = bool(response.get("accepted")) or status in {"accepted", "accept", "confirmed", "succeeded"}
+        rejected = (not accepted) or status in {"rejected", "reject", "denied", "cancelled", "canceled"}
+        result = {
+            **payload,
+            **response,
+            "status": "accepted" if accepted and not rejected else "rejected",
+            "accepted": accepted and not rejected,
+            "decided_at": time.time(),
+        }
+        if not result.get("reason"):
+            result["reason"] = "Operator accepted this object candidate." if result["accepted"] else "Operator rejected this object candidate."
+        return result
+
+    def _object_detection_confirmation_enabled(self, *, object_label: str, constraints: dict[str, Any]) -> bool:
+        if not object_label.strip():
+            return False
+        if "confirm_detected_object" in constraints:
+            return _constraint_bool(constraints, "confirm_detected_object", True)
+        if "require_object_confirmation" in constraints:
+            return _constraint_bool(constraints, "require_object_confirmation", True)
+        return bool(self.config.object_detection_confirmation_required)
+
+    def _discard_tracked_detection(self, detection_id: str) -> None:
+        if not detection_id:
+            return
+        self.detection_tracking.pop(detection_id, None)
+        if self.selected_detection_id == detection_id:
+            self.selected_detection_id = next(reversed(self.detection_tracking), None)
 
     def _align_to_region_exploration_shot(
         self,
@@ -2742,6 +2869,7 @@ class HomeTaskAgent:
     def __init__(self, config: HomeAgentConfig, emit: EventSink | None = None) -> None:
         self.config = config
         self.emit = emit or (lambda kind, title, summary, details=None: None)
+        self.object_detection_confirmation_handler: ObjectDetectionConfirmation | None = None
 
     def run(self, command: str) -> HomeAgentRunRecord:
         memory = self._load_memory()
@@ -2756,6 +2884,7 @@ class HomeTaskAgent:
             config=self.config,
             emit=self._recording_emit(record),
             run_id=record.run_id,
+            confirm_object_detection=self.object_detection_confirmation_handler,
         )
         try:
             if self.config.model.provider == "mock":
@@ -3048,7 +3177,7 @@ class HomeTaskAgent:
                 "- If execute_region_exploration_plan returns status='requires_navigation', follow its suggested_navigation by calling resolve_navigation_to_region, then navigate_to_waypoint and relocalize_here until the search-entry waypoint is reached.",
                 "- For nearby regions already within roughly one short-horizon waypoint, execute_region_exploration_plan may be used directly for search.",
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
-                "- If execute_region_exploration_plan returns detection_status='matched', remaining shots were aborted and selected_detection contains the best box.",
+                "- If execute_region_exploration_plan returns detection_status='matched', a detector match was confirmed by the operator, remaining shots were aborted, and selected_detection contains the best box. If the operator rejects a candidate, the tool marks that shot rejected and keeps searching.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
                 "- approach_detected_object uses the first matched search-shot bbox before any new detector pass: if the object was seen with the head camera panned, it combines that shot yaw with the bbox horizontal offset, faces the head camera forward, and rotates the robot body toward the object. Only after this initial angle correction does it capture/DINO again to reacquire a front-camera bbox for RGB-D geometry. If that reacquire misses, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approach.",
                 "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
@@ -3179,11 +3308,15 @@ class HomeAgentController:
         self.agent = agent
         self.config = config
         self._lock = threading.RLock()
+        self._confirmation_condition = threading.Condition(self._lock)
         self._thread: threading.Thread | None = None
         self._status = "idle"
         self._events: list[dict[str, Any]] = []
         self._record: HomeAgentRunRecord | None = None
         self._paused = False
+        self._pending_object_confirmation: dict[str, Any] | None = None
+        self._object_confirmation_response: dict[str, Any] | None = None
+        self.agent.object_detection_confirmation_handler = self.request_object_detection_confirmation
 
     @classmethod
     def from_config(cls, config: HomeAgentConfig) -> "HomeAgentController":
@@ -3203,6 +3336,8 @@ class HomeAgentController:
                 return False
             self._events = []
             self._record = None
+            self._pending_object_confirmation = None
+            self._object_confirmation_response = None
             self._status = "running"
             self._thread = threading.Thread(target=self._run, args=(command,), daemon=True)
             self._thread.start()
@@ -3219,9 +3354,16 @@ class HomeAgentController:
             self.emit("resumed", "Resumed", "Resume requested.", {})
 
     def stop(self) -> None:
-        with self._lock:
+        with self._confirmation_condition:
             self._status = "stopped"
             self.emit("stop_requested", "Stop Requested", "Operator requested stop.", {})
+            if self._pending_object_confirmation is not None:
+                self._object_confirmation_response = {
+                    "status": "rejected",
+                    "accepted": False,
+                    "reason": "Operator stopped the run while object confirmation was pending.",
+                }
+                self._confirmation_condition.notify_all()
 
     def emit(self, kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
         event = {
@@ -3258,7 +3400,99 @@ class HomeAgentController:
                 "plan": record or {},
                 "report": {"events": list(self._events)},
                 "events": list(self._events),
+                "pending_object_confirmation": (
+                    dict(self._pending_object_confirmation)
+                    if self._pending_object_confirmation is not None
+                    else None
+                ),
             }
+
+    def request_object_detection_confirmation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        confirmation_id = str(payload.get("confirmation_id") or f"objconf_{uuid.uuid4().hex[:12]}")
+        pending = {
+            **payload,
+            "confirmation_id": confirmation_id,
+            "status": "pending",
+            "requested_at": time.time(),
+        }
+        timeout_s = max(float(self.config.object_detection_confirmation_timeout_s or 0.0), 0.0)
+        deadline = time.time() + timeout_s if timeout_s > 0.0 else None
+        with self._confirmation_condition:
+            self._pending_object_confirmation = pending
+            self._object_confirmation_response = None
+            if self._status == "running":
+                self._status = "waiting_for_object_confirmation"
+            while self._pending_object_confirmation is not None and self._object_confirmation_response is None:
+                if self._status == "stopped":
+                    self._object_confirmation_response = {
+                        "status": "rejected",
+                        "accepted": False,
+                        "reason": "Run stopped while object confirmation was pending.",
+                    }
+                    break
+                if deadline is not None:
+                    remaining = deadline - time.time()
+                    if remaining <= 0.0:
+                        self._object_confirmation_response = {
+                            "status": "rejected",
+                            "accepted": False,
+                            "reason": "Object confirmation timed out.",
+                        }
+                        break
+                    self._confirmation_condition.wait(timeout=min(remaining, 0.5))
+                else:
+                    self._confirmation_condition.wait(timeout=0.5)
+            response = self._object_confirmation_response or {
+                "status": "rejected",
+                "accepted": False,
+                "reason": "Object confirmation ended without a response.",
+            }
+            self._pending_object_confirmation = None
+            self._object_confirmation_response = None
+            if self._status == "waiting_for_object_confirmation":
+                self._status = "running"
+            self._confirmation_condition.notify_all()
+            return dict(response)
+
+    def respond_object_detection_confirmation(
+        self,
+        *,
+        confirmation_id: str,
+        accepted: bool,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        with self._confirmation_condition:
+            pending = self._pending_object_confirmation
+            if pending is None:
+                return {"status": "missing", "reason": "No object confirmation is pending."}
+            expected_id = str(pending.get("confirmation_id") or "")
+            if confirmation_id and expected_id and confirmation_id != expected_id:
+                return {
+                    "status": "mismatch",
+                    "reason": f"Pending confirmation is `{expected_id}`, not `{confirmation_id}`.",
+                    "pending_confirmation_id": expected_id,
+                }
+            self._object_confirmation_response = {
+                "status": "accepted" if accepted else "rejected",
+                "accepted": bool(accepted),
+                "reason": reason or (
+                    "Operator accepted this object candidate."
+                    if accepted
+                    else "Operator rejected this object candidate."
+                ),
+                "confirmation_id": expected_id or confirmation_id,
+                "object_label": pending.get("object_label"),
+                "detection_id": pending.get("detection_id"),
+                "decided_at": time.time(),
+            }
+            self.emit(
+                "object_confirmation_accepted" if accepted else "object_confirmation_rejected",
+                "Object Confirmed" if accepted else "Object Rejected",
+                self._object_confirmation_response["reason"],
+                {"confirmation": {**pending, **self._object_confirmation_response}},
+            )
+            self._confirmation_condition.notify_all()
+            return dict(self._object_confirmation_response)
 
     def list_environment_memories(self) -> list[dict[str, Any]]:
         records: list[dict[str, Any]] = []
@@ -3356,6 +3590,18 @@ class HomeAgentServer:
                 if self.path == "/api/stop":
                     controller.stop()
                     self._send_json({"status": "stopping"})
+                    return
+                if self.path == "/api/object-confirmation/respond":
+                    decision = str(payload.get("decision") or payload.get("status") or "").strip().lower()
+                    accepted = bool(payload.get("accepted")) or decision in {"accept", "accepted", "confirm", "confirmed"}
+                    if decision in {"deny", "denied", "reject", "rejected", "cancel", "cancelled", "canceled"}:
+                        accepted = False
+                    response = controller.respond_object_detection_confirmation(
+                        confirmation_id=str(payload.get("confirmation_id") or ""),
+                        accepted=accepted,
+                        reason=str(payload.get("reason") or ""),
+                    )
+                    self._send_json(response)
                     return
                 if self.path == "/api/memory/select":
                     response = controller.select_environment_memory(str(payload.get("memory_id") or ""))
@@ -3468,6 +3714,8 @@ def config_from_env() -> HomeAgentConfig:
         object_detector_timeout_s=float(os.getenv("ROBOT42_OBJECT_DETECTOR_TIMEOUT_S", "90")),
         object_detector_max_image_edge_px=int(os.getenv("ROBOT42_OBJECT_DETECTOR_MAX_IMAGE_EDGE_PX", "1280")),
         object_detector_jpeg_quality=int(os.getenv("ROBOT42_OBJECT_DETECTOR_JPEG_QUALITY", "85")),
+        object_detection_confirmation_required=_env_bool("ROBOT42_OBJECT_CONFIRMATION_REQUIRED", True),
+        object_detection_confirmation_timeout_s=float(os.getenv("ROBOT42_OBJECT_CONFIRMATION_TIMEOUT_S", "0")),
         object_focus_horizontal_fov_deg=float(os.getenv("ROBOT42_OBJECT_FOCUS_HORIZONTAL_FOV_DEG", "65")),
         object_focus_center_tolerance_norm=float(os.getenv("ROBOT42_OBJECT_FOCUS_CENTER_TOLERANCE_NORM", "0.08")),
         object_focus_max_attempts=int(os.getenv("ROBOT42_OBJECT_FOCUS_MAX_ATTEMPTS", "3")),
@@ -4601,6 +4849,8 @@ def _aggregate_detection_status(stops: list[dict[str, Any]], object_label: str) 
     ]
     if any(status == "matched" for status in statuses):
         return "matched"
+    if any(status == "rejected" for status in statuses):
+        return "rejected"
     if any(status == "not_found" for status in statuses):
         return "not_found"
     if any(status in {"failed", "unavailable"} for status in statuses):
@@ -4611,6 +4861,8 @@ def _aggregate_detection_status(stops: list[dict[str, Any]], object_label: str) 
 
 
 def _region_exploration_result_reason(detection_status: str) -> str:
+    if detection_status == "rejected":
+        return "Region exploration motion completed; detected candidates were rejected by the operator."
     if detection_status == "not_found":
         return "Region exploration motion completed; no matching object was detected."
     if detection_status == "failed":

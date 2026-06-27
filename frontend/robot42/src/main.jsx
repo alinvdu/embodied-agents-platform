@@ -111,6 +111,7 @@ function AgentChat({ onConfigure }) {
   const environment = environmentStatus(state, explorationState);
   const navigationPreview = latestNavigationPreview(events);
   const visionShots = latestVisionShots(events);
+  const pendingObjectConfirmation = state?.pending_object_confirmation || null;
 
   const selectAgentMemory = async (memoryId) => {
     if (!memoryId) return;
@@ -130,6 +131,16 @@ function AgentChat({ onConfigure }) {
     setSelectedMemoryId(memoryId);
     await refresh();
     onConfigure();
+  };
+
+  const respondObjectConfirmation = async (accepted) => {
+    if (!pendingObjectConfirmation?.confirmation_id || !agentConnected) return;
+    await apiPost(AGENT_BASE, "/api/object-confirmation/respond", {
+      confirmation_id: pendingObjectConfirmation.confirmation_id,
+      accepted,
+      decision: accepted ? "accept" : "deny",
+    });
+    await refresh();
   };
 
   return (
@@ -155,6 +166,11 @@ function AgentChat({ onConfigure }) {
           setNewMemoryId={setNewMemoryId}
           onCreateMemory={createAgentMemory}
           onConfigure={onConfigure}
+        />
+        <ObjectConfirmationCard
+          confirmation={pendingObjectConfirmation}
+          onAccept={() => respondObjectConfirmation(true)}
+          onDeny={() => respondObjectConfirmation(false)}
         />
         <div className="chat-panel minimal">
           <div className="section-head">
@@ -273,6 +289,50 @@ function AgentVisionReport({ shots }) {
           );
         })}
       </div>
+    </section>
+  );
+}
+
+function ObjectConfirmationCard({ confirmation, onAccept, onDeny }) {
+  if (!confirmation) return null;
+  const src = artifactSrc(confirmation.annotated_artifact_url || confirmation.image_url || confirmation.artifact_url);
+  const confidence = Number(confirmation.confidence_percent ?? Number(confirmation.confidence || 0) * 100);
+  const confidenceLabel = Number.isFinite(confidence) && confidence > 0 ? `${confidence.toFixed(1)}%` : "unknown";
+  return (
+    <section className="object-confirmation-card">
+      <div className="object-confirmation-copy">
+        <div className="section-head compact">
+          <span><Crosshair size={17} /> Confirm Target</span>
+          <small>{confirmation.status || "pending"}</small>
+        </div>
+        <div className="object-confirmation-details">
+          <div>
+            <label>Requested</label>
+            <strong>{confirmation.object_label || "object"}</strong>
+          </div>
+          <div>
+            <label>Detected</label>
+            <strong>{confirmation.detected_label || confirmation.object_label || "object"}</strong>
+          </div>
+          <div>
+            <label>Confidence</label>
+            <strong>{confidenceLabel}</strong>
+          </div>
+          <div>
+            <label>Shot</label>
+            <strong>{[confirmation.stop_id, confirmation.shot_id].filter(Boolean).join(" / ") || "current view"}</strong>
+          </div>
+        </div>
+        <div className="object-confirmation-actions">
+          <button className="primary" onClick={onAccept}><Check size={16} /> Yes, approach it</button>
+          <button className="danger" onClick={onDeny}><Square size={16} /> No, keep searching</button>
+        </div>
+      </div>
+      {src ? (
+        <div className="object-confirmation-image">
+          <img src={src} alt={`Detected ${confirmation.object_label || "object"}`} />
+        </div>
+      ) : null}
     </section>
   );
 }
