@@ -115,25 +115,24 @@ right grip    IK clutch/rebaseline for the right arm
 Recording controls:
 
 ```text
-right thumbstick press  start episode, or stop and save active episode
-left thumbstick press   cancel/discard active episode
-left thumbstick right   fallback start/save episode control
-left thumbstick left    fallback discard active episode
-left thumbstick up      save active episode and quit session
-left thumbstick down    reset robot pose to ACTION_READY
+left thumbstick press   start recording if idle, save episode if recording
+right thumbstick press  open/close the recording menu and pause teleop
+pointer trigger         select Record, Save, Cancel, or Finish
 ```
 
-The right-arm basket move follows a captured timed waypoint sequence: move from the actual grasp into a relative clearance pose, move close to the base into an over-basket pose, then lower into the exact basket pose. It continues after each timed phase even if object weight causes some servo tracking error. Trigger control remains live throughout every fixed motion and hold. The complete motion takes `4.0s`; the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
+The right-arm basket move follows a captured timed waypoint sequence: move from the actual grasp into a relative clearance pose, move close to the base into an over-basket pose, then lower into the exact basket pose. The right-arm return to `ACTION_READY` also follows captured waypoints through the over-basket and clearance poses before moving forward. It continues after each timed phase even if object weight causes some servo tracking error. Trigger control remains live throughout every fixed motion and hold. The complete basket motion takes `4.0s`; the button-triggered return to `ACTION_READY` is `2.0s`. Startup pose timing is separate.
 
 After right A reaches `ACTION_READY`, IK remains locked:
 
 ```text
-first right thumbstick press  save/end the completed episode
-or left thumbstick press      cancel the completed episode
-next right thumbstick press   start the next episode and resume IK
+left thumbstick press   save/end the completed episode
+left thumbstick press   start the next episode and resume IK, when idle
+right thumbstick press  open the recording menu
+Cancel                 discard the completed episode from the menu
+Finish                 finalize the dataset and exit cleanly from the menu
 ```
 
-Without `--record-training`, use the same sequence. The first right/left thumbstick press acknowledges the completed attempt, and the next right thumbstick press releases IK.
+Without `--record-training`, the same menu still pauses teleop. Use `Resume` to close the hold and continue.
 
 ## Episode Recipe
 
@@ -142,17 +141,19 @@ For each successful episode:
 ```text
 1. Place the target object on the surface.
 2. Make sure the robot is at ACTION_READY.
-3. Press the right thumbstick to start recording.
+3. Press the left thumbstick to start recording.
 4. Use IK to grab the object.
 5. Press right B to lift the object, move it above the basket, and descend to the basket pose.
 6. Press trigger to release the object into the basket.
 7. Press right A to return to ACTION_READY and lock the arm.
-8. Press the right thumbstick to save, or the left thumbstick to cancel.
+8. Press the left thumbstick to save, or open the menu and select Cancel.
 9. Put the object back while the arm remains locked at ACTION_READY.
-10. Press the right thumbstick to start the next episode and resume IK.
+10. Press the left thumbstick to start the next episode and resume IK.
 ```
 
 This workflow intentionally keeps the arm fixed while the object and episode boundary are reset, ensuring every new demonstration begins from the captured `ACTION_READY` pose.
+
+When finished collecting, open the recording menu and select Finish. If an episode is still active, Finish saves it before finalizing; choose Cancel first if you want to discard it.
 
 ## Dataset Shape
 
@@ -203,10 +204,15 @@ operator accidentally records reset or object replacement
 Clean exit:
 
 ```text
-Ctrl+C in terminal
+open the recording menu with the right thumbstick
+select Finish
+wait for "Finalizing LeRobot dataset."
+wait for "LeRobot dataset finalized with N episode(s)."
 wait for "Stopping VR monitor/runtime..."
 reload the Quest browser page before reconnecting
 ```
+
+Use `Ctrl+C` only as a fallback. Do not press `Ctrl+C` a second time while the dataset is finalizing. LeRobot v3 closes parquet writers and finalizes metadata during this step.
 
 If a previous frozen run seems to be holding the VR ports:
 

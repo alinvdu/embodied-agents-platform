@@ -7,6 +7,7 @@ import importlib
 import importlib.util
 import json
 import math
+import os
 import ssl
 import threading
 import subprocess
@@ -30,16 +31,22 @@ class CameraSpec:
     width: int | None = None
     height: int | None = None
     fps: int | None = None
+    fourcc: str | None = None
+    backend: str | None = None
 
 
 @dataclass
 class RecordingSession:
     dataset: Any
     task: str
+    dataset_root: Path | None = None
     active: bool = False
     orbbec_output_dir: Path | None = None
     orbbec_camera_key: str = "head"
+    latest_observation_images: dict[str, tuple[Any, float]] = field(default_factory=dict)
+    last_missing_features: tuple[str, ...] = ()
     last_missing_feature_warn_t: float = 0.0
+    episode_frame_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -116,6 +123,31 @@ _VR_CAMERA_JPEGS: dict[str, tuple[bytes, int, int, float]] = {}
 _VR_CAMERA_JPEGS_LOCK = threading.Lock()
 _ORBBEC_JPEG_CACHE: tuple[Path, int, int, bytes, float] | None = None
 _ORBBEC_JPEG_CACHE_LOCK = threading.Lock()
+_VR_SESSION_STATUS: dict[str, Any] = {
+    "recording_enabled": False,
+    "recording_active": False,
+    "recording_missing": [],
+    "episode_frame_count": 0,
+    "episode_phase": "idle",
+    "held_sides": [],
+    "finish_requested": False,
+    "menu_open": False,
+    "menu_pointer_hand": "left",
+    "recording_operation": "",
+}
+_VR_SESSION_STATUS_LOCK = threading.Lock()
+_VR_FINISH_REQUESTED = False
+_VR_FINISH_REQUEST_LOCK = threading.Lock()
+_VR_MENU_OPEN = False
+_VR_MENU_LOCK = threading.Lock()
+_VR_RECORDING_CONTROL_REQUESTS: list[str] = []
+_VR_RECORDING_CONTROL_LOCK = threading.Lock()
+_VR_RECORDING_CONTROL_LAST_ACTION: tuple[str, float] | None = None
+_VR_RECORDING_CONTROL_DEBOUNCE_S = 0.45
+_RECORDING_IMAGE_CACHE_MAX_AGE_S = 1.0
+_VR_CAMERA_ASYNC_READ_TIMEOUT_MS = 500.0
+_VR_CAMERA_RECONNECT_MIN_INTERVAL_S = 3.0
+_VR_CAMERA_RECONNECT_LAST_ATTEMPT: dict[str, float] = {}
 _WEBRTC_LOOP: Any = None
 _WEBRTC_LOOP_THREAD: threading.Thread | None = None
 _WEBRTC_PEERS: set[Any] = set()
@@ -272,13 +304,13 @@ def _add_recording_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--record-training-toggle-vr-button",
-        default="right:thumbstick",
-        help="Quest button that toggles training episode start/save, e.g. `right:thumbstick`.",
+        default="",
+        help="Legacy direct Quest button for training start/save. Empty uses the in-VR recording menu.",
     )
     parser.add_argument(
         "--record-training-discard-vr-button",
-        default="left:thumbstick",
-        help="Quest button that discards/cancels the active training episode, e.g. `left:thumbstick`.",
+        default="",
+        help="Legacy direct Quest button for training cancel/discard. Empty uses the in-VR recording menu.",
     )
 
 
@@ -352,6 +384,11 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=30.0,
         help="How often to poll wrist cameras for the VR overlay.",
+    )
+    parser.add_argument(
+        "--no-vr-video-streams",
+        action="store_true",
+        help="Disable Quest WebRTC camera streams while keeping VR controls and the recording menu.",
     )
     parser.add_argument(
         "--vr-left-arm-clutch-key",
@@ -502,19 +539,19 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--vr-wrist-video-gain",
         type=float,
-        default=1.65,
+        default=1.0,
         help="Display-only brightness gain for wrist camera panels in the Quest overlay.",
     )
     parser.add_argument(
         "--vr-wrist-video-gamma",
         type=float,
-        default=0.78,
+        default=1.0,
         help="Display-only gamma for wrist camera panels. Values below 1 brighten shadows.",
     )
     parser.add_argument(
         "--vr-wrist-video-bias",
         type=float,
-        default=0.02,
+        default=0.0,
         help="Display-only brightness offset for wrist camera panels.",
     )
     parser.add_argument("--vr-orbbec-video-gain", type=float, default=1.0)
@@ -628,6 +665,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_observation_features=extra_observation_features,
             ),
             task=args.task,
+            dataset_root=Path(args.dataset_root).expanduser(),
             orbbec_output_dir=orbbec_output_dir,
         )
 
@@ -717,6 +755,7 @@ def main(argv: list[str] | None = None) -> int:
             orbbec_gamma=args.vr_orbbec_video_gamma,
             orbbec_bias=args.vr_orbbec_video_bias,
         ),
+        vr_video_streams=not args.no_vr_video_streams,
         startup_pose=VrStartupPoseConfig(
             enabled=not args.no_vr_startup_pose,
             stow_wait_s=args.vr_nav_stow_wait_s,
@@ -737,7 +776,7 @@ def _build_camera_configs(
     height: int,
     fps: int,
 ) -> dict[str, Any]:
-    from lerobot.cameras.configs import ColorMode, Cv2Rotation
+    from lerobot.cameras.configs import ColorMode, Cv2Backends, Cv2Rotation
     from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
     from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig
 
@@ -749,12 +788,19 @@ def _build_camera_configs(
         spec_fps = spec.fps or fps
         if spec.driver == "opencv":
             source: Any = int(spec.source) if spec.source.isdigit() else spec.source
+            try:
+                backend = Cv2Backends[spec.backend.upper()] if spec.backend else Cv2Backends.ANY
+            except KeyError as exc:
+                valid = ", ".join(item.name for item in Cv2Backends)
+                raise ValueError(f"Unsupported OpenCV backend `{spec.backend}`. Valid values: {valid}.") from exc
             cameras[spec.name] = OpenCVCameraConfig(
                 index_or_path=source,
                 fps=spec_fps,
                 width=spec_width,
                 height=spec_height,
                 rotation=Cv2Rotation.NO_ROTATION,
+                fourcc=spec.fourcc,
+                backend=backend,
             )
             continue
         if spec.driver == "realsense":
@@ -781,7 +827,8 @@ def _parse_camera_spec(raw_spec: str) -> CameraSpec:
     name, remainder = raw_spec.split("=", 1)
     driver, source_and_options = remainder.split(":", 1)
     source, *option_parts = source_and_options.split(",")
-    options: dict[str, int] = {}
+    int_options: dict[str, int] = {}
+    str_options: dict[str, str] = {}
     for option in option_parts:
         if not option.strip():
             continue
@@ -789,16 +836,29 @@ def _parse_camera_spec(raw_spec: str) -> CameraSpec:
             raise ValueError(f"Invalid camera option `{option}` in `{raw_spec}`. Use key=value.")
         option_key, option_value = option.split("=", 1)
         option_key = option_key.strip()
-        if option_key not in {"width", "height", "fps"}:
+        option_value = option_value.strip()
+        if option_key in {"width", "height", "fps"}:
+            int_options[option_key] = int(option_value)
+            continue
+        if option_key == "fourcc":
+            if len(option_value) != 4:
+                raise ValueError(f"Invalid fourcc `{option_value}` in `{raw_spec}`. Use 4 characters, e.g. MJPG.")
+            str_options[option_key] = option_value
+            continue
+        if option_key == "backend":
+            str_options[option_key] = option_value
+            continue
+        if option_key not in {"width", "height", "fps", "fourcc", "backend"}:
             raise ValueError(f"Unsupported camera option `{option_key}` in `{raw_spec}`.")
-        options[option_key] = int(option_value)
     return CameraSpec(
         name=name.strip(),
         driver=driver.strip(),
         source=source.strip(),
-        width=options.get("width"),
-        height=options.get("height"),
-        fps=options.get("fps"),
+        width=int_options.get("width"),
+        height=int_options.get("height"),
+        fps=int_options.get("fps"),
+        fourcc=str_options.get("fourcc"),
+        backend=str_options.get("backend"),
     )
 
 
@@ -875,6 +935,7 @@ def _install_orbbec_vr_overlay(
     *,
     include_orbbec: bool,
     video_display: VrVideoDisplayConfig,
+    video_streams_enabled: bool,
 ) -> bool:
     monitor = getattr(vr_teleop, "vr_monitor", None)
     if monitor is None:
@@ -886,6 +947,7 @@ def _install_orbbec_vr_overlay(
         handler_cls.orbbec_output_dir = output_dir.resolve()
         handler_cls.orbbec_overlay_include_orbbec = include_orbbec
         handler_cls.robot42_video_display = video_display
+        handler_cls.robot42_video_streams_enabled = video_streams_enabled
         return True
 
     original_do_get = handler_cls.do_GET
@@ -894,6 +956,7 @@ def _install_orbbec_vr_overlay(
     handler_cls.orbbec_output_dir = output_dir.resolve()
     handler_cls.orbbec_overlay_include_orbbec = include_orbbec
     handler_cls.robot42_video_display = video_display
+    handler_cls.robot42_video_streams_enabled = video_streams_enabled
 
     def do_GET(self):
         if self.path.startswith("/api/status"):
@@ -923,7 +986,19 @@ def _install_orbbec_vr_overlay(
             return _serve_xlevr_post_ack(self, "config")
         if self.path.startswith("/api/restart"):
             return _serve_xlevr_post_ack(self, "restart")
+        if self.path.startswith("/api/teleop-menu"):
+            return _serve_teleop_menu_request(self)
+        if self.path.startswith("/api/recording-control"):
+            return _serve_recording_control_request(self)
+        if self.path.startswith("/api/finish-collection"):
+            return _serve_finish_collection_request(self)
         if self.path.startswith("/webrtc/offer"):
+            if not getattr(self.__class__, "robot42_video_streams_enabled", True):
+                return _write_json_response(
+                    self,
+                    json.dumps({"error": "VR video streams are disabled"}),
+                    status=404,
+                )
             return _serve_webrtc_offer(self)
         if original_do_post is not None:
             return original_do_post(self)
@@ -940,6 +1015,7 @@ def _install_orbbec_vr_overlay(
                 content += "\n\n" + _orbbec_vr_overlay_js(
                     include_orbbec=getattr(handler_cls, "orbbec_overlay_include_orbbec", True),
                     video_display=getattr(handler_cls, "robot42_video_display", video_display),
+                    video_streams_enabled=getattr(handler_cls, "robot42_video_streams_enabled", True),
                 )
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
@@ -972,7 +1048,7 @@ def _patch_xlevr_controller_button_js(content: str) -> str:
                     a: !!leftGamepad.buttons[4]?.pressed,
                     b: !!leftGamepad.buttons[5]?.pressed,
                     squeeze: !!leftGamepad.buttons[1]?.pressed,
-                    thumbstick: !!leftGamepad.buttons[2]?.pressed,
+                    thumbstick: !!leftGamepad.buttons[2]?.pressed || !!leftGamepad.buttons[3]?.pressed,
                     menu: !!leftGamepad.buttons[6]?.pressed
                 };"""
     right_old = """                rightController.buttons = {
@@ -986,7 +1062,7 @@ def _patch_xlevr_controller_button_js(content: str) -> str:
                     a: !!rightGamepad.buttons[4]?.pressed,
                     b: !!rightGamepad.buttons[5]?.pressed,
                     squeeze: !!rightGamepad.buttons[1]?.pressed,
-                    thumbstick: !!rightGamepad.buttons[2]?.pressed,
+                    thumbstick: !!rightGamepad.buttons[2]?.pressed || !!rightGamepad.buttons[3]?.pressed,
                     menu: !!rightGamepad.buttons[6]?.pressed
                 };"""
     return content.replace(left_old, left_new).replace(right_old, right_new)
@@ -1043,12 +1119,58 @@ def _get_robot_observation_best_effort(robot: Any) -> tuple[dict[str, Any], Exce
     first_error: Exception | None = None
     for cam_key, cam in cameras.items():
         try:
-            obs[cam_key] = cam.async_read()
+            obs[cam_key] = cam.async_read(timeout_ms=_VR_CAMERA_ASYNC_READ_TIMEOUT_MS)
         except Exception as exc:
             if first_error is None:
                 first_error = exc
+            if _camera_read_thread_is_dead(cam) and _try_reconnect_vr_camera(cam_key, cam):
+                try:
+                    obs[cam_key] = cam.async_read(timeout_ms=_VR_CAMERA_ASYNC_READ_TIMEOUT_MS)
+                except Exception as retry_exc:
+                    if first_error is None:
+                        first_error = retry_exc
             continue
     return obs, first_error
+
+
+def _camera_read_thread_is_dead(cam: Any) -> bool:
+    thread = getattr(cam, "thread", None)
+    return thread is not None and not thread.is_alive()
+
+
+def _try_reconnect_vr_camera(cam_key: str, cam: Any) -> bool:
+    now = time.monotonic()
+    last_attempt = _VR_CAMERA_RECONNECT_LAST_ATTEMPT.get(cam_key, 0.0)
+    if now - last_attempt < _VR_CAMERA_RECONNECT_MIN_INTERVAL_S:
+        return False
+    _VR_CAMERA_RECONNECT_LAST_ATTEMPT[cam_key] = now
+
+    print(f"VR camera `{cam_key}` read thread is dead; attempting reconnect.")
+    disconnect = getattr(cam, "disconnect", None)
+    if callable(disconnect):
+        try:
+            disconnect()
+        except Exception as exc:
+            print(f"VR camera `{cam_key}` disconnect before reconnect failed: {exc}")
+
+    connect = getattr(cam, "connect", None)
+    if not callable(connect):
+        print(f"VR camera `{cam_key}` cannot reconnect: camera object has no connect().")
+        return False
+    try:
+        connect(warmup=False)
+    except TypeError:
+        try:
+            connect()
+        except Exception as exc:
+            print(f"VR camera `{cam_key}` reconnect failed: {exc}")
+            return False
+    except Exception as exc:
+        print(f"VR camera `{cam_key}` reconnect failed: {exc}")
+        return False
+
+    print(f"VR camera `{cam_key}` reconnected.")
+    return True
 
 
 def _run_vr_startup_pose(robot: Any, vr_teleop: Any, config: VrStartupPoseConfig) -> None:
@@ -1212,11 +1334,19 @@ def _write_json_response(handler: Any, payload: str, *, status: int = 200) -> No
 
 
 def _serve_xlevr_status(handler: Any) -> None:
+    with _VR_SESSION_STATUS_LOCK:
+        robot42_status = dict(_VR_SESSION_STATUS)
     _write_json_response(
         handler,
-        (
-            '{"left_arm_connected":true,"right_arm_connected":true,'
-            '"vrConnected":true,"keyboardEnabled":false,"robotEngaged":true}'
+        json.dumps(
+            {
+                "left_arm_connected": True,
+                "right_arm_connected": True,
+                "vrConnected": True,
+                "keyboardEnabled": False,
+                "robotEngaged": True,
+                "robot42": robot42_status,
+            }
         ),
     )
 
@@ -1242,6 +1372,113 @@ def _serve_xlevr_post_ack(handler: Any, endpoint: str) -> None:
     if length > 0:
         handler.rfile.read(length)
     _write_json_response(handler, f'{{"success":true,"endpoint":"{endpoint}"}}')
+
+
+def _read_json_request_body(handler: Any) -> dict[str, Any]:
+    try:
+        length = int(handler.headers.get("Content-Length", "0") or "0")
+    except ValueError:
+        length = 0
+    if length <= 0:
+        return {}
+    try:
+        payload = json.loads(handler.rfile.read(length).decode("utf-8"))
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _serve_teleop_menu_request(handler: Any) -> None:
+    payload = _read_json_request_body(handler)
+    open_state = bool(payload.get("open", False))
+    _set_vr_menu_open(open_state)
+    _write_json_response(handler, json.dumps({"success": True, "menu_open": open_state}))
+
+
+def _serve_recording_control_request(handler: Any) -> None:
+    payload = _read_json_request_body(handler)
+    action = str(payload.get("action", "")).strip().lower()
+    if action not in {"record", "save", "cancel", "finish"}:
+        _write_json_response(handler, json.dumps({"success": False, "error": "invalid action"}), status=400)
+        return
+    if not _vr_menu_is_open():
+        _write_json_response(handler, json.dumps({"success": True, "action": action, "ignored": True}))
+        return
+    _set_vr_menu_open(False)
+    _set_vr_recording_operation(
+        {
+            "record": "starting",
+            "save": "saving",
+            "cancel": "cancelling",
+            "finish": "finishing",
+        }[action]
+    )
+    _queue_vr_recording_control(action)
+    _write_json_response(handler, json.dumps({"success": True, "action": action}))
+
+
+def _serve_finish_collection_request(handler: Any) -> None:
+    _read_json_request_body(handler)
+    _request_finish_collection()
+    _write_json_response(handler, json.dumps({"success": True, "finish_requested": True}))
+
+
+def _request_finish_collection() -> None:
+    global _VR_FINISH_REQUESTED
+    with _VR_FINISH_REQUEST_LOCK:
+        _VR_FINISH_REQUESTED = True
+    with _VR_SESSION_STATUS_LOCK:
+        _VR_SESSION_STATUS["finish_requested"] = True
+
+
+def _consume_finish_collection_request() -> bool:
+    global _VR_FINISH_REQUESTED
+    with _VR_FINISH_REQUEST_LOCK:
+        requested = _VR_FINISH_REQUESTED
+        _VR_FINISH_REQUESTED = False
+    return requested
+
+
+def _finish_collection_requested() -> bool:
+    with _VR_FINISH_REQUEST_LOCK:
+        return _VR_FINISH_REQUESTED
+
+
+def _set_vr_menu_open(open_state: bool) -> None:
+    global _VR_MENU_OPEN
+    with _VR_MENU_LOCK:
+        _VR_MENU_OPEN = bool(open_state)
+    with _VR_SESSION_STATUS_LOCK:
+        _VR_SESSION_STATUS["menu_open"] = bool(open_state)
+
+
+def _vr_menu_is_open() -> bool:
+    with _VR_MENU_LOCK:
+        return _VR_MENU_OPEN
+
+
+def _set_vr_recording_operation(operation: str) -> None:
+    with _VR_SESSION_STATUS_LOCK:
+        _VR_SESSION_STATUS["recording_operation"] = operation
+
+
+def _queue_vr_recording_control(action: str) -> None:
+    global _VR_RECORDING_CONTROL_LAST_ACTION
+    now = time.monotonic()
+    with _VR_RECORDING_CONTROL_LOCK:
+        if _VR_RECORDING_CONTROL_LAST_ACTION is not None:
+            last_action, last_t = _VR_RECORDING_CONTROL_LAST_ACTION
+            if action == last_action and now - last_t < _VR_RECORDING_CONTROL_DEBOUNCE_S:
+                return
+        _VR_RECORDING_CONTROL_LAST_ACTION = (action, now)
+        _VR_RECORDING_CONTROL_REQUESTS.append(action)
+
+
+def _consume_vr_recording_controls() -> list[str]:
+    with _VR_RECORDING_CONTROL_LOCK:
+        actions = list(_VR_RECORDING_CONTROL_REQUESTS)
+        _VR_RECORDING_CONTROL_REQUESTS.clear()
+    return actions
 
 
 def _serve_webrtc_offer(handler: Any) -> None:
@@ -1592,7 +1829,12 @@ def _ppm_file_to_jpeg(path: Path) -> tuple[bytes, int, int]:
     return encoded.tobytes(), width, height
 
 
-def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplayConfig) -> str:
+def _orbbec_vr_overlay_js(
+    *,
+    include_orbbec: bool,
+    video_display: VrVideoDisplayConfig,
+    video_streams_enabled: bool,
+) -> str:
     script = r"""
 (function () {
   const FEEDS = [
@@ -1640,89 +1882,439 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplay
     }
   ];
   const INCLUDE_ORBBEC = __INCLUDE_ORBBEC__;
-  const ACTIVE_FEEDS = FEEDS.filter(feed => INCLUDE_ORBBEC || feed.name !== 'orbbec');
+  const VIDEO_STREAMS_ENABLED = __VIDEO_STREAMS_ENABLED__;
+  const ACTIVE_FEEDS = VIDEO_STREAMS_ENABLED ? FEEDS.filter(feed => INCLUDE_ORBBEC || feed.name !== 'orbbec') : [];
   const overlays = new Map();
   let lastStatusLog = 0;
   let webRtcStarted = false;
   let webRtcFailed = false;
   let webRtcPc = null;
-  let feedsVisible = true;
+  let lastRobot42StatusText = '';
+  let robot42LatestStatus = {};
+  let menuOpen = false;
+  let menuButtons = [];
+  let menuSignature = '';
+  let hoveredMenuAction = null;
+  let activePointerHand = null;
+  let pointerReticle = null;
+  let pendingRecordingAction = null;
 
-  function setFeedNodesVisible(nodes, visible) {
-    if (!nodes) return;
-    if (nodes.mesh) nodes.mesh.visible = visible;
-    if (nodes.marker) nodes.marker.visible = visible;
-  }
-
-  function applyFeedsVisibility() {
-    overlays.forEach(nodes => setFeedNodesVisible(nodes, feedsVisible));
-    const pageButton = document.getElementById('robot42-video-toggle-button');
-    if (pageButton) {
-      pageButton.textContent = feedsVisible ? 'Hide video feeds' : 'Show video feeds';
-      pageButton.setAttribute('aria-pressed', feedsVisible ? 'true' : 'false');
+  function statusTextFromPayload(payload) {
+    const status = payload && payload.robot42 ? payload.robot42 : {};
+    robot42LatestStatus = status;
+    const missing = Array.isArray(status.recording_missing) ? status.recording_missing : [];
+    if (status.recording_operation === 'saving') return 'Saving...';
+    if (status.recording_operation === 'starting') return 'Starting...';
+    if (status.recording_operation === 'cancelling') return 'Cancelling...';
+    if (status.recording_operation === 'finishing') return 'FINISHING';
+    if (status.finish_requested) return 'FINISHING';
+    if (status.recording_active && missing.length > 0) {
+      return status.menu_open ? `MENU - Missing ${missing[0]}` : `REC BLOCKED: ${missing[0]}`;
     }
-    const vrLabel = document.getElementById('robot42-video-toggle-vr-label');
-    if (vrLabel) {
-      vrLabel.setAttribute('value', feedsVisible ? 'Hide feeds' : 'Show feeds');
+    if (status.recording_active) return status.menu_open ? 'MENU - Recording...' : 'Recording...';
+    if (status.episode_phase === 'await_finish') return status.menu_open ? 'MENU - Save or cancel' : 'Action ready - open menu';
+    if (status.episode_phase === 'await_start') return status.menu_open ? 'MENU - Record or finish' : 'Ready - open menu';
+    if (status.menu_open) return status.recording_enabled ? 'MENU - Idle' : 'MENU';
+    return status.recording_enabled ? 'Idle' : 'Teleop';
+  }
+
+  function statusColor(text) {
+    if (text.includes('BLOCKED') || text.includes('Missing')) return '#b91c1c';
+    if (text.includes('Saving') || text.includes('Starting') || text.includes('Cancelling')) return '#b7791f';
+    if (text.includes('Recording')) return '#cf2e2e';
+    if (text === 'FINISHING') return '#6b21a8';
+    if (text.includes('Save') || text.includes('Action ready')) return '#b7791f';
+    if (text.includes('Ready')) return '#2563eb';
+    if (text.startsWith('MENU')) return '#111827';
+    return '#333';
+  }
+
+  function ensurePageStatus() {
+    if (document.getElementById('robot42-recording-status')) return;
+    const badge = document.createElement('div');
+    badge.id = 'robot42-recording-status';
+    badge.textContent = 'IDLE';
+    badge.style.position = 'fixed';
+    badge.style.left = '18px';
+    badge.style.bottom = '18px';
+    badge.style.zIndex = '10000';
+    badge.style.padding = '10px 14px';
+    badge.style.borderRadius = '8px';
+    badge.style.background = '#333';
+    badge.style.color = '#fff';
+    badge.style.font = '700 14px system-ui, -apple-system, BlinkMacSystemFont, sans-serif';
+    badge.style.boxShadow = '0 2px 10px rgba(0,0,0,0.25)';
+    document.body.appendChild(badge);
+  }
+
+  function ensureVrStatus() {
+    if (document.getElementById('robot42-recording-status-vr')) return;
+    const headset = document.querySelector('#headset');
+    if (!headset) return;
+    const label = document.createElement('a-text');
+    label.id = 'robot42-recording-status-vr';
+    label.setAttribute('value', 'IDLE');
+    label.setAttribute('align', 'center');
+    label.setAttribute('width', '1.8');
+    label.setAttribute('color', '#fff');
+    label.setAttribute('position', '0 0.16 -0.99');
+    label.setAttribute('side', 'double');
+    label.setAttribute('geometry', 'primitive: plane; width: 0.88; height: 0.075');
+    label.setAttribute('material', 'color: #333; shader: flat; side: double');
+    headset.appendChild(label);
+  }
+
+  async function postJson(url, payload) {
+    try {
+      await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload || {})
+      });
+    } catch (error) {
+      console.warn(`[Robot42] request failed: ${url}`, error);
     }
-    const vrButton = document.getElementById('robot42-video-toggle-vr-button');
-    if (vrButton) {
-      vrButton.setAttribute('color', feedsVisible ? '#1f8b4c' : '#555');
+  }
+
+  function setLocalMenuOpen(open) {
+    menuOpen = !!open;
+    applyMenuVisualState();
+    ensureRecordingMenu();
+    updateControllerPointer();
+    updateRecordingMenu();
+  }
+
+  function setMenuOpen(open) {
+    setLocalMenuOpen(open);
+    postJson('/api/teleop-menu', { open: menuOpen });
+    setTimeout(pollRobot42Status, 80);
+  }
+
+  async function requestRecordingAction(action) {
+    if (!action || pendingRecordingAction) return;
+    pendingRecordingAction = action;
+    setMenuHover(null);
+    setLocalMenuOpen(false);
+    const localStatus = {
+      record: 'Starting...',
+      save: 'Saving...',
+      cancel: 'Cancelling...',
+      finish: 'FINISHING'
+    }[action];
+    if (localStatus) applyRobot42Status(localStatus);
+    try {
+      await postJson('/api/recording-control', { action });
+    } finally {
+      setTimeout(() => {
+        pendingRecordingAction = null;
+        pollRobot42Status();
+      }, 450);
     }
   }
 
-  function toggleFeedsVisibility() {
-    feedsVisible = !feedsVisible;
-    applyFeedsVisibility();
-    console.log(`[Robot42 WebRTC] video feeds ${feedsVisible ? 'shown' : 'hidden'}`);
+  function recordingMenuSpecs() {
+    const status = robot42LatestStatus || {};
+    if (!status.recording_enabled) {
+      return [
+        { action: 'record', label: 'Resume', color: '#2563eb' },
+        { action: 'finish', label: 'Exit', color: '#6b21a8' }
+      ];
+    }
+    if (status.recording_active) {
+      return [
+        { action: 'save', label: 'Save', color: '#1f8b4c' },
+        { action: 'cancel', label: 'Cancel', color: '#b91c1c' },
+        { action: 'finish', label: 'Finish', color: '#6b21a8' }
+      ];
+    }
+    return [
+      { action: 'record', label: 'Record', color: '#2563eb' },
+      { action: 'finish', label: 'Finish', color: '#6b21a8' }
+    ];
   }
 
-  function ensurePageToggle() {
-    if (document.getElementById('robot42-video-toggle-button')) return;
-    const button = document.createElement('button');
-    button.id = 'robot42-video-toggle-button';
-    button.type = 'button';
-    button.textContent = 'Hide video feeds';
-    button.style.position = 'fixed';
-    button.style.right = '18px';
-    button.style.bottom = '18px';
-    button.style.zIndex = '10000';
-    button.style.padding = '10px 14px';
-    button.style.border = '0';
-    button.style.borderRadius = '8px';
-    button.style.background = '#1f8b4c';
-    button.style.color = '#fff';
-    button.style.font = '600 14px system-ui, -apple-system, BlinkMacSystemFont, sans-serif';
-    button.style.boxShadow = '0 2px 10px rgba(0,0,0,0.25)';
-    button.style.cursor = 'pointer';
-    button.addEventListener('click', toggleFeedsVisibility);
-    document.body.appendChild(button);
-  }
-
-  function ensureVrToggle() {
-    if (document.getElementById('robot42-video-toggle-vr-button')) return;
+  function ensureRecordingMenu() {
+    if (document.getElementById('robot42-recording-menu')) return;
     const headset = document.querySelector('#headset');
     if (!headset) return;
 
-    const button = document.createElement('a-plane');
-    button.id = 'robot42-video-toggle-vr-button';
-    button.setAttribute('width', '0.28');
-    button.setAttribute('height', '0.075');
-    button.setAttribute('position', '0.43 -0.42 -1.0');
-    button.setAttribute('material', 'color: #1f8b4c; shader: flat; side: double');
-    button.classList.add('clickable');
-    button.addEventListener('click', toggleFeedsVisibility);
+    const root = document.createElement('a-entity');
+    root.id = 'robot42-recording-menu';
+    root.setAttribute('position', '0 0.055 -0.985');
+    root.setAttribute('visible', 'false');
 
-    const label = document.createElement('a-text');
-    label.id = 'robot42-video-toggle-vr-label';
-    label.setAttribute('value', 'Hide feeds');
-    label.setAttribute('align', 'center');
-    label.setAttribute('width', '0.9');
-    label.setAttribute('color', '#fff');
-    label.setAttribute('position', '0 0 0.006');
-    label.setAttribute('side', 'double');
-    button.appendChild(label);
-    headset.appendChild(button);
+    const backdrop = document.createElement('a-plane');
+    backdrop.id = 'robot42-recording-menu-backdrop';
+    backdrop.setAttribute('width', '0.88');
+    backdrop.setAttribute('height', '0.21');
+    backdrop.setAttribute('position', '0 0 0');
+    backdrop.setAttribute('material', 'color: #050816; opacity: 0.82; transparent: true; shader: flat; side: double');
+    root.appendChild(backdrop);
+
+    const hint = document.createElement('a-text');
+    hint.id = 'robot42-recording-menu-hint';
+    hint.setAttribute('value', 'Aim the blue ray, select with trigger');
+    hint.setAttribute('align', 'center');
+    hint.setAttribute('width', '1.4');
+    hint.setAttribute('color', '#cbd5e1');
+    hint.setAttribute('position', '0 0.065 0.006');
+    hint.setAttribute('side', 'double');
+    root.appendChild(hint);
+
+    headset.appendChild(root);
+    updateRecordingMenu();
+  }
+
+  function tagMenuButtonObject(el, action) {
+    const assign = () => {
+      if (!el.object3D) return;
+      el.object3D.traverse(obj => {
+        obj.userData.robot42MenuAction = action;
+      });
+    };
+    assign();
+    el.addEventListener('loaded', assign);
+  }
+
+  function updateRecordingMenu() {
+    const root = document.getElementById('robot42-recording-menu');
+    if (!root) return;
+    root.setAttribute('visible', menuOpen ? 'true' : 'false');
+
+    const specs = recordingMenuSpecs();
+    const signature = specs.map(spec => `${spec.action}:${spec.label}`).join('|');
+    if (signature === menuSignature && menuButtons.length > 0) {
+      setMenuHover(hoveredMenuAction);
+      return;
+    }
+    menuSignature = signature;
+
+    const existing = root.querySelectorAll('.robot42-menu-button');
+    existing.forEach(el => el.parentNode && el.parentNode.removeChild(el));
+    menuButtons = [];
+
+    const spacing = 0.25;
+    const startX = -spacing * (specs.length - 1) / 2;
+    specs.forEach((spec, index) => {
+      const button = document.createElement('a-plane');
+      button.classList.add('robot42-menu-button', 'clickable');
+      button.setAttribute('width', '0.22');
+      button.setAttribute('height', '0.065');
+      button.setAttribute('position', `${startX + spacing * index} -0.035 0.008`);
+      button.setAttribute('material', `color: ${spec.color}; opacity: 0.95; transparent: true; shader: flat; side: double`);
+      button.addEventListener('click', event => {
+        event.stopPropagation();
+        requestRecordingAction(spec.action);
+      });
+      button.addEventListener('mouseenter', () => setMenuHover(spec.action));
+      button.addEventListener('mouseleave', () => {
+        if (hoveredMenuAction === spec.action) setMenuHover(null);
+      });
+      tagMenuButtonObject(button, spec.action);
+
+      const label = document.createElement('a-text');
+      label.setAttribute('value', spec.label);
+      label.setAttribute('align', 'center');
+      label.setAttribute('width', '0.72');
+      label.setAttribute('color', '#fff');
+      label.setAttribute('position', '0 0 0.006');
+      label.setAttribute('side', 'double');
+      button.appendChild(label);
+      root.appendChild(button);
+      menuButtons.push({ el: button, action: spec.action, color: spec.color });
+    });
+    setMenuHover(hoveredMenuAction);
+    if (activePointerHand) {
+      const el = controllerEl(activePointerHand);
+      if (el && el.components && el.components.raycaster) {
+        try {
+          el.components.raycaster.refreshObjects();
+        } catch (error) {
+          // The raycaster will refresh on its next tick if the scene is not ready yet.
+        }
+      }
+    }
+  }
+
+  function setMenuHover(action) {
+    hoveredMenuAction = action;
+    menuButtons.forEach(button => {
+      const isHovered = button.action === action;
+      button.el.setAttribute(
+        'material',
+        `color: ${isHovered ? '#f8fafc' : button.color}; opacity: 0.96; transparent: true; shader: flat; side: double`
+      );
+      const label = button.el.querySelector('a-text');
+      if (label) label.setAttribute('color', isHovered ? '#111827' : '#fff');
+    });
+  }
+
+  function applyMenuVisualState() {
+    overlays.forEach(nodes => {
+      if (nodes.mesh && nodes.mesh.material && nodes.mesh.material.uniforms) {
+        const baseGain = nodes.baseDisplayGain || 1.0;
+        nodes.mesh.material.uniforms.displayGain.value = menuOpen ? baseGain * 0.32 : baseGain;
+      }
+      if (nodes.marker && nodes.marker.material) {
+        nodes.marker.material.transparent = true;
+        nodes.marker.material.opacity = menuOpen ? 0.25 : 1.0;
+      }
+    });
+    const root = document.getElementById('robot42-recording-menu');
+    if (root) root.setAttribute('visible', menuOpen ? 'true' : 'false');
+  }
+
+  function applyRobot42Status(text) {
+    if (!text || text === lastRobot42StatusText) return;
+    lastRobot42StatusText = text;
+    const color = statusColor(text);
+    const pageBadge = document.getElementById('robot42-recording-status');
+    if (pageBadge) {
+      pageBadge.textContent = text;
+      pageBadge.style.background = color;
+    }
+    const vrBadge = document.getElementById('robot42-recording-status-vr');
+    if (vrBadge) {
+      vrBadge.setAttribute('value', text);
+      vrBadge.setAttribute('material', `color: ${color}; shader: flat; side: double`);
+    }
+  }
+
+  async function pollRobot42Status() {
+    try {
+      const response = await fetch('/api/status', { cache: 'no-store' });
+      if (!response.ok) return;
+      const payload = await response.json();
+      const status = payload && payload.robot42 ? payload.robot42 : {};
+      if (typeof status.menu_open === 'boolean' && status.menu_open !== menuOpen) {
+        setLocalMenuOpen(status.menu_open);
+      }
+      applyRobot42Status(statusTextFromPayload(payload));
+      updateRecordingMenu();
+    } catch (error) {
+      // Keep the last visible status during transient network hiccups.
+    }
+  }
+
+  function controllerGamepad(hand) {
+    const el = document.querySelector(hand === 'right' ? '#rightHand' : '#leftHand');
+    return el && el.components && el.components['tracked-controls']
+      ? el.components['tracked-controls'].controller?.gamepad
+      : null;
+  }
+
+  function controllerEl(hand) {
+    return document.querySelector(hand === 'right' ? '#rightHand' : '#leftHand');
+  }
+
+  function ensureAFramePointer(hand) {
+    const el = controllerEl(hand);
+    if (!el) return null;
+    el.setAttribute(
+      'raycaster',
+      'objects: .robot42-menu-button; showLine: true; far: 3.0; interval: 0; lineColor: #38bdf8; lineOpacity: 0.95'
+    );
+    el.setAttribute(
+      'cursor',
+      'rayOrigin: entity; fuse: false; downEvents: triggerdown; upEvents: triggerup'
+    );
+    return el;
+  }
+
+  function ensurePointerReticle() {
+    if (pointerReticle) return pointerReticle;
+    if (typeof THREE === 'undefined') return null;
+    const scene = document.querySelector('a-scene');
+    if (!scene || !scene.object3D) return null;
+    pointerReticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.011, 0.018, 32),
+      new THREE.MeshBasicMaterial({
+        color: 0x38bdf8,
+        transparent: true,
+        opacity: 0.95,
+        side: THREE.DoubleSide,
+        depthTest: false
+      })
+    );
+    pointerReticle.name = 'robot42-recording-menu-pointer-reticle';
+    pointerReticle.visible = false;
+    pointerReticle.renderOrder = 5000;
+    scene.object3D.add(pointerReticle);
+    return pointerReticle;
+  }
+
+  function disableAFramePointer(hand) {
+    const el = controllerEl(hand);
+    if (!el) return;
+    if (el.components && el.components.raycaster) {
+      el.setAttribute('raycaster', 'enabled', false);
+    }
+    if (el.components && el.components.cursor) {
+      el.setAttribute('cursor', 'enabled', false);
+    }
+  }
+
+  function enableAFramePointer(hand) {
+    const el = ensureAFramePointer(hand);
+    if (!el) return;
+    el.setAttribute('raycaster', 'enabled', true);
+    el.setAttribute('cursor', 'enabled', true);
+    if (el.components && el.components.raycaster) {
+      try {
+        el.components.raycaster.refreshObjects();
+      } catch (error) {
+        // A-Frame may refresh automatically depending on lifecycle timing.
+      }
+    }
+  }
+
+  function updateControllerPointer() {
+    const reticle = ensurePointerReticle();
+    if (!menuOpen) {
+      disableAFramePointer('left');
+      disableAFramePointer('right');
+      activePointerHand = null;
+      setMenuHover(null);
+      if (reticle) reticle.visible = false;
+      return;
+    }
+
+    const hand = robot42LatestStatus.menu_pointer_hand === 'right' ? 'right' : 'left';
+    if (activePointerHand && activePointerHand !== hand) {
+      disableAFramePointer(activePointerHand);
+    }
+    activePointerHand = hand;
+    enableAFramePointer(hand);
+    updatePointerReticle(hand);
+  }
+
+  function updatePointerReticle(hand) {
+    const reticle = ensurePointerReticle();
+    const el = controllerEl(hand);
+    const raycaster = el && el.components ? el.components.raycaster : null;
+    if (!reticle || !raycaster || !raycaster.intersectedEls || raycaster.intersectedEls.length === 0) {
+      if (reticle) reticle.visible = false;
+      return;
+    }
+
+    let closest = null;
+    raycaster.intersectedEls.forEach(target => {
+      const intersection = raycaster.getIntersection(target);
+      if (intersection && (!closest || intersection.distance < closest.distance)) {
+        closest = intersection;
+      }
+    });
+    if (!closest || !closest.point) {
+      reticle.visible = false;
+      return;
+    }
+
+    reticle.visible = true;
+    reticle.position.copy(closest.point);
+    const headset = document.querySelector('#headset');
+    if (headset && headset.object3D) {
+      reticle.quaternion.copy(headset.object3D.quaternion);
+    }
   }
 
   function ensurePanel(feed) {
@@ -1810,9 +2402,10 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplay
 	        marker,
 	        loading: false,
 	        lastRequestAt: 0,
-	        frameCount: 0
+	        frameCount: 0,
+	        baseDisplayGain: feed.displayGain || 1.0
 	      });
-      setFeedNodesVisible(overlays.get(feed.name), feedsVisible);
+      applyMenuVisualState();
       console.log(`[${feed.logName}] WebRTC headset overlay created`);
     }
 
@@ -1850,7 +2443,7 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplay
   }
 
   async function startWebRtc() {
-    if (webRtcStarted || webRtcFailed) return;
+    if (!VIDEO_STREAMS_ENABLED || ACTIVE_FEEDS.length === 0 || webRtcStarted || webRtcFailed) return;
     webRtcStarted = true;
     try {
       ACTIVE_FEEDS.forEach(ensurePanel);
@@ -1907,11 +2500,21 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplay
   }
 
   function start() {
-    ensurePageToggle();
-    ensureVrToggle();
+    ensurePageStatus();
+    ensureVrStatus();
+    ensureRecordingMenu();
+    pollRobot42Status();
+    setInterval(() => {
+      ensurePageStatus();
+      ensureVrStatus();
+      ensureRecordingMenu();
+      pollRobot42Status();
+    }, 500);
     startWebRtc();
     function renderStreams() {
-      ensureVrToggle();
+      ensureVrStatus();
+      ensureRecordingMenu();
+      updateControllerPointer();
       ACTIVE_FEEDS.forEach(updateVideoTexture);
       requestAnimationFrame(renderStreams);
     }
@@ -1927,6 +2530,7 @@ def _orbbec_vr_overlay_js(*, include_orbbec: bool, video_display: VrVideoDisplay
 """
     replacements = {
         "__INCLUDE_ORBBEC__": "true" if include_orbbec else "false",
+        "__VIDEO_STREAMS_ENABLED__": "true" if video_streams_enabled else "false",
         "__WRIST_GAIN__": _js_float(video_display.wrist_gain),
         "__WRIST_GAMMA__": _js_float(video_display.wrist_gamma),
         "__WRIST_BIAS__": _js_float(video_display.wrist_bias),
@@ -1996,6 +2600,9 @@ def _run_keyboard_backend(
             newly_pressed = pressed_keys - previous_pressed_keys
             previous_pressed_keys = pressed_keys
             if quit_key in newly_pressed:
+                break
+            if _consume_finish_collection_request():
+                print("Finish dataset requested from VR UI.")
                 break
             _handle_recording_hotkeys(
                 recording,
@@ -2079,6 +2686,7 @@ def _run_vr_backend(
     base_smoother: BaseSmoother,
     arm_tuning: VrArmTuning,
     video_display: VrVideoDisplayConfig,
+    vr_video_streams: bool,
     startup_pose: VrStartupPoseConfig,
 ) -> int:
     from lerobot.teleoperators.keyboard.configuration_keyboard import KeyboardTeleopConfig
@@ -2089,6 +2697,9 @@ def _run_vr_backend(
 
     hotkeys = KeyboardTeleop(KeyboardTeleopConfig())
     previous_pressed_keys: set[str] = set()
+    _set_vr_menu_open(False)
+    _consume_vr_recording_controls()
+    _consume_finish_collection_request()
 
     orbbec_process = _start_orbbec_rgb_sidecar(orbbec_rgb)
     _connect_robot(robot, auto_restore_calibration=auto_restore_calibration)
@@ -2120,11 +2731,15 @@ def _run_vr_backend(
         orbbec_rgb.output_dir,
         include_orbbec=orbbec_rgb.enabled,
         video_display=video_display,
+        video_streams_enabled=vr_video_streams,
     )
     if installed:
-        if orbbec_rgb.enabled:
+        if vr_video_streams and orbbec_rgb.enabled:
             print("Orbbec RGB VR overlay enabled. Reload the Quest page if it was already open.")
-        print("VR arm camera panels enabled for camera names: left_wrist and right_wrist.")
+        if vr_video_streams:
+            print("VR arm camera panels enabled for camera names: left_wrist and right_wrist.")
+        else:
+            print("VR camera video streams disabled; recording menu/status overlay remains enabled.")
     elif orbbec_rgb.enabled:
         print("Orbbec RGB sidecar is running, but the XLeVR web overlay could not be installed.")
     _run_vr_startup_pose(robot, vr_teleop, startup_pose)
@@ -2151,9 +2766,12 @@ def _run_vr_backend(
     last_camera_warn_t = 0.0
     arm_clutch_state = {"left": False, "right": False}
     previous_vr_buttons: set[str] = set()
+    previous_menu_open = _vr_menu_is_open()
+    menu_pointer_hand = _vr_menu_pointer_hand(basket_pose)
     fixed_arm_modes: dict[str, str] = {}
     fixed_arm_motion_states: dict[str, FixedArmMotionState] = {}
     episode_boundary = VrEpisodeBoundaryState()
+    _update_vr_session_status(recording, episode_boundary, menu_pointer_hand=menu_pointer_hand)
 
     try:
         while True:
@@ -2166,6 +2784,9 @@ def _run_vr_backend(
             previous_pressed_keys = pressed_keys
             if quit_key in newly_pressed:
                 break
+            if _consume_finish_collection_request():
+                print("Finish dataset requested from VR UI/controller.")
+                break
             _handle_recording_hotkeys(
                 recording,
                 newly_pressed,
@@ -2176,45 +2797,96 @@ def _run_vr_backend(
             current_vr_buttons = _current_vr_button_state(vr_teleop)
             newly_pressed_vr_buttons = current_vr_buttons - previous_vr_buttons
             previous_vr_buttons = current_vr_buttons
-            if arm_tuning.debug and newly_pressed_vr_buttons:
+            if newly_pressed_vr_buttons:
                 print(f"VR buttons pressed: {', '.join(sorted(newly_pressed_vr_buttons))}")
+            if _vr_button_spec_pressed("right:thumbstick", newly_pressed_vr_buttons):
+                _set_vr_menu_open(not _vr_menu_is_open())
+                print(f"VR recording menu {'opened' if _vr_menu_is_open() else 'closed'} from right thumbstick.")
             vr_controls = _map_vr_events_to_recording_controls(vr_teleop.get_vr_events())
             vr_decision = VRRecordingDecision(reset_robot=vr_controls.reset_robot)
 
             obs = _get_robot_observation(robot, use_camera=False)
-            boundary_button_consumed = _handle_episode_boundary_buttons(
-                episode_boundary,
-                recording,
-                fixed_arm_modes,
-                fixed_arm_motion_states,
-                vr_teleop,
-                obs,
-                action_ready_targets,
-                newly_pressed_vr_buttons,
-                toggle_button=training_toggle_vr_button,
-                discard_button=training_discard_vr_button,
-            )
-            if not boundary_button_consumed:
-                if (
-                    recording is not None
-                    and _vr_button_spec_pressed(training_discard_vr_button, newly_pressed_vr_buttons)
-                ):
-                    _discard_recording_from_vr_button(recording, training_discard_vr_button)
-                elif (
-                    recording is not None
-                    and _vr_button_spec_pressed(training_toggle_vr_button, newly_pressed_vr_buttons)
-                ):
-                    _toggle_recording_from_vr_button(recording, training_toggle_vr_button)
-            if recording is not None:
-                vr_decision = _decide_vr_recording_action(
-                    recording.active,
-                    vr_controls,
+            menu_actions = _consume_vr_recording_controls()
+            if menu_actions:
+                _apply_vr_recording_menu_actions(
+                    menu_actions,
+                    recording,
+                    episode_boundary,
+                    fixed_arm_modes,
+                    fixed_arm_motion_states,
+                    vr_teleop,
+                    obs,
+                    action_ready_targets,
                 )
+
+            left_thumb_recording_shortcut = (
+                not _vr_menu_is_open()
+                and _vr_button_spec_pressed("left:thumbstick", newly_pressed_vr_buttons)
+            )
+            left_thumb_shortcut_consumed = False
+            if left_thumb_recording_shortcut:
+                left_thumb_shortcut_consumed = _apply_left_thumb_recording_shortcut(
+                    recording,
+                    episode_boundary,
+                    fixed_arm_modes,
+                    fixed_arm_motion_states,
+                    vr_teleop,
+                    obs,
+                    action_ready_targets,
+                )
+                if left_thumb_shortcut_consumed:
+                    vr_decision = VRRecordingDecision()
+
+            menu_open = _vr_menu_is_open()
+            menu_pause_this_loop = menu_open or previous_menu_open
+            if menu_open and not previous_menu_open:
+                _sync_vr_teleop_to_current_pose(robot, vr_teleop)
+                print("VR teleoperation paused for recording menu.")
+            elif previous_menu_open and not menu_open:
+                _sync_vr_teleop_to_current_pose(robot, vr_teleop)
+                print("VR teleoperation menu closed; controls re-baselined.")
+            previous_menu_open = menu_open
+
+            if not menu_pause_this_loop and not left_thumb_shortcut_consumed:
+                boundary_button_consumed = _handle_episode_boundary_buttons(
+                    episode_boundary,
+                    recording,
+                    fixed_arm_modes,
+                    fixed_arm_motion_states,
+                    vr_teleop,
+                    obs,
+                    action_ready_targets,
+                    newly_pressed_vr_buttons,
+                    toggle_button=training_toggle_vr_button,
+                    discard_button=training_discard_vr_button,
+                )
+                if not boundary_button_consumed:
+                    if (
+                        recording is not None
+                        and _vr_button_spec_pressed(training_discard_vr_button, newly_pressed_vr_buttons)
+                    ):
+                        _discard_or_finish_recording_from_vr_button(recording, training_discard_vr_button)
+                    elif (
+                        recording is not None
+                        and _vr_button_spec_pressed(training_toggle_vr_button, newly_pressed_vr_buttons)
+                    ):
+                        _toggle_recording_from_vr_button(recording, training_toggle_vr_button)
+            if recording is not None:
+                if left_thumb_shortcut_consumed:
+                    vr_decision = VRRecordingDecision()
+                else:
+                    vr_decision = _decide_vr_recording_action(
+                        recording.active,
+                        vr_controls,
+                    )
                 _apply_vr_recording_decision(recording, vr_decision)
                 if vr_decision.quit_session:
                     break
+            if _consume_finish_collection_request():
+                print("Finish dataset requested from VR UI/controller.")
+                break
 
-            if basket_pose.enabled:
+            if basket_pose.enabled and not menu_pause_this_loop:
                 _update_fixed_arm_modes_from_controls(
                     fixed_arm_modes,
                     basket_pose,
@@ -2222,7 +2894,10 @@ def _run_vr_backend(
                     newly_pressed_vr_buttons,
                 )
             basket_reset_requested = basket_pose.enabled and basket_pose.full_reset_key in newly_pressed
-            if vr_decision.reset_robot or basket_reset_requested:
+            if menu_pause_this_loop:
+                _set_fixed_arm_ik_pauses(vr_teleop, {"left": "menu", "right": "menu"})
+                action = {}
+            elif vr_decision.reset_robot or basket_reset_requested:
                 _move_to_action_ready(robot, vr_teleop, startup_pose)
                 action_ready_targets = _capture_arm_pose_targets(robot)
                 fixed_arm_modes.clear()
@@ -2274,15 +2949,22 @@ def _run_vr_backend(
                 if camera_error is not None and now - last_camera_warn_t >= 30.0:
                     print(f"VR camera read skipped: {camera_error}")
                     last_camera_warn_t = now
-                _publish_vr_camera_frames(camera_obs)
+                if vr_video_streams:
+                    _publish_vr_camera_frames(camera_obs)
                 if recording is not None:
                     obs = _augment_recording_observation(recording, camera_obs)
             log_rerun_data(obs, sent_action)
-            _record_frame_if_needed(recording, obs, sent_action)
+            if not menu_pause_this_loop:
+                _record_frame_if_needed(recording, obs, sent_action)
+            _update_vr_session_status(recording, episode_boundary, menu_pointer_hand=menu_pointer_hand)
 
             dt_s = time.perf_counter() - start_loop_t
             precise_sleep(max(0.0, 1 / fps - dt_s))
     finally:
+        _set_vr_menu_open(False)
+        _set_vr_recording_operation("")
+        _update_vr_session_status(None, VrEpisodeBoundaryState(), menu_pointer_hand=menu_pointer_hand)
+        _consume_finish_collection_request()
         _finalize_recording(recording)
         _stop_orbbec_rgb_sidecar(orbbec_process)
         try:
@@ -2593,6 +3275,108 @@ def _build_vr_basket_pose_targets(raw_targets: list[str]) -> dict[str, float]:
     return targets
 
 
+def _apply_vr_recording_menu_actions(
+    actions: list[str],
+    recording: RecordingSession | None,
+    state: VrEpisodeBoundaryState,
+    fixed_modes: dict[str, str],
+    motion_states: dict[str, FixedArmMotionState],
+    vr_teleop: Any,
+    obs: dict[str, Any],
+    action_ready_targets: dict[str, float],
+) -> None:
+    for action in actions:
+        if action == "record":
+            if recording is not None and not recording.active:
+                _start_recording_session(recording)
+                print("Training menu: recording started.")
+            elif recording is not None:
+                print("Training menu: recording is already active.")
+            else:
+                print("Training menu: resume selected without dataset recording.")
+            if state.phase == "await_start":
+                _release_episode_boundary_hold(
+                    state,
+                    fixed_modes,
+                    motion_states,
+                    vr_teleop,
+                    obs,
+                    action_ready_targets,
+                )
+                print("Training menu: ACTION_READY hold released; IK resumed.")
+            _set_vr_menu_open(False)
+            _set_vr_recording_operation("")
+        elif action == "save":
+            if recording is not None and recording.active:
+                print("Training menu: saving episode.")
+                _save_episode(recording)
+            else:
+                print("Training menu: save selected, but no episode is active.")
+            _set_vr_menu_open(False)
+            _set_vr_recording_operation("")
+            if state.phase == "await_finish":
+                state.phase = "await_start"
+                print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
+        elif action == "cancel":
+            if recording is not None and recording.active:
+                print("Training menu: cancelling active episode.")
+                _discard_episode(recording)
+            else:
+                print("Training menu: cancel selected, but no episode is active.")
+            _set_vr_menu_open(False)
+            _set_vr_recording_operation("")
+            if state.phase == "await_finish":
+                state.phase = "await_start"
+                print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
+        elif action == "finish":
+            print("Training menu: finishing dataset collection.")
+            _set_vr_menu_open(False)
+            _request_finish_collection()
+
+
+def _apply_left_thumb_recording_shortcut(
+    recording: RecordingSession | None,
+    state: VrEpisodeBoundaryState,
+    fixed_modes: dict[str, str],
+    motion_states: dict[str, FixedArmMotionState],
+    vr_teleop: Any,
+    obs: dict[str, Any],
+    action_ready_targets: dict[str, float],
+) -> bool:
+    if recording is None:
+        return False
+
+    if recording.active:
+        _set_vr_recording_operation("saving")
+        try:
+            print("Left thumb recording shortcut: saving episode.")
+            _save_episode(recording)
+        finally:
+            _set_vr_recording_operation("")
+        if state.phase == "await_finish":
+            state.phase = "await_start"
+            print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
+        return True
+
+    _set_vr_recording_operation("starting")
+    try:
+        _start_recording_session(recording)
+        print("Left thumb recording shortcut: recording started.")
+        if state.phase == "await_start":
+            _release_episode_boundary_hold(
+                state,
+                fixed_modes,
+                motion_states,
+                vr_teleop,
+                obs,
+                action_ready_targets,
+            )
+            print("Left thumb recording shortcut: ACTION_READY hold released; IK resumed.")
+    finally:
+        _set_vr_recording_operation("")
+    return True
+
+
 def _handle_episode_boundary_buttons(
     state: VrEpisodeBoundaryState,
     recording: RecordingSession | None,
@@ -2626,15 +3410,16 @@ def _handle_episode_boundary_buttons(
             else:
                 print("Episode boundary acknowledged as complete; no dataset recording was active.")
         state.phase = "await_start"
-        print("ACTION_READY remains locked. Press right thumbstick to start the next episode and resume IK.")
+        print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
         return True
 
     if state.phase == "await_start":
         if discard_pressed:
-            print("ACTION_READY remains locked; press right thumbstick to start the next episode.")
+            print("Training discard pressed while no episode is active: finalizing dataset collection.")
+            _request_finish_collection()
             return True
         if recording is not None and not recording.active:
-            recording.active = True
+            _start_recording_session(recording)
             print(f"Training recording toggle `{toggle_button}` pressed: recording started.")
         _release_episode_boundary_hold(
             state,
@@ -2648,6 +3433,40 @@ def _handle_episode_boundary_buttons(
         return True
 
     return False
+
+
+def _update_vr_session_status(
+    recording: RecordingSession | None,
+    state: VrEpisodeBoundaryState,
+    *,
+    menu_pointer_hand: str = "left",
+) -> None:
+    finish_requested = _finish_collection_requested()
+    menu_open = _vr_menu_is_open()
+    with _VR_SESSION_STATUS_LOCK:
+        _VR_SESSION_STATUS.update(
+            {
+                "recording_enabled": recording is not None,
+                "recording_active": bool(recording is not None and recording.active),
+                "recording_missing": list(recording.last_missing_features) if recording is not None else [],
+                "episode_frame_count": recording.episode_frame_count if recording is not None else 0,
+                "episode_phase": state.phase,
+                "held_sides": sorted(state.held_sides),
+                "finish_requested": finish_requested,
+                "menu_open": menu_open,
+                "menu_pointer_hand": menu_pointer_hand,
+            }
+        )
+
+
+def _vr_menu_pointer_hand(config: VrBasketPoseConfig) -> str:
+    if not config.enabled:
+        return "left"
+    if config.skill_arm == "right":
+        return "left"
+    if config.skill_arm == "left":
+        return "right"
+    return "left"
 
 
 def _release_episode_boundary_hold(
@@ -2687,7 +3506,7 @@ def _update_fixed_arm_modes_from_controls(
     for side, mode, key, button in requests:
         if side not in allowed_sides:
             continue
-        if fixed_modes.get(side) == "episode_hold":
+        if fixed_modes.get(side) in {"action_ready", "episode_hold"}:
             continue
         if key in newly_pressed_keys or _vr_button_spec_pressed(button, newly_pressed_vr_buttons):
             fixed_modes[side] = mode
@@ -2816,7 +3635,7 @@ def _fixed_arm_motion_targets(
             basket_elbow_compensation_deg=basket_elbow_compensation_deg,
         )
         motion_states[side] = state
-        if mode == "basket" and state.waypoint_targets:
+        if state.waypoint_targets:
             elbow_key = f"{side}_arm_elbow_flex.pos"
             shoulder_key = f"{side}_arm_shoulder_lift.pos"
             first_elbow = state.waypoint_targets[0].get(elbow_key)
@@ -2824,7 +3643,7 @@ def _fixed_arm_motion_targets(
             last_shoulder = state.waypoint_targets[-1].get(shoulder_key)
             final_elbow = state.goal_targets.get(elbow_key)
             print(
-                f"{side.capitalize()} arm basket motion over {state.duration_s:.1f}s: "
+                f"{side.capitalize()} arm {mode.replace('_', ' ')} motion over {state.duration_s:.1f}s: "
                 f"elbow {float(state.start_targets.get(elbow_key, 0.0)):.1f}"
                 f" -> first {float(first_elbow):.1f}; "
                 f"last waypoint elbow {float(last_elbow):.1f}, shoulder {float(last_shoulder):.1f}; "
@@ -2868,6 +3687,10 @@ def _start_fixed_arm_motion(
         )
         if waypoint_targets:
             segment_weights = _basket_motion_segment_weights(len(waypoint_targets))
+    elif mode == "action_ready":
+        waypoint_targets = _build_action_ready_joint_waypoints(side, start_targets)
+        if waypoint_targets:
+            segment_weights = _action_ready_motion_segment_weights(len(waypoint_targets))
     return FixedArmMotionState(
         mode=mode,
         start_targets=start_targets,
@@ -2988,6 +3811,12 @@ def _basket_motion_segment_weights(waypoint_count: int) -> tuple[float, ...]:
     return tuple(1.0 for _ in range(max(1, waypoint_count + 1)))
 
 
+def _action_ready_motion_segment_weights(waypoint_count: int) -> tuple[float, ...]:
+    if waypoint_count == 2:
+        return (0.35, 0.35, 0.30)
+    return tuple(1.0 for _ in range(max(1, waypoint_count + 1)))
+
+
 def _build_right_captured_basket_waypoints(
     start_targets: dict[str, float],
     goal_targets: dict[str, float],
@@ -3005,6 +3834,26 @@ def _build_right_captured_basket_waypoints(
             over_basket_targets[key] = _clip_arm_joint_target(key, float(value))
 
     return (clearance_targets, over_basket_targets)
+
+
+def _build_action_ready_joint_waypoints(
+    side: str,
+    start_targets: dict[str, float],
+) -> tuple[dict[str, float], ...]:
+    if side != "right":
+        return ()
+
+    over_basket_targets = dict(start_targets)
+    for key, value in _RIGHT_BASKET_PATH_OVER_BASKET.items():
+        if key in over_basket_targets:
+            over_basket_targets[key] = _clip_arm_joint_target(key, float(value))
+
+    clearance_targets = dict(start_targets)
+    for key, value in _RIGHT_BASKET_PATH_CLEARANCE.items():
+        if key in clearance_targets:
+            clearance_targets[key] = _clip_arm_joint_target(key, float(value))
+
+    return (over_basket_targets, clearance_targets)
 
 
 def _clip_arm_joint_target(key: str, value: float) -> float:
@@ -3054,8 +3903,8 @@ def _clear_reached_action_ready_modes(
         episode_boundary.held_sides.add(side)
         print(
             f"{side.capitalize()} arm ACTION_READY motion complete; arm locked at ACTION_READY. "
-            "Press right thumbstick to save/end or left thumbstick to cancel, then press "
-            "right thumbstick again to start the next episode and resume IK."
+            "Press left thumbstick to save, or open the menu to Save/Cancel. "
+            "Press left thumbstick again to start the next episode."
         )
 
 
@@ -3619,7 +4468,9 @@ def _create_dataset(
 def _record_frame_if_needed(recording: RecordingSession | None, observation: dict[str, Any], action: dict[str, Any]) -> None:
     if recording is None or not recording.active:
         return
+    observation = _recording_observation_with_cached_images(recording, observation)
     missing = _missing_dataset_observation_values(recording.dataset.features, observation)
+    recording.last_missing_features = tuple(missing)
     if missing:
         now = time.time()
         if now - recording.last_missing_feature_warn_t >= 5.0:
@@ -3647,9 +4498,10 @@ def _record_frame_if_needed(recording: RecordingSession | None, observation: dic
         **observation_frame,
         **action_frame,
         "task": recording.task,
-        "timestamp": time.time(),
     }
     recording.dataset.add_frame(frame)
+    recording.episode_frame_count += 1
+    recording.last_missing_features = ()
 
 
 def _augment_recording_observation(recording: RecordingSession, observation: dict[str, Any]) -> dict[str, Any]:
@@ -3661,6 +4513,49 @@ def _augment_recording_observation(recording: RecordingSession, observation: dic
         if frame is not None:
             augmented[recording.orbbec_camera_key] = frame
     return augmented
+
+
+def _recording_observation_with_cached_images(
+    recording: RecordingSession,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    image_keys = _dataset_image_observation_keys(recording.dataset.features)
+    if not image_keys:
+        return observation
+
+    now = time.monotonic()
+    augmented = dict(observation)
+    for key in image_keys:
+        if key in augmented:
+            recording.latest_observation_images[key] = (_copy_observation_image(augmented[key]), now)
+            continue
+        cached = recording.latest_observation_images.get(key)
+        if cached is None:
+            continue
+        value, captured_at = cached
+        if now - captured_at <= _RECORDING_IMAGE_CACHE_MAX_AGE_S:
+            augmented[key] = value
+    return augmented
+
+
+def _copy_observation_image(value: Any) -> Any:
+    try:
+        import numpy as np
+
+        return np.asarray(value).copy()
+    except Exception:
+        return value
+
+
+def _dataset_image_observation_keys(features: dict[str, dict]) -> list[str]:
+    from lerobot.utils.constants import OBS_STR
+
+    prefix = f"{OBS_STR}.images."
+    return [
+        key.removeprefix(prefix)
+        for key, ft in features.items()
+        if key.startswith(prefix) and ft["dtype"] in {"image", "video"}
+    ]
 
 
 def _latest_orbbec_rgb_array(output_dir: Path) -> Any | None:
@@ -3737,7 +4632,7 @@ def _handle_recording_hotkeys(
         return
 
     if start_key in pressed_keys and not recording.active:
-        recording.active = True
+        _start_recording_session(recording)
         print(f"Recording started. Press `{stop_key}` to save the current episode.")
         return
 
@@ -3750,7 +4645,7 @@ def _toggle_recording_from_vr_button(recording: RecordingSession, button_spec: s
         print(f"Training recording toggle `{button_spec}` pressed: saving episode.")
         _save_episode(recording)
         return
-    recording.active = True
+    _start_recording_session(recording)
     print(f"Training recording toggle `{button_spec}` pressed: recording started.")
 
 
@@ -3762,22 +4657,84 @@ def _discard_recording_from_vr_button(recording: RecordingSession, button_spec: 
     _discard_episode(recording)
 
 
+def _discard_or_finish_recording_from_vr_button(recording: RecordingSession, button_spec: str) -> None:
+    if recording.active:
+        _discard_recording_from_vr_button(recording, button_spec)
+        return
+    print(f"Training discard `{button_spec}` pressed while no episode is active: finalizing dataset collection.")
+    _request_finish_collection()
+
+
+def _start_recording_session(recording: RecordingSession) -> None:
+    recording.active = True
+    recording.episode_frame_count = 0
+    recording.last_missing_features = ()
+
+
 def _save_episode(recording: RecordingSession) -> None:
     if not _episode_buffer_has_frames(recording.dataset):
         recording.active = False
-        print("Recording stopped. No frames captured, skipping save.")
+        if recording.last_missing_features:
+            print(
+                "Recording stopped. No frames captured; last missing observation values: "
+                f"{', '.join(recording.last_missing_features)}. Skipping save."
+            )
+        else:
+            print("Recording stopped. No frames captured, skipping save.")
+        recording.episode_frame_count = 0
         return
 
     recording.dataset.save_episode()
+    _restore_dataset_owner_after_sudo(recording)
     recording.active = False
+    recording.episode_frame_count = 0
+    recording.last_missing_features = ()
     print(f"Saved episode {recording.dataset.meta.total_episodes - 1}.")
 
 
 def _finalize_recording(recording: RecordingSession | None) -> None:
-    if recording is None or not recording.active:
+    if recording is None:
         return
-    print("Saving the active episode before exit.")
-    _save_episode(recording)
+    if recording.active:
+        print("Saving the active episode before exit.")
+        _save_episode(recording)
+    finalize = getattr(recording.dataset, "finalize", None)
+    if callable(finalize):
+        print("Finalizing LeRobot dataset.")
+        finalize()
+        _restore_dataset_owner_after_sudo(recording)
+        total_episodes = getattr(getattr(recording.dataset, "meta", None), "total_episodes", None)
+        if total_episodes is not None:
+            print(f"LeRobot dataset finalized with {total_episodes} episode(s).")
+
+
+def _restore_dataset_owner_after_sudo(recording: RecordingSession) -> None:
+    if os.geteuid() != 0:
+        return
+    sudo_uid = os.environ.get("SUDO_UID")
+    sudo_gid = os.environ.get("SUDO_GID")
+    if not sudo_uid or not sudo_gid:
+        return
+    try:
+        uid = int(sudo_uid)
+        gid = int(sudo_gid)
+    except ValueError:
+        return
+    root = recording.dataset_root or Path(getattr(recording.dataset, "root", ""))
+    if not root:
+        return
+    root = Path(root).expanduser().resolve()
+    if not root.exists():
+        return
+    try:
+        os.chown(root, uid, gid)
+        for path in root.rglob("*"):
+            try:
+                os.chown(path, uid, gid)
+            except OSError:
+                continue
+    except OSError as exc:
+        print(f"Warning: could not restore dataset ownership for {root}: {exc}")
 
 
 def _discard_episode(recording: RecordingSession) -> None:
@@ -3785,7 +4742,7 @@ def _discard_episode(recording: RecordingSession) -> None:
     if callable(clear_episode_buffer):
         clear_episode_buffer()
     else:
-        buffer = getattr(recording.dataset, "episode_buffer", None)
+        buffer = _dataset_episode_buffer(recording.dataset)
         if isinstance(buffer, dict):
             for key, value in buffer.items():
                 if key == "size":
@@ -3793,12 +4750,23 @@ def _discard_episode(recording: RecordingSession) -> None:
                 elif hasattr(value, "clear"):
                     value.clear()
     recording.active = False
+    recording.episode_frame_count = 0
+    recording.last_missing_features = ()
     print("Discarded the current episode.")
 
 
 def _episode_buffer_has_frames(dataset: Any) -> bool:
-    buffer = getattr(dataset, "episode_buffer", None)
+    buffer = _dataset_episode_buffer(dataset)
     return bool(buffer and buffer.get("size", 0) > 0)
+
+
+def _dataset_episode_buffer(dataset: Any) -> dict[str, Any] | None:
+    buffer = getattr(dataset, "episode_buffer", None)
+    if isinstance(buffer, dict):
+        return buffer
+    writer = getattr(dataset, "writer", None)
+    buffer = getattr(writer, "episode_buffer", None) if writer is not None else None
+    return buffer if isinstance(buffer, dict) else None
 
 
 def _print_recording_guide(
@@ -3812,10 +4780,8 @@ def _print_recording_guide(
     print(f"Quit key: `{quit_key}`")
     if controller == "vr":
         print(
-            "VR controls: right thumbstick press start/stop and save, "
-            "left thumbstick press discard, left thumbstick right fallback start/save, "
-            "left thumbstick left fallback discard, left thumbstick up save and quit, "
-            "left thumbstick down reset robot pose"
+            "VR controls: left thumbstick press starts/saves recording; "
+            "right thumbstick opens the recording menu for Record, Save, Cancel, and Finish."
         )
         print(
             "VR IK clutch: hold Quest squeeze/grip to freeze that arm; "
@@ -3842,9 +4808,6 @@ def _map_vr_events_to_recording_controls(vr_events: dict[str, bool] | None) -> V
         return VRRecordingControls()
 
     return VRRecordingControls(
-        toggle_recording=bool(vr_events.get("exit_early")),
-        discard_episode=bool(vr_events.get("rerecord_episode")),
-        quit_session=bool(vr_events.get("stop_recording")),
         reset_robot=bool(vr_events.get("reset_position")),
     )
 
@@ -3869,8 +4832,8 @@ def _apply_vr_recording_decision(
     decision: VRRecordingDecision,
 ) -> None:
     if decision.start_recording:
-        recording.active = True
-        print("Recording started from VR. Press right thumbstick to save, or left thumbstick to discard.")
+        _start_recording_session(recording)
+        print("Recording started from VR. Press left thumbstick to save, or open the menu to cancel.")
     if decision.save_episode:
         _save_episode(recording)
     if decision.discard_episode:

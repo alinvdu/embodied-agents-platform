@@ -179,19 +179,17 @@ To skip the startup pose routine and use the old zero/middle behavior:
 
 ## Tuning VR Camera Display
 
-The wrist camera panels use display-only gain/gamma correction in the Quest overlay. This does not alter the raw camera frames or recorded dataset images.
+The wrist camera panels default to neutral display values. Optional display-only gain/gamma correction can be enabled in the Quest overlay if needed. This does not alter the raw camera frames or recorded dataset images.
 
 Defaults:
 
 ```bash
---vr-wrist-video-gain 1.65
---vr-wrist-video-gamma 0.78
---vr-wrist-video-bias 0.02
+--vr-wrist-video-gain 1.0
+--vr-wrist-video-gamma 1.0
+--vr-wrist-video-bias 0.0
 ```
 
-If the wrist panels are too bright or washed out, reduce `--vr-wrist-video-gain`. If the shadows are still too dark, lower `--vr-wrist-video-gamma` slightly.
-
-The Quest page also adds a `Hide video feeds` / `Show video feeds` button. It hides the headset video panels and green status markers without stopping the WebRTC streams.
+If the wrist panels are too dark, raise `--vr-wrist-video-gain` or lower `--vr-wrist-video-gamma` slightly.
 
 If you need a specific wrist camera frame rate later, add an override directly in the camera spec:
 
@@ -202,7 +200,7 @@ If you need a specific wrist camera frame rate later, add an override directly i
 
 ## Base Control
 
-The right thumbstick controls the differential base. Robot42 smooths base velocity commands before sending them to the wheels.
+The right thumbstick axis controls the differential base. Pressing the right thumbstick opens the recording menu. Robot42 smooths base velocity commands before sending them to the wheels.
 
 Default base tuning:
 
@@ -217,21 +215,18 @@ curve               1.5
 
 ## VR Recording Controls
 
-In training recording mode, thumbstick button presses are the primary episode controls:
+In training recording mode, left thumbstick press is the fast start/save shortcut. The right thumbstick opens the in-headset recording menu and pauses teleop. The camera panels darken while the menu is open. Use the controller ray from the non-teleop hand and press trigger to select a menu action.
 
 ```text
-right thumbstick press start / stop and save episode
-left thumbstick press  discard active episode
+left thumbstick press  start recording if idle, save episode if recording
+right thumbstick press open / close recording menu
+Record                 start recording or resume from ACTION_READY hold
+Save                   save active episode
+Cancel                 discard active episode
+Finish                 finalize dataset and exit
 ```
 
-The older left-thumbstick direction events remain available as fallbacks:
-
-```text
-left thumbstick right  fallback start / stop and save episode
-left thumbstick left   fallback discard active episode
-left thumbstick up     save and quit session
-left thumbstick down   reset robot to ACTION_READY
-```
+Cancel and Finish remain menu-only so accidental shortcut presses cannot discard or finalize the dataset.
 
 In plain `manipulate` mode, left thumbstick down also resets the robot to `ACTION_READY`.
 
@@ -256,7 +251,7 @@ To disable Quest squeeze/grip clutch and keep only keyboard fallback:
 
 ## Grab To Basket Mode
 
-For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press the right arm's basket control, Robot42 disables IK for that arm and follows a captured waypoint path: a relative clearance pose from the actual grasp, a fixed over-basket pose close to the base, then the final basket placement pose. Pressing that arm's action-ready control sends the arm back to the captured `ACTION_READY` pose and then resumes IK.
+For VLA data collection, `grab_to_basket` mode keeps normal VR IK for grabbing. When you press the right arm's basket control, Robot42 disables IK for that arm and follows a captured waypoint path: a relative clearance pose from the actual grasp, a fixed over-basket pose close to the base, then the final basket placement pose. Pressing that arm's action-ready control follows a reverse-style captured path through the over-basket and clearance poses before settling at `ACTION_READY`.
 
 ```bash
 --vr-skill-mode grab_to_basket --vr-skill-arm right
@@ -287,7 +282,7 @@ Button-triggered fixed-pose motions are ramped by default so carrying an object 
 
 The right-arm basket trajectory uses 35% of its duration for the relative clearance pose, 40% for the over-basket transfer pose, and 25% for lowering into the final basket pose. The phases advance on time rather than observed servo error, so object weight cannot leave the sequence waiting forever. The shoulder/elbow heuristic flags are kept for fallback paths, but the right-arm dataset path now follows the captured waypoints.
 
-These settings only affect the `B/Y` basket move. `--vr-action-ready-motion-s` controls the `A/X` return-to-`ACTION_READY` move. None of them change the startup `NAV_STOW` -> `ACTION_READY` routine.
+These settings only affect the `B/Y` basket move. `--vr-action-ready-motion-s` controls the `A/X` return-to-`ACTION_READY` move; the right arm return uses captured waypoints so it does not sweep directly through the table. None of them change the startup `NAV_STOW` -> `ACTION_READY` routine.
 
 The baked basket poses are the captured right/left placement poses for the current physical basket. If you capture a better final pose later, override any joint with repeated target flags:
 
@@ -296,9 +291,9 @@ The baked basket poses are the captured right/left placement poses for the curre
 --vr-basket-target right_arm_shoulder_lift.pos=-42.3715
 ```
 
-While recording, all three joint-space stages are produced inside the main control loop, so the full trajectory is captured frame-by-frame in the episode. Live trigger/gripper commands pass through during the automatic move, ACTION_READY return, and boundary hold.
+While recording, the waypointed joint-space stages are produced inside the main control loop, so the full trajectory is captured frame-by-frame in the episode. Live trigger/gripper commands pass through during the automatic move, ACTION_READY return, and boundary hold.
 
-After `A/X` reaches `ACTION_READY`, the arm stays locked there. Press the right thumbstick once to save/end the current episode, or the left thumbstick once to cancel it. The next right-thumbstick press starts the next episode and releases IK from the captured `ACTION_READY` pose. This two-step boundary also works without dataset recording.
+After `A/X` reaches `ACTION_READY`, the arm stays locked there. Press the left thumbstick to save the active episode, or press the right thumbstick and choose Cancel from the menu. Press the left thumbstick again to start the next episode and release IK from the captured `ACTION_READY` pose. Choose Finish from the menu when collection is complete. This boundary also works without dataset recording; in that mode the menu behaves as a pause/resume control.
 
 ## Dataset Practice
 
@@ -307,12 +302,13 @@ For VLA data collection:
 ```text
 1. Let the robot navigate folded in NAV_STOW.
 2. Move to ACTION_READY outside the recorded episode.
-3. Start recording.
+3. Press the left thumbstick to start recording.
 4. Demonstrate grab and basket drop.
 5. Return to ACTION_READY and let the boundary lock engage.
-6. Save or cancel with one thumbstick press.
+6. Press the left thumbstick to save, or open the menu and select Cancel.
 7. Reset the object while the arm remains locked.
-8. Start the next episode with the right thumbstick; IK resumes.
+8. Press the left thumbstick; IK resumes.
+9. Finish collection from the recording menu.
 ```
 
 ## Pose Utilities
