@@ -40,9 +40,7 @@ sudo /Users/alindumitru/miniconda3/envs/xlerobot/bin/python -m xlerobot_playgrou
   --vr-skill-arm right \
   --vr-basket-motion-s 4.0 \
   --vr-basket-elbow-lift-deg -25 \
-  --vr-action-ready-motion-s 2.0 \
-  --vr-arm-debug \
-  --vr-arm-debug-hz 2
+  --vr-action-ready-motion-s 2.0
 ```
 
 Open the printed Quest URL, usually:
@@ -78,9 +76,7 @@ sudo /Users/alindumitru/miniconda3/envs/xlerobot/bin/python -m xlerobot_playgrou
   --vr-skill-arm right \
   --vr-basket-motion-s 4.0 \
   --vr-basket-elbow-lift-deg -25 \
-  --vr-action-ready-motion-s 2.0 \
-  --vr-arm-debug \
-  --vr-arm-debug-hz 2
+  --vr-action-ready-motion-s 2.0
 ```
 
 If the dataset already exists at `--dataset-root`, Robot42 resumes it and appends new episodes. Use `--no-resume-dataset` only when intentionally starting a fresh dataset directory.

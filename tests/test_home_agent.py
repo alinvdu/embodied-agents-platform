@@ -1743,6 +1743,116 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertTrue(all(body.get("require_depth_image") is True for body in geometry_bodies))
         self.assertTrue(all(body.get("disable_point_cloud_fallback") is True for body in geometry_bodies))
 
+    def test_runtime_approach_applies_one_final_detector_centering_rotation(self) -> None:
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        runtime = HomeAgentToolRuntime(
+            memory=visual_sweep_memory(),
+            config=HomeAgentConfig(
+                exploration_backend_url="http://explore.local",
+                agent_artifacts_root=tmpdir.name,
+                object_detector_provider="mock",
+            ),
+            emit=lambda *_args, **_kwargs: None,
+            run_id="test_final_centering_run",
+        )
+        current_pose = dict(runtime.current_pose)
+        detector_calls = []
+        local_motion_bodies = []
+
+        def fake_detect_object_in_image(*, config, image_data_url, object_label, shot_id, image_path=None):
+            detector_calls.append({"shot_id": shot_id, "image_path": image_path})
+            bbox = [0.35, 0.25, 0.65, 0.75] if len(detector_calls) == 1 else [0.55, 0.25, 0.85, 0.75]
+            detection = {
+                "detection_id": f"{shot_id}_det_1",
+                "label": object_label,
+                "confidence": 0.99,
+                "bbox_xyxy": bbox,
+                "image_path": image_path,
+            }
+            return {
+                "status": "matched",
+                "provider": config.provider,
+                "shot_id": shot_id,
+                "object_label": object_label,
+                "detections": [detection],
+                "selected_detection_id": detection["detection_id"],
+                "selected_detection": detection,
+                "reason": "test detector match",
+            }
+
+        def fake_urlopen(request, timeout=0):
+            body = json.loads(request.data.decode("utf-8")) if request.data else {}
+            if request.full_url.endswith("/api/nav/capture_rgb"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "captured",
+                        "image_data_url": TEST_PNG_DATA_URL,
+                        "robot_pose": dict(current_pose),
+                        "captured_at": 123.0 + len(detector_calls),
+                    }
+                )
+            if request.full_url.endswith("/api/nav/estimate_detection_geometry"):
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "geometry solved",
+                        "forward_m": 0.42,
+                        "distance_m": 0.42,
+                        "lateral_m": 0.0,
+                        "bearing_error_deg": 0.0,
+                        "estimated_pose_base": {"x": 0.42, "y": 0.0, "z": 0.0},
+                        "current_pose": dict(current_pose),
+                        "safety": {"safe": True, "safe_forward_step_m": 0.0, "reason": "clear"},
+                    }
+                )
+            if request.full_url.endswith("/api/nav/local_motion"):
+                local_motion_bodies.append(body)
+                if body.get("primitive") == "rotate_by":
+                    current_pose["yaw"] = round(
+                        current_pose.get("yaw", 0.0)
+                        + float(body.get("delta_yaw_deg", 0.0)) * math.pi / 180.0,
+                        3,
+                    )
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "local motion succeeded",
+                        "local_motion": {
+                            "primitive": body.get("primitive"),
+                            "status": "succeeded",
+                            "start_pose": dict(runtime.current_pose),
+                            "end_pose": dict(current_pose),
+                            "actual_yaw_delta_deg": body.get("delta_yaw_deg"),
+                            "distance_remaining_m": 0.0,
+                        },
+                        "map": {"robot_pose": dict(current_pose)},
+                    }
+                )
+            raise AssertionError(f"unexpected URL {request.full_url}")
+
+        with (
+            patch("xlerobot_agent.home_agent.detect_object_in_image", side_effect=fake_detect_object_in_image),
+            patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            result = runtime.approach_detected_object(
+                object_label="coke can",
+                constraints={
+                    "allow_surface_alignment": False,
+                    "final_centering_after_approach": True,
+                    "final_centering_max_yaw_step_deg": 8.0,
+                },
+            )
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(len(detector_calls), 2)
+        self.assertEqual(result["final_image_centering"]["status"], "succeeded")
+        self.assertEqual(result["final_image_centering"]["yaw_step_deg"], -8.0)
+        self.assertEqual(len(local_motion_bodies), 1)
+        self.assertEqual(local_motion_bodies[0]["primitive"], "rotate_by")
+        self.assertNotIn("pose", local_motion_bodies[0])
+
     def test_runtime_approach_moves_fraction_of_remaining_gap(self) -> None:
         tmpdir = tempfile.TemporaryDirectory()
         self.addCleanup(tmpdir.cleanup)

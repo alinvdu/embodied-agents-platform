@@ -92,6 +92,9 @@ class HomeAgentConfig:
     object_approach_step_fraction: float = 0.8
     object_approach_max_attempts: int = 20
     object_approach_max_centering_corrections: int = 1
+    object_approach_final_centering_enabled: bool = True
+    object_approach_final_center_tolerance_norm: float = 0.06
+    object_approach_final_center_max_yaw_step_deg: float = 12.0
     object_approach_surface_reacquire_sweep_deg: float = 15.0
     object_approach_robot_width_m: float = 0.459
     object_approach_clearance_m: float = 0.06
@@ -1598,6 +1601,17 @@ class HomeAgentToolRuntime:
                     "reason": reason,
                 }
                 self._track_detection_result(object_label=label, detection=detection, capture=capture, geometry=geometry)
+                final_centering = self._final_center_object_after_approach(
+                    object_label=label,
+                    constraints=constraints,
+                    attempt_index=attempt_index,
+                )
+                if final_centering.get("status") != "skipped":
+                    result["final_image_centering"] = final_centering
+                    if final_centering.get("status") == "succeeded":
+                        result["reason"] = f"{result['reason']} Applied one final bbox-centering rotation."
+                    elif final_centering.get("status") == "already_centered":
+                        result["reason"] = f"{result['reason']} Final detector pass confirmed the object is centered."
                 self.emit("tool_executed", "Approach Object", result["reason"], result)
                 return result
             if forward_m <= 0.0:
@@ -1857,6 +1871,124 @@ class HomeAgentToolRuntime:
             "attempts": attempts,
         }
         self.emit("tool_blocked", "Approach Object", result["reason"], result)
+        return result
+
+    def _final_center_object_after_approach(
+        self,
+        *,
+        object_label: str,
+        constraints: dict[str, Any],
+        attempt_index: int,
+    ) -> dict[str, Any]:
+        provider = (self.config.object_detector_provider or "none").strip().lower()
+        default_enabled = (
+            self.config.object_approach_final_centering_enabled
+            and provider not in {"", "none", "disabled", "mock"}
+        )
+        if not _constraint_bool(constraints, "final_centering_after_approach", default_enabled):
+            return {
+                "status": "skipped",
+                "enabled": False,
+                "reason": "Final one-shot image centering after approach is disabled.",
+            }
+        capture = self._capture_rgb_for_object_tool(
+            tool_name="approach_detected_object_final_center",
+            object_label=object_label,
+            attempt_index=attempt_index,
+        )
+        if capture.get("status") != "succeeded":
+            return {
+                "status": "capture_failed",
+                "enabled": True,
+                "capture": capture,
+                "reason": capture.get("reason") or "Final object-centering RGB capture failed.",
+            }
+        detection = self._detect_object_in_capture(
+            object_label=object_label,
+            shot_id=str(capture.get("shot_id") or f"approach_final_center_{attempt_index}"),
+            capture=capture,
+        )
+        result: dict[str, Any] = {
+            "status": "object_lost",
+            "enabled": True,
+            "capture": capture,
+            "detection": detection,
+            "reason": detection.get("reason") or "Object was not detected in the final centering pass.",
+        }
+        if detection.get("status") != "matched":
+            return result
+        selected = detection.get("selected_detection") if isinstance(detection.get("selected_detection"), dict) else {}
+        center = _detection_center_error(selected, capture)
+        result.update(
+            {
+                "selected_detection": selected,
+                "center": center,
+            }
+        )
+        if center.get("status") != "succeeded":
+            result.update(
+                {
+                    "status": "center_failed",
+                    "reason": center.get("reason") or "Final detection bbox could not be converted to center error.",
+                }
+            )
+            return result
+        tolerance = _bounded_float(
+            constraints.get(
+                "final_center_tolerance_norm",
+                constraints.get(
+                    "final_centering_tolerance_norm",
+                    self.config.object_approach_final_center_tolerance_norm,
+                ),
+            ),
+            self.config.object_approach_final_center_tolerance_norm,
+            minimum=0.005,
+            maximum=0.5,
+        )
+        result["tolerance_norm"] = round(tolerance, 4)
+        result["center_error_norm"] = center["error_norm"]
+        if abs(float(center["error_norm"])) <= tolerance:
+            result.update(
+                {
+                    "status": "already_centered",
+                    "reason": "Final detector pass found the object within the camera-center tolerance.",
+                }
+            )
+            return result
+        yaw_constraints = {
+            **constraints,
+            "max_yaw_step_deg": constraints.get(
+                "final_centering_max_yaw_step_deg",
+                constraints.get("max_yaw_step_deg", self.config.object_approach_final_center_max_yaw_step_deg),
+            ),
+        }
+        yaw_step_deg = _visual_servo_yaw_step_deg(center, yaw_constraints, self.config)
+        result["yaw_step_deg"] = yaw_step_deg
+        rotation = self.rotate_by(
+            delta_yaw_deg=yaw_step_deg,
+            reason=f"Final one-shot center `{object_label}` from image bbox after approach.",
+            **_object_alignment_rotation_kwargs(constraints, self.config),
+        )
+        result["rotation"] = rotation
+        if rotation.get("status") not in {"succeeded", "partial"}:
+            result.update(
+                {
+                    "status": "rotation_failed",
+                    "reason": rotation.get("reason") or "Final bbox-centering rotation failed.",
+                }
+            )
+            return result
+        predicted = _horizontally_centered_detection(selected, capture)
+        if predicted is not None:
+            detection_id = str(detection.get("selected_detection_id") or selected.get("tracking_id") or "")
+            self._update_tracked_detection(detection_id, predicted)
+            result["predicted_selected_detection"] = predicted
+        result.update(
+            {
+                "status": "succeeded",
+                "reason": "Applied exactly one final bbox-centering rotation after approach.",
+            }
+        )
         return result
 
     def _reacquire_object_after_surface_alignment(
@@ -3180,7 +3312,7 @@ class HomeTaskAgent:
                 "- If execute_region_exploration_plan returns detection_status='matched', a detector match was confirmed by the operator, remaining shots were aborted, and selected_detection contains the best box. If the operator rejects a candidate, the tool marks that shot rejected and keeps searching.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
                 "- approach_detected_object uses the first matched search-shot bbox before any new detector pass: if the object was seen with the head camera panned, it combines that shot yaw with the bbox horizontal offset, faces the head camera forward, and rotates the robot body toward the object. Only after this initial angle correction does it capture/DINO again to reacquire a front-camera bbox for RGB-D geometry. If that reacquire misses, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approach.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. When the object reaches the configured staging band, it performs one fresh detector pass and at most one rotation-only final bbox-centering nudge before returning success. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Once approach_detected_object has been called for an object, stay in visual/RGB-D approach mode. Do not call relocalize_here between approach attempts; stale ROS camera/head state can make final approach worse. If approach returns partial after useful motion and the object was still detected, retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false, \"reset_head_pan_before_approach\": true}' so the retry refreshes the camera-forward detection and checks reachability without repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
@@ -3727,6 +3859,16 @@ def config_from_env() -> HomeAgentConfig:
         object_approach_max_attempts=int(os.getenv("ROBOT42_OBJECT_APPROACH_MAX_ATTEMPTS", "20")),
         object_approach_max_centering_corrections=int(
             os.getenv("ROBOT42_OBJECT_APPROACH_MAX_CENTERING_CORRECTIONS", "1")
+        ),
+        object_approach_final_centering_enabled=_env_bool(
+            "ROBOT42_OBJECT_APPROACH_FINAL_CENTERING_ENABLED",
+            True,
+        ),
+        object_approach_final_center_tolerance_norm=float(
+            os.getenv("ROBOT42_OBJECT_APPROACH_FINAL_CENTER_TOLERANCE_NORM", "0.06")
+        ),
+        object_approach_final_center_max_yaw_step_deg=float(
+            os.getenv("ROBOT42_OBJECT_APPROACH_FINAL_CENTER_MAX_YAW_STEP_DEG", "12")
         ),
         object_approach_surface_reacquire_sweep_deg=float(
             os.getenv("ROBOT42_OBJECT_APPROACH_SURFACE_REACQUIRE_SWEEP_DEG", "15")
@@ -4416,6 +4558,8 @@ def _compact_agent_tool_result(result: dict[str, Any], *, tool_name: str = "") -
         geometry = result.get("geometry") if isinstance(result.get("geometry"), dict) else None
         if geometry is not None:
             compact["geometry"] = _compact_geometry(geometry)
+        if isinstance(result.get("final_image_centering"), dict):
+            compact["final_image_centering"] = _compact_final_image_centering(result["final_image_centering"])
         last_attempt = _last_dict(result.get("attempts"))
         if last_attempt is not None:
             compact["last_attempt"] = _compact_approach_attempt(last_attempt)
@@ -4533,6 +4677,21 @@ def _compact_detection(detection: dict[str, Any]) -> dict[str, Any]:
         "shot_id": detection.get("shot_id"),
         "image_path": detection.get("image_path"),
     }
+    return _drop_none(compact)
+
+
+def _compact_final_image_centering(value: dict[str, Any]) -> dict[str, Any]:
+    compact = {
+        "status": value.get("status"),
+        "reason": value.get("reason"),
+        "center_error_norm": _round_optional(value.get("center_error_norm")),
+        "tolerance_norm": _round_optional(value.get("tolerance_norm")),
+        "yaw_step_deg": _round_optional(value.get("yaw_step_deg")),
+    }
+    if isinstance(value.get("selected_detection"), dict):
+        compact["selected_detection"] = _compact_detection(value["selected_detection"])
+    if isinstance(value.get("rotation"), dict):
+        compact["rotation"] = _compact_local_motion(value["rotation"])
     return _drop_none(compact)
 
 

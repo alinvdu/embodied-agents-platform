@@ -3294,7 +3294,7 @@ def _apply_vr_recording_menu_actions(
                 print("Training menu: recording is already active.")
             else:
                 print("Training menu: resume selected without dataset recording.")
-            if state.phase == "await_start":
+            if state.phase in {"await_start", "await_finish"}:
                 _release_episode_boundary_hold(
                     state,
                     fixed_modes,
@@ -3362,7 +3362,7 @@ def _apply_left_thumb_recording_shortcut(
     try:
         _start_recording_session(recording)
         print("Left thumb recording shortcut: recording started.")
-        if state.phase == "await_start":
+        if state.phase in {"await_start", "await_finish"}:
             _release_episode_boundary_hold(
                 state,
                 fixed_modes,
