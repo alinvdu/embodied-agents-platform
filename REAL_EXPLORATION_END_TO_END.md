@@ -414,7 +414,7 @@ Expected temporary topics:
 /relocalization_octomap_full
 ```
 
-When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and publishes the corrected robot pose to `/xlerobot/odom/set_pose` if confidence is high enough. The default accept threshold is `0.55`; tune it with `--ros-relocalization-accept-confidence`.
+When you click `Relocalize`, the backend resets `/relocalization_octomap_server`, runs the same 360 camera-pan scan, reads `/relocalization_projected_map`, matches it against the loaded long-term map, and publishes the corrected robot pose to `/xlerobot/odom/set_pose` if confidence is high enough. The default accept threshold is `0.65`; tune it with `--ros-relocalization-accept-confidence`.
 
 Keep the normal static `map -> odom` identity publisher running. `rgbd_visual_odometry` owns `/odom` and `odom -> base_link`; relocalization reseeds that odometry pose so `/odom` and TF stay consistent. The `odom -> relocalization_map` static publisher above should still run for the temporary OctoMap.
 
@@ -637,7 +637,8 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-active-topic /xlerobot/scan_active \
   --ros-nav-active-topic /xlerobot/nav_active \
   --ros-local-rotation-active-topic /xlerobot/local_rotation_active \
-  --ros-relocalization-accept-confidence 0.55 \
+  --relocalization true \
+  --ros-relocalization-accept-confidence 0.85 \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
@@ -670,6 +671,8 @@ http://OFFLOAD_IP:8770
 Click `Start Explore` in the UI. The robot should keep its base still, keep pitch at `30 deg`, pan the head in 60 degree stops (`0 -> 60 -> 120 -> 180 -> 0 -> -60 -> -120`), wait `1.5s` for the motor at each stop, wait for a fresh `/camera/head/points` sample, then give OctoMap `2.0s` of compute time before the next pan move. It should then show `/projected_map` plus `/projected_map_updates` as the occupancy map in the UI. Because `--pause-for-operator-approval` is enabled, it should pause after the initial scan while keeping the live ROS session available for waypoint testing.
 
 By default this real-exploration command waits for the UI start request before moving the robot or panning the head. Use `--no-wait-for-ui-start` only when you want the 360 degree camera-pan scan to begin immediately after the terminal command starts.
+
+To disable relocalization corrections for a run, use `--relocalization false` or `--no-relocalization`. When disabled, `/api/nav/relocalize` returns `skipped` without running the relocalization scan or applying an odometry correction.
 
 Local rotation primitives still command normal angular velocity. The rear-axle swept rectangular footprint guard is currently disabled by default because it was too conservative in tight spaces. Re-enable it with `--ros-local-rotation-safety-enabled` only when validating that guard specifically.
 
@@ -710,7 +713,8 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-scan-active-topic /xlerobot/scan_active \
   --ros-nav-active-topic /xlerobot/nav_active \
   --ros-local-rotation-active-topic /xlerobot/local_rotation_active \
-  --ros-relocalization-accept-confidence 0.55 \
+  --relocalization true \
+  --ros-relocalization-accept-confidence 0.65 \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \

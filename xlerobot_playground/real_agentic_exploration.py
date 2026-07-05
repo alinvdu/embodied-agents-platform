@@ -5,6 +5,17 @@ import argparse
 from xlerobot_playground.nav2_defaults import default_nav2_behavior_tree
 
 
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected true/false, got {value!r}.")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -73,7 +84,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
     parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
-    parser.add_argument("--ros-relocalization-accept-confidence", type=float, default=0.55)
+    parser.add_argument("--ros-relocalization-accept-confidence", type=float, default=0.65)
+    parser.add_argument(
+        "--relocalization",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable or disable backend relocalization corrections. Accepts true/false.",
+    )
+    parser.add_argument("--no-relocalization", action="store_false", dest="relocalization")
     parser.add_argument("--ros-odom-reset-topic", default="/xlerobot/odom/set_pose")
     parser.add_argument("--ros-scan-topic", default="/scan")
     parser.add_argument("--ros-point-cloud-topic", default="/camera/head/points")
@@ -179,6 +199,8 @@ def translated_args(args: argparse.Namespace) -> list[str]:
         args.ros_navigation_map_source,
         "--ros-map-topic",
         args.ros_map_topic,
+        "--relocalization",
+        str(bool(args.relocalization)).lower(),
         "--ros-relocalization-map-topic",
         args.ros_relocalization_map_topic,
         "--ros-relocalization-reset-service",

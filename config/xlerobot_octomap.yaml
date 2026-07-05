@@ -7,7 +7,7 @@ octomap_server:
     resolution: 0.08
 
     # Keep this near the reliable Gemini 2 indoor range while validating.
-    sensor_model.max_range: 5.0
+    sensor_model.max_range: 2.5
 
     # Input cloud crop before insertion. Use z in the fixed frame.
     pointcloud_min_z: 0.12

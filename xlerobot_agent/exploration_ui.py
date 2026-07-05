@@ -580,6 +580,28 @@ HTML_PAGE = """<!doctype html>
       border-color: rgba(15,118,110,0.35);
       background: rgba(15,118,110,0.08);
     }
+    .message-list {
+      display: grid;
+      gap: 8px;
+      max-height: 320px;
+      overflow: auto;
+      margin-top: 10px;
+    }
+    .message-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 9px 10px;
+      background: rgba(255,255,255,0.74);
+    }
+    .message-card:first-child {
+      border-color: rgba(15,118,110,0.35);
+      background: rgba(15,118,110,0.08);
+    }
+    .message-time {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
     .thumbs {
       display: grid;
       gap: 10px;
@@ -632,6 +654,7 @@ HTML_PAGE = """<!doctype html>
         <section class="panel">
           <div class="eyebrow">Status</div>
           <div id="meta-grid" class="meta-grid"></div>
+          <div id="task-messages" class="message-list"></div>
         </section>
 
         <section class="panel">
@@ -870,6 +893,12 @@ HTML_PAGE = """<!doctype html>
       return `${Math.round(Number(meters) * 100)} cm`;
     }
 
+    function formatTimestamp(seconds) {
+      const value = Number(seconds);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      return new Date(value * 1000).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'});
+    }
+
     function shouldPaintCell(cell) {
       if (!cell) return false;
       if (mapEditMode !== 'clear') return true;
@@ -922,7 +951,34 @@ HTML_PAGE = """<!doctype html>
           <div class="meta-value">${escapeHtml(value)}</div>
         </div>
       `).join('');
+      renderTaskMessages(task);
       renderLaunchControls(state);
+    }
+
+    function renderTaskMessages(task) {
+      const element = document.getElementById('task-messages');
+      if (!element) return;
+      if (!task) {
+        element.innerHTML = '<div class="muted">No task messages.</div>';
+        return;
+      }
+      const history = Array.isArray(task.message_history) ? task.message_history.slice() : [];
+      if (!history.length && task.message) {
+        history.push({message: task.message, timestamp: task.updated_at});
+      }
+      const recent = history
+        .filter((item) => item && item.message)
+        .slice(-24)
+        .reverse();
+      element.innerHTML = recent.map((item) => {
+        const timestamp = formatTimestamp(item.timestamp);
+        return `
+          <div class="message-card">
+            <div class="message-time">${escapeHtml(timestamp || 'updated')}</div>
+            <div>${escapeHtml(item.message)}</div>
+          </div>
+        `;
+      }).join('') || '<div class="muted">No task messages.</div>';
     }
 
     function renderLaunchControls(state) {

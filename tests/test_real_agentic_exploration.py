@@ -5,7 +5,12 @@ from unittest.mock import patch
 
 from xlerobot_agent.exploration import ExplorationBackend, ExplorationBackendConfig
 from xlerobot_playground.real_agentic_exploration import build_parser, translated_args
-from xlerobot_playground.sim_exploration_backend import ExplorationRunner, RosExplorationSession, SimExplorationConfig
+from xlerobot_playground.sim_exploration_backend import (
+    ExplorationRunner,
+    RosExplorationSession,
+    SimExplorationConfig,
+    build_parser as build_backend_parser,
+)
 
 
 class RealAgenticExplorationTests(unittest.TestCase):
@@ -33,7 +38,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--no-ros-local-rotation-safety-block-unknown", translated)
         self.assertEqual(translated[translated.index("--ros-turn-scan-mode") + 1], "camera_pan")
         self.assertEqual(translated[translated.index("--camera-pan-action-key") + 1], "head_motor_1.pos")
-        self.assertEqual(translated[translated.index("--ros-relocalization-accept-confidence") + 1], "0.55")
+        self.assertEqual(translated[translated.index("--relocalization") + 1], "true")
+        self.assertEqual(translated[translated.index("--ros-relocalization-accept-confidence") + 1], "0.65")
         self.assertEqual(translated[translated.index("--ros-scan-active-topic") + 1], "/xlerobot/scan_active")
         self.assertEqual(translated[translated.index("--ros-nav-active-topic") + 1], "/xlerobot/nav_active")
         self.assertEqual(translated[translated.index("--ros-local-rotation-active-topic") + 1], "/xlerobot/local_rotation_active")
@@ -72,6 +78,23 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertEqual(translated[translated.index("--review-host") + 1], "127.0.0.1")
         self.assertEqual(translated[translated.index("--review-port") + 1], "8899")
         self.assertEqual(translated[translated.index("--ros-relocalization-accept-confidence") + 1], "0.5")
+
+    def test_relocalization_false_is_translated(self) -> None:
+        args = build_parser().parse_args(["--relocalization", "false"])
+
+        translated = translated_args(args)
+
+        self.assertEqual(translated[translated.index("--relocalization") + 1], "false")
+
+    def test_backend_accepts_relocalization_false(self) -> None:
+        args = build_backend_parser().parse_args(["--relocalization", "false"])
+
+        self.assertFalse(args.relocalization)
+
+    def test_backend_accepts_no_relocalization_alias(self) -> None:
+        args = build_backend_parser().parse_args(["--no-relocalization"])
+
+        self.assertFalse(args.relocalization)
 
     def test_pause_for_operator_approval_is_translated(self) -> None:
         args = build_parser().parse_args(["--pause-for-operator-approval"])

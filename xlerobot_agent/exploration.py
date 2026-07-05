@@ -120,11 +120,25 @@ class _TaskState:
     state: str = ExecutionStatus.IN_PROGRESS.value
     progress: float = 0.0
     message: str = ""
+    message_history: list[dict[str, Any]] = field(default_factory=list)
     result: dict[str, Any] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
     paused: bool = False
     canceled: bool = False
+
+    def set_message(self, message: str, *, timestamp: float | None = None) -> None:
+        text = str(message)
+        self.message = text
+        if not text:
+            return
+        entry = {"message": text, "timestamp": float(timestamp if timestamp is not None else time.time())}
+        if self.message_history and self.message_history[-1].get("message") == text:
+            self.message_history[-1] = entry
+        else:
+            self.message_history.append(entry)
+        if len(self.message_history) > 200:
+            del self.message_history[:-200]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -136,6 +150,7 @@ class _TaskState:
             "state": self.state,
             "progress": round(self.progress, 3),
             "message": self.message,
+            "message_history": list(self.message_history),
             "result": dict(self.result),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -335,8 +350,8 @@ class ExplorationBackend:
             area=area or "workspace",
             session=session,
             source=source,
-            message=message or f"Accepted external `{tool_id}` request for `{area or 'workspace'}`.",
         )
+        task.set_message(message or f"Accepted external `{tool_id}` request for `{area or 'workspace'}`.")
         with self._lock:
             self._tasks[task.task_id] = task
             self._persist()
@@ -359,7 +374,7 @@ class ExplorationBackend:
             if progress is not None:
                 task.progress = max(0.0, min(float(progress), 1.0))
             if message is not None:
-                task.message = str(message)
+                task.set_message(str(message))
             if result is not None:
                 task.result = json.loads(json.dumps(result))
             if state is not None:
@@ -386,7 +401,7 @@ class ExplorationBackend:
                 self._set_current_map(map_payload)
             task.state = ExecutionStatus.SUCCEEDED.value
             task.progress = 1.0
-            task.message = message or f"Completed `{task.tool_id}` for `{task.area}`."
+            task.set_message(message or f"Completed `{task.tool_id}` for `{task.area}`.")
             if result is not None:
                 task.result = json.loads(json.dumps(result))
             elif map_payload is not None:
@@ -412,7 +427,7 @@ class ExplorationBackend:
             if task is None:
                 return None
             task.state = state
-            task.message = str(message)
+            task.set_message(str(message))
             if result is not None:
                 task.result = json.loads(json.dumps(result))
             task.updated_at = time.time()
@@ -430,7 +445,7 @@ class ExplorationBackend:
             if task is None:
                 return None
             task.paused = True
-            task.message = f"Paused task `{task_id}`."
+            task.set_message(f"Paused task `{task_id}`.")
             task.updated_at = time.time()
             self._persist()
             return task.to_dict()
@@ -442,7 +457,7 @@ class ExplorationBackend:
                 return None
             task.paused = False
             if task.state == ExecutionStatus.IN_PROGRESS.value:
-                task.message = f"Resumed task `{task_id}`."
+                task.set_message(f"Resumed task `{task_id}`.")
             task.updated_at = time.time()
             self._persist()
             return task.to_dict()
@@ -455,7 +470,7 @@ class ExplorationBackend:
             task.canceled = True
             task.paused = False
             task.state = ExecutionStatus.ABORTED.value
-            task.message = f"Canceled task `{task.task_id}`."
+            task.set_message(f"Canceled task `{task.task_id}`.")
             task.updated_at = time.time()
             self._persist()
             return task.to_dict()
@@ -826,8 +841,8 @@ class ExplorationBackend:
             area=area or "workspace",
             session=session,
             source=source,
-            message=f"Accepted `{tool_id}` request for `{area or 'workspace'}`.",
         )
+        task.set_message(f"Accepted `{tool_id}` request for `{area or 'workspace'}`.")
         with self._lock:
             self._tasks[task.task_id] = task
             thread = threading.Thread(
@@ -875,7 +890,7 @@ class ExplorationBackend:
                     task.progress = min(processed / max(total_frames, 1), 0.92)
                     task.updated_at = time.time()
                     frontier_count = _frontier_count(discovered_region_ids, scenario.templates)
-                    task.message = (
+                    task.set_message(
                         f"Exploring `{task.area}`: visited {len(discovered_region_ids)} region(s), "
                         f"{frontier_count} frontier(s) remaining."
                     )
@@ -902,7 +917,7 @@ class ExplorationBackend:
             task.state = ExecutionStatus.SUCCEEDED.value
             task.progress = 1.0
             task.updated_at = time.time()
-            task.message = f"Completed `{task.tool_id}` for `{task.area}`."
+            task.set_message(f"Completed `{task.tool_id}` for `{task.area}`.")
             task.result = {
                 "map": map_payload,
                 "coverage": map_payload["coverage"],
@@ -1115,6 +1130,26 @@ class ExplorationBackend:
             for item in tasks:
                 if not isinstance(item, dict) or not item.get("task_id"):
                     continue
+                message_history = item.get("message_history")
+                if not isinstance(message_history, list):
+                    message_history = []
+                restored_history = [
+                    {
+                        "message": str(entry.get("message", "")),
+                        "timestamp": float(entry.get("timestamp", item.get("updated_at", time.time())) or time.time()),
+                    }
+                    for entry in message_history
+                    if isinstance(entry, dict) and entry.get("message")
+                ][-200:]
+                message = str(item.get("message", ""))
+                if message and (not restored_history or restored_history[-1].get("message") != message):
+                    restored_history.append(
+                        {
+                            "message": message,
+                            "timestamp": float(item.get("updated_at", time.time()) or time.time()),
+                        }
+                    )
+                    restored_history = restored_history[-200:]
                 task = _TaskState(
                     task_id=str(item["task_id"]),
                     tool_id=str(item.get("tool_id", "unknown")),
@@ -1123,7 +1158,8 @@ class ExplorationBackend:
                     source=str(item.get("source", "restored")),
                     state=str(item.get("state", ExecutionStatus.IN_PROGRESS.value)),
                     progress=float(item.get("progress", 0.0) or 0.0),
-                    message=str(item.get("message", "")),
+                    message=message,
+                    message_history=restored_history,
                     result=dict(item.get("result", {})) if isinstance(item.get("result"), dict) else {},
                     created_at=float(item.get("created_at", time.time()) or time.time()),
                     updated_at=float(item.get("updated_at", time.time()) or time.time()),

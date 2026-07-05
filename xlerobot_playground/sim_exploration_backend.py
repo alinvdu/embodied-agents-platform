@@ -126,9 +126,10 @@ class SimExplorationConfig:
     ros_map_updates_topic: str | None = None
     ros_fuse_external_projected_map_snapshots: bool = False
     ros_publish_identity_map_to_odom: bool = False
+    relocalization: bool = True
     ros_relocalization_map_topic: str = "/relocalization_projected_map"
     ros_relocalization_reset_service: str = "/relocalization_octomap_server/reset"
-    ros_relocalization_accept_confidence: float = 0.55
+    ros_relocalization_accept_confidence: float = 0.65
     ros_odom_reset_topic: str = "/xlerobot/odom/set_pose"
     ros_scan_topic: str = "/scan"
     ros_point_cloud_topic: str = "/camera/head/points"
@@ -194,6 +195,17 @@ class SimExplorationConfig:
     stop_after_initial_scan: bool = False
     use_keyboard_controls: bool = False
     keyboard_speed: str = "normal"
+
+
+def _parse_bool(value: str | bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected true/false, got {value!r}.")
 
 
 @dataclass(frozen=True, order=True)
@@ -3352,8 +3364,8 @@ class RosExplorationSession:
                 RosRuntimeConfig(
                     map_topic=config.ros_map_topic,
                     map_updates_topic=config.ros_map_updates_topic,
-                    relocalization_map_topic=config.ros_relocalization_map_topic,
-                    relocalization_reset_service=config.ros_relocalization_reset_service,
+                    relocalization_map_topic=config.ros_relocalization_map_topic if config.relocalization else "",
+                    relocalization_reset_service=config.ros_relocalization_reset_service if config.relocalization else "",
                     odom_reset_topic=config.ros_odom_reset_topic,
                     scan_topic=config.ros_scan_topic,
                     point_cloud_topic=config.ros_point_cloud_topic,
@@ -3926,6 +3938,11 @@ class RosExplorationSession:
     def relocalize_here(self) -> dict[str, Any]:
         with self._lock:
             self.last_error = None
+            if not self.config.relocalization:
+                return {
+                    "status": "skipped",
+                    "reason": "Relocalization is disabled by --relocalization false.",
+                }
             if self._manual_scan_in_progress:
                 return {"status": "busy", "reason": "A scan is already running."}
             self._sync_manual_occupancy_edits()
@@ -6128,9 +6145,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-relocalization-map-topic", default="/relocalization_projected_map")
     parser.add_argument("--ros-relocalization-reset-service", default="/relocalization_octomap_server/reset")
     parser.add_argument(
+        "--relocalization",
+        type=_parse_bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help="Enable or disable backend relocalization corrections. Accepts true/false.",
+    )
+    parser.add_argument("--no-relocalization", action="store_false", dest="relocalization")
+    parser.add_argument(
         "--ros-relocalization-accept-confidence",
         type=float,
-        default=0.55,
+        default=0.65,
         help="Minimum relocalization match confidence required before applying an odometry correction.",
     )
     parser.add_argument("--ros-odom-reset-topic", default="/xlerobot/odom/set_pose")
@@ -6293,6 +6319,7 @@ def main(argv: list[str] | None = None) -> int:
             ros_map_updates_topic=args.ros_map_updates_topic,
             ros_fuse_external_projected_map_snapshots=args.ros_fuse_external_projected_map_snapshots,
             ros_publish_identity_map_to_odom=args.ros_publish_identity_map_to_odom,
+            relocalization=args.relocalization,
             ros_relocalization_map_topic=args.ros_relocalization_map_topic,
             ros_relocalization_reset_service=args.ros_relocalization_reset_service,
             ros_relocalization_accept_confidence=args.ros_relocalization_accept_confidence,

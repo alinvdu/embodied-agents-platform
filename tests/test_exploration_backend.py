@@ -18,6 +18,73 @@ class _Cell:
 
 
 class ExplorationBackendExternalTaskTests(unittest.TestCase):
+    def test_external_task_keeps_message_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=f"{tmpdir}/map.json",
+                )
+            )
+            task = backend.begin_external_task(
+                tool_id="explore",
+                area="workspace",
+                session="house_v1",
+                source="operator",
+                message="Starting exploration.",
+            )
+
+            backend.update_external_task(task["task_id"], progress=0.2, message="Driving to first waypoint.")
+            backend.update_external_task(task["task_id"], progress=0.4, message="Running relocalization scan.")
+            backend.complete_external_task(task["task_id"], message="Exploration complete.")
+
+            active_task = backend.snapshot()["active_task"]
+            self.assertEqual(active_task["message"], "Exploration complete.")
+            self.assertEqual(
+                [item["message"] for item in active_task["message_history"]],
+                [
+                    "Starting exploration.",
+                    "Driving to first waypoint.",
+                    "Running relocalization scan.",
+                    "Exploration complete.",
+                ],
+            )
+
+    def test_restored_task_backfills_message_history_for_old_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            persist_path = Path(tmpdir) / "map.json"
+            persist_path.write_text(
+                json.dumps(
+                    {
+                        "tasks": [
+                            {
+                                "task_id": "explore_old",
+                                "tool_id": "explore",
+                                "area": "workspace",
+                                "session": "house_v1",
+                                "source": "operator",
+                                "state": "in_progress",
+                                "progress": 0.5,
+                                "message": "Latest legacy message.",
+                                "updated_at": 123.0,
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            backend = ExplorationBackend(
+                ExplorationBackendConfig(
+                    mode="sim",
+                    persist_path=str(persist_path),
+                )
+            )
+
+            active_task = backend.snapshot()["active_task"]
+            self.assertEqual(active_task["message"], "Latest legacy message.")
+            self.assertEqual(active_task["message_history"], [{"message": "Latest legacy message.", "timestamp": 123.0}])
+
     def test_external_task_updates_and_completes_with_named_places(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             backend = ExplorationBackend(
