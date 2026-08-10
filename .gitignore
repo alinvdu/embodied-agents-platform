@@ -8,3 +8,5 @@ datasets/
 .env
 
 .env
+outputs/
+meta/
