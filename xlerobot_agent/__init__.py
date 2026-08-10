@@ -1,4 +1,10 @@
 from .brain_service import BrainBridge, BrainServiceServer
+from .basket_verification import (
+    BasketOutcomeVerifier,
+    BasketReferenceSet,
+    BasketVerificationConfig,
+    BasketVerificationResult,
+)
 from .executors import ExecutorRegistry, StaticSkillExecutor
 from .integration import (
     XLeRobotAgentBindings,
@@ -115,6 +121,15 @@ from .tools import (
 )
 from .ui import PlaygroundUIServer
 from .visual_differencing import VisualDifferencingModule, VisualObservation
+from .vla_worker import (
+    VLAWorkerConfig,
+    VLAWorkerError,
+    VLAWorkerPrediction,
+    VLAWorkerPredictionError,
+    VLAWorkerReady,
+    VLAWorkerStartError,
+    VLAWorkerSupervisor,
+)
 from .voice import (
     MockVoiceCommandApp,
     MockVoiceTranslator,
@@ -134,6 +149,10 @@ __all__ = [
     "BrainBridge",
     "BrainRegistration",
     "BrainServiceServer",
+    "BasketOutcomeVerifier",
+    "BasketReferenceSet",
+    "BasketVerificationConfig",
+    "BasketVerificationResult",
     "BoundedCodeExecutor",
     "CandidateSkillScore",
     "CodeGenerationResult",
@@ -199,6 +218,13 @@ __all__ = [
     "VoiceCommandPipeline",
     "VisualDifferencingModule",
     "VisualObservation",
+    "VLAWorkerConfig",
+    "VLAWorkerError",
+    "VLAWorkerPrediction",
+    "VLAWorkerPredictionError",
+    "VLAWorkerReady",
+    "VLAWorkerStartError",
+    "VLAWorkerSupervisor",
     "WakeWordConfig",
     "WorldState",
     "XLeRobotAgentBindings",

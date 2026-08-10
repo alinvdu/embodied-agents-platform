@@ -16,6 +16,7 @@ Replace these placeholders:
 ROBOT_BRAIN_IP   IP address of the Mac/robot brain running robot_brain_agent
 OFFLOAD_IP       IP address of the ROS/Nav2 offload computer
 YOUR_MODEL       LLM model name, only for LLM mode
+YOUR_VISION_MODEL Vision-capable model used to verify the bottle in the basket
 YOUR_API_KEY     LLM API key, only for LLM mode
 ```
 
@@ -75,7 +76,7 @@ Run these on the robot brain Mac. Keep both terminals running.
 Use the Python environment that has LeRobot/XLeRobot installed.
 
 ```bash
-cd /Users/alin/Robot42
+cd /Users/alindumitru/embodied-agents-platform
 conda activate xlerobot
 python -m pip install aiohttp
 
@@ -105,6 +106,46 @@ python -m xlerobot_playground.robot_brain_agent \
   --no-stream-imu
 ```
 
+To enable the current right-arm SmolVLA checkpoint as an on-demand handoff, add these flags to RB-1:
+
+```bash
+  --camera right_wrist=opencv:1 \
+  --camera-width 640 \
+  --camera-height 480 \
+  --camera-fps 30 \
+  --vla-policy-path outputs/train/pretrained_vla_batch_16_30k_new_dataset \
+  --vla-dataset-root datasets/small-juice-bottle-to-basket-right-arm \
+  --vla-dataset-repo-id alindumitru/small-juice-bottle-to-basket-right-arm \
+  --vla-device mps \
+  --vla-duration-s 60 \
+  --vla-action-steps 50 \
+  --vla-max-joint-delta 50 \
+  --vla-max-gripper-delta 50 \
+  --vla-camera-max-age-s 1 \
+  --vla-release-open-threshold 30 \
+  --vla-release-closed-threshold 10 \
+  --vla-release-transition-samples 3 \
+  --vla-release-observed-open-samples 2 \
+  --vla-release-observed-open-timeout-s 2 \
+  --vla-release-settle-s 1 \
+  --vla-release-capture-count 4 \
+  --vla-release-capture-interval-s 0.25
+```
+
+This does not preload the model. `robot_brain_agent` creates the model-only worker after `POST /vla/run`, uses the live in-memory Orbbec head frame plus `right_wrist`, and stops the worker after the rollout. The worker does not open cameras or serial ports and does not require `sudo`; only the separate Orbbec sidecar retains its existing USB permission requirement.
+
+The handoff recognizes the demonstrated right-gripper sequence `open >= 30`, `closed <= 10`, then the second `open >= 30`. After the second opening it stops consuming policy actions, confirms the observed gripper is open, waits for the bottle to settle, and returns four right-wrist images with status `release_detected`. Reaching the rollout duration without this sequence returns `timed_out`, never success.
+
+HomeTaskAgent runs on the offload computer, so its robot-brain URL must use `ROBOT_BRAIN_IP`, not localhost. A direct robot-side controlled test is:
+
+```bash
+curl -X POST http://127.0.0.1:8765/vla/run \
+  -H 'Content-Type: application/json' \
+  -d '{"duration_s":60}'
+```
+
+The direct test deliberately does not stow automatically. In the end-to-end flow, the offload HomeTaskAgent verifies the returned wrist images first and calls `POST /vla/stow` only after the vision model approves that the bottle is released inside the basket.
+
 For wheel-odometry-only mode, keep `--stream-wheel-state --wheel-state-stream-rate-hz 100` and add `--no-stream-imu` to `robot_brain_agent`. That keeps robot brain from opening the Orbbec IMU UDP listener or `/ws/imu`; `/wheel_state`, `/ws/wheel_state`, camera control, RGB-D ingest, and `/cmd_vel` still work.
 
 `head_motor_1.pos` is the default horizontal head pan motor command. Keep `--allow-motion-commands` enabled here; camera-pan exploration scans use the same safe hardware command gate as wheel motion.
@@ -124,7 +165,7 @@ If you recalibrate and the level camera position changes, update only `--camera-
 The command below enables RGB-D plus IMU for the RGB-D/IMU odometry stack. For wheel-odometry-only mode, remove `--enable-imu`, `--imu-aggregate-mode`, `--imu-udp-host`, `--imu-udp-port`, and `--imu-log-every`; keep the RGB-D, point-cloud, and camera HTTP flags.
 
 ```bash
-cd /Users/alin/Robot42
+cd /Users/alindumitru/embodied-agents-platform
 
 cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
 cmake --build build/orbbec_rgb_test
@@ -735,6 +776,46 @@ python -m xlerobot_playground.real_agentic_exploration \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8
 ```
+
+### Terminal OC-7: HomeTaskAgent Fetch Orchestrator
+
+Run HomeTaskAgent on the offload computer after the exploration/Nav2 backend is available on port `8770`. The robot brain remains on the Mac at `ROBOT_BRAIN_IP:8765`; using port `8765` for HomeTaskAgent on the offload computer does not conflict because they are different hosts.
+
+```bash
+cd /home/alin/Robot42
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+export OPENAI_API_KEY=YOUR_API_KEY
+export REPLICATE_API_TOKEN=YOUR_REPLICATE_API_TOKEN
+
+python examples/robot42_agent_backend.py \
+  --host 0.0.0.0 \
+  --port 8765 \
+  --memory-root /home/alin/Robot42/artifacts/memories \
+  --provider openai \
+  --model YOUR_MODEL \
+  --basket-verifier-provider openai \
+  --basket-verifier-model YOUR_VISION_MODEL \
+  --basket-verification-manifest /home/alin/Robot42/config/basket_verification/small_cherry_juice_bottle_v0/reference_set.json \
+  --basket-verification-minimum-confidence 0.8 \
+  --object-detector-provider replicate_grounding_dino \
+  --exploration-backend-url http://127.0.0.1:8770 \
+  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
+  --vla-handoff \
+  --vla-handoff-duration-s 60 \
+  --backend-request-timeout-s 180 \
+  --max-turns 32 \
+  --no-dry-run
+```
+
+For the first end-to-end runs, leave object confirmation enabled; `--no-object-confirmation` is intentionally omitted. A successful fetch follows this sequence:
+
+```text
+navigate -> detect/confirm -> focus -> approach -> VLA release detected
+-> freeze policy -> verify right-wrist burst -> NAV_STOW -> return to saved dock/start pose
+```
+
+If basket verification is negative, uncertain, unavailable, or below `0.8` confidence, the arms remain at the release pose and the agent does not return home. Use the physical e-stop whenever needed. The HomeTaskAgent `/api/stop` endpoint also cancels the active exploration task and forwards `/stop` to robot brain, but it remains a software stop rather than an emergency-stop replacement.
 
 ## Preflight Checklist
 

@@ -33,6 +33,29 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-url", default=None)
     parser.add_argument("--api-key", default=None)
     parser.add_argument("--exploration-backend-url", default=None)
+    parser.add_argument("--robot-brain-url", default=None)
+    parser.add_argument(
+        "--vla-handoff",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Allow grab_object to call the robot brain's on-demand VLA endpoint.",
+    )
+    parser.add_argument("--vla-handoff-duration-s", type=float, default=None)
+    parser.add_argument(
+        "--basket-verifier-provider",
+        choices=("openai", "openai-compatible", "litellm", "ollama"),
+        default=None,
+    )
+    parser.add_argument("--basket-verifier-model", default=None)
+    parser.add_argument("--basket-verifier-base-url", default=None)
+    parser.add_argument("--basket-verifier-api-key", default=None)
+    parser.add_argument("--basket-verification-manifest", default=None)
+    parser.add_argument("--basket-verification-minimum-confidence", type=float, default=None)
+    parser.add_argument(
+        "--dry-run",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+    )
     parser.add_argument("--navigation-waypoint-horizon-m", type=float, default=None)
     parser.add_argument("--navigation-auto-rotate-threshold-deg", type=float, default=None)
     parser.add_argument("--backend-request-timeout-s", type=float, default=None)
@@ -88,9 +111,20 @@ def main(argv: list[str] | None = None) -> int:
     print(
         "Exposed tools: resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, "
         "navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, "
-        "focus_detected_object, approach_detected_object, grab_object"
+        "focus_detected_object, approach_detected_object, grab_object, return_to_start, stop_robot"
     )
     print(f"Exploration/Nav2 backend: {config.exploration_backend_url or 'not configured'}")
+    print(f"Robot brain: {config.robot_brain_url or 'not configured'}")
+    print(
+        "VLA handoff: "
+        f"{'enabled' if config.vla_handoff_enabled and not config.dry_run else 'disabled'}"
+    )
+    basket_model = config.basket_verifier_model or config.specialist_model or config.model
+    print(
+        "Basket verifier: "
+        f"{basket_model.provider}/{basket_model.model}, "
+        f"minimum confidence={config.basket_verification_minimum_confidence:g}"
+    )
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
     print(f"Agent artifacts: {config.agent_artifacts_root}")
     print(f"Object detector: {config.object_detector_provider}")
@@ -148,6 +182,25 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             base_url=args.specialist_base_url,
             api_key=args.specialist_api_key,
         )
+    basket_verifier = config.basket_verifier_model
+    if args.basket_verifier_provider or args.basket_verifier_model:
+        fallback = basket_verifier or specialist or model
+        basket_verifier = HomeAgentModelConfig(
+            provider=args.basket_verifier_provider or fallback.provider,
+            model=args.basket_verifier_model or fallback.model,
+            base_url=(
+                args.basket_verifier_base_url
+                if args.basket_verifier_base_url is not None
+                else fallback.base_url
+            ),
+            api_key=(
+                args.basket_verifier_api_key
+                if args.basket_verifier_api_key is not None
+                else fallback.api_key
+            ),
+            temperature=0.0,
+            max_tokens=300,
+        )
     return replace(
         config,
         home_memory_path=args.home_memory_path or config.home_memory_path,
@@ -162,6 +215,33 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             if args.exploration_backend_url is not None
             else config.exploration_backend_url
         ),
+        robot_brain_url=(
+            args.robot_brain_url
+            if args.robot_brain_url is not None
+            else config.robot_brain_url
+        ),
+        vla_handoff_enabled=(
+            args.vla_handoff
+            if args.vla_handoff is not None
+            else config.vla_handoff_enabled
+        ),
+        vla_handoff_duration_s=(
+            args.vla_handoff_duration_s
+            if args.vla_handoff_duration_s is not None
+            else config.vla_handoff_duration_s
+        ),
+        basket_verifier_model=basket_verifier,
+        basket_verification_manifest_path=(
+            args.basket_verification_manifest
+            if args.basket_verification_manifest is not None
+            else config.basket_verification_manifest_path
+        ),
+        basket_verification_minimum_confidence=(
+            args.basket_verification_minimum_confidence
+            if args.basket_verification_minimum_confidence is not None
+            else config.basket_verification_minimum_confidence
+        ),
+        dry_run=args.dry_run if args.dry_run is not None else config.dry_run,
         navigation_waypoint_horizon_m=(
             args.navigation_waypoint_horizon_m
             if args.navigation_waypoint_horizon_m is not None

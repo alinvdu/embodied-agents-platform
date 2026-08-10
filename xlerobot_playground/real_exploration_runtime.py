@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import builtins
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from collections.abc import Iterator
 from typing import Any, Sequence
@@ -32,6 +32,7 @@ class RealXLeRobotRuntimeConfig:
     max_angular_rad_s: float = 0.50
     debug_motion: bool = False
     calibration_prompt_response: str | None = ""
+    cameras: dict[str, Any] = field(default_factory=dict)
 
 
 class RealXLeRobotDirectRuntime:
@@ -72,7 +73,7 @@ class RealXLeRobotDirectRuntime:
                 config_cls(
                     port1=self.config.port1,
                     port2=self.config.port2,
-                    cameras={},
+                    cameras=self.config.cameras,
                     use_degrees=self.config.use_degrees,
                 )
             )

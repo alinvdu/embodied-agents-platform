@@ -3358,6 +3358,89 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertEqual(result["tool"], "grab_object")
         self.assertIn("future VLA", result["reason"])
 
+    def test_runtime_return_to_start_uses_saved_dock_pose(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        runtime.current_pose = {"x": 2.0, "y": 1.0, "yaw": 0.0}
+        runtime._verified_item_in_basket = True
+
+        def fake_urlopen(request, timeout=0):
+            if request.full_url.endswith("/api/state"):
+                return FakeHTTPResponse({"current_map": {"robot_pose": dict(runtime.current_pose)}})
+            if request.full_url.endswith("/api/nav/waypoint"):
+                body = json.loads(request.data.decode("utf-8"))
+                self.assertEqual(body["pose"], {"x": 0.0, "y": 0.0, "yaw": 0.0})
+                return FakeHTTPResponse(
+                    {
+                        "status": "succeeded",
+                        "reason": "dock reached",
+                        "nav2_result": {
+                            "status": "succeeded",
+                            "reason": "dock reached",
+                            "reached_pose": body["pose"],
+                        },
+                        "map": {"robot_pose": body["pose"]},
+                    }
+                )
+            raise AssertionError(request.full_url)
+
+        with patch("xlerobot_agent.home_agent.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = runtime.return_to_start(constraints={"allow_auto_rotate": False})
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(result["handoff_ready"])
+        self.assertEqual(result["start_name"], "dock")
+        self.assertEqual(runtime.current_pose, {"x": 0.0, "y": 0.0, "yaw": 0.0})
+
+    def test_runtime_return_to_start_rejects_default_map_origin(self) -> None:
+        memory = sample_memory()
+        memory["start_pose"]["source"] = "default_map_origin"
+        runtime = HomeAgentToolRuntime(
+            memory=memory,
+            config=HomeAgentConfig(exploration_backend_url="http://explore.local"),
+            emit=lambda *_args, **_kwargs: None,
+        )
+
+        result = runtime.return_to_start()
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertIn("operator-approved", result["reason"])
+
+    def test_runtime_stop_propagates_to_navigation_and_robot_brain(self) -> None:
+        runtime = HomeAgentToolRuntime(
+            memory=sample_memory(),
+            config=HomeAgentConfig(),
+            emit=lambda *_args, **_kwargs: None,
+        )
+        stops = {
+            "navigation": {"status": "aborted"},
+            "robot_brain": {"succeeded": True, "message": "stopped"},
+        }
+        with patch("xlerobot_agent.home_agent._request_motion_stop", return_value=stops) as stop:
+            result = runtime.stop_robot(reason="test")
+
+        self.assertEqual(result["status"], "succeeded")
+        self.assertTrue(runtime.stopped)
+        stop.assert_called_once_with(runtime.config)
+
+    def test_controller_stop_dispatches_physical_stop(self) -> None:
+        config = HomeAgentConfig()
+        controller = HomeAgentController.from_config(config)
+        stops = {
+            "navigation": {"status": "aborted"},
+            "robot_brain": {"succeeded": True, "message": "stopped"},
+        }
+        with patch("xlerobot_agent.home_agent._request_motion_stop", return_value=stops) as stop:
+            result = controller.stop()
+
+        self.assertEqual(result["status"], "stopping")
+        self.assertEqual(result["robot_brain_stop"], stops["robot_brain"])
+        self.assertEqual(controller.snapshot()["status"], "stopped")
+        stop.assert_called_once_with(config)
+
     def test_runtime_execute_region_exploration_plan_skips_capture_when_alignment_fails(self) -> None:
         runtime = HomeAgentToolRuntime(
             memory=visual_sweep_memory(),
@@ -3633,6 +3716,9 @@ class HomeTaskAgentTests(unittest.TestCase):
         self.assertIn("focus_detected_object", instructions)
         self.assertIn("approach_detected_object", instructions)
         self.assertIn("grab_object", instructions)
+        self.assertIn("return_to_start", instructions)
+        self.assertIn("stop_robot", instructions)
+        self.assertIn("vision verification", instructions)
         self.assertIn("saves RGB debug shots", instructions)
         self.assertIn("RGB-D", instructions)
         self.assertIn("Nav2 can sometimes fail to find paths", instructions)

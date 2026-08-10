@@ -93,6 +93,12 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertEqual(config.base_angular_action_sign, 1.0)
         self.assertEqual(config.left_wheel_motor, "base_left_wheel")
         self.assertEqual(config.right_wheel_motor, "base_right_wheel")
+        self.assertEqual(config.cameras, {})
+        self.assertIsNone(config.vla_policy_path)
+        self.assertEqual(config.vla_action_steps, 50)
+        self.assertEqual(config.vla_release_open_threshold, 30.0)
+        self.assertEqual(config.vla_release_closed_threshold, 10.0)
+        self.assertEqual(config.vla_release_capture_count, 4)
 
     def test_parser_accepts_debug_motion(self) -> None:
         args = build_parser().parse_args(["--debug-motion"])
@@ -118,6 +124,23 @@ class RobotBrainAgentTests(unittest.TestCase):
 
         self.assertIsNone(config.calibration_prompt_response)
 
+    def test_parser_configures_on_demand_vla_without_starting_it(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--vla-policy-path",
+                "outputs/train/model",
+                "--vla-duration-s",
+                "75",
+                "--vla-action-steps",
+                "50",
+            ]
+        )
+        config = config_from_args(args)
+
+        self.assertEqual(config.vla_policy_path, Path("outputs/train/model").resolve())
+        self.assertEqual(config.vla_duration_s, 75.0)
+        self.assertEqual(config.vla_action_steps, 50)
+
     def test_agent_forwards_velocity_to_runtime(self) -> None:
         runtime = FakeRuntime()
         agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=runtime)
@@ -127,6 +150,13 @@ class RobotBrainAgentTests(unittest.TestCase):
         self.assertTrue(response["succeeded"])
         self.assertEqual(runtime.velocity_calls, [(0.02, 0.08)])
         self.assertEqual(response["metadata"], {"sent": True})
+
+    def test_agent_reports_vla_not_configured_by_default(self) -> None:
+        agent = RobotBrainAgent(RobotBrainAgentConfig(), runtime=FakeRuntime())
+
+        self.assertEqual(agent.vla_status()["phase"], "disabled")
+        self.assertEqual(agent.run_vla()["status"], "not_configured")
+        self.assertEqual(agent.stow_after_vla()["status"], "not_configured")
 
     def test_agent_can_flip_base_angular_action_sign(self) -> None:
         runtime = FakeRuntime()

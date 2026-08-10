@@ -17,6 +17,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from .basket_verification import BasketOutcomeVerifier, BasketVerificationConfig
 from .home_memory import (
     DEFAULT_DIRECT_NAVIGATION_FALLBACK_MAX_DISTANCE_M,
     DEFAULT_NAVIGATION_CLEARANCE_M,
@@ -39,6 +40,14 @@ from .perception_service import execute_perception_tool
 
 EventSink = Callable[[str, str, str, dict[str, Any] | None], None]
 ObjectDetectionConfirmation = Callable[[dict[str, Any]], dict[str, Any]]
+
+_DEFAULT_BASKET_VERIFICATION_MANIFEST = (
+    Path(__file__).resolve().parents[1]
+    / "config"
+    / "basket_verification"
+    / "small_cherry_juice_bottle_v0"
+    / "reference_set.json"
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +75,15 @@ class HomeAgentConfig:
     port: int = 8765
     max_turns: int = 18
     exploration_backend_url: str | None = "http://127.0.0.1:8770"
+    robot_brain_url: str | None = "http://127.0.0.1:8765"
+    vla_handoff_enabled: bool = False
+    vla_handoff_duration_s: float = 60.0
+    basket_verifier_model: HomeAgentModelConfig | None = None
+    basket_verification_manifest_path: str = str(_DEFAULT_BASKET_VERIFICATION_MANIFEST)
+    basket_verification_minimum_confidence: float = 0.8
+    basket_verification_max_positive_examples: int = 10
+    basket_verification_max_image_edge_px: int = 1024
+    basket_verification_jpeg_quality: int = 85
     navigation_waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M
     navigation_auto_rotate_threshold_deg: float = 45.0
     backend_request_timeout_s: float = 120.0
@@ -140,6 +158,7 @@ class HomeAgentToolRuntime:
         emit: EventSink,
         run_id: str | None = None,
         confirm_object_detection: ObjectDetectionConfirmation | None = None,
+        basket_verifier: BasketOutcomeVerifier | None = None,
     ) -> None:
         self.memory = memory or {}
         self.config = config
@@ -151,6 +170,9 @@ class HomeAgentToolRuntime:
         self.selected_detection_id: str | None = None
         self.object_approach_state: dict[str, dict[str, Any]] = {}
         self.confirm_object_detection = confirm_object_detection
+        self._basket_verifier_override = basket_verifier
+        self._basket_verifier_instance: BasketOutcomeVerifier | None = None
+        self._verified_item_in_basket = False
 
     def preview_path_to_pose(
         self,
@@ -2184,6 +2206,101 @@ class HomeAgentToolRuntime:
         constraints: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         state = self._resolve_detection_state(detection_id=detection_id, object_label=object_label)
+        if self.config.vla_handoff_enabled and not self.config.dry_run:
+            handoff_constraints = constraints or {}
+            payload: dict[str, Any] = {
+                "duration_s": _bounded_float(
+                    handoff_constraints.get("duration_s", self.config.vla_handoff_duration_s),
+                    self.config.vla_handoff_duration_s,
+                    minimum=1.0,
+                    maximum=180.0,
+                ),
+            }
+            if handoff_constraints.get("task"):
+                payload["task"] = str(handoff_constraints["task"])
+            response = _post_robot_brain(
+                self.config,
+                "/vla/run",
+                payload,
+            )
+            response = dict(response)
+            runtime_images = response.pop("release_wrist_images", [])
+            runtime_images = list(runtime_images) if isinstance(runtime_images, list) else []
+            handoff_status = str(response.get("status") or "failed")
+            common_result = {
+                "tool": "grab_object",
+                **response,
+                "object_label": object_label,
+                "detection_id": state.get("detection_id") or detection_id or self.selected_detection_id,
+                "object_description": object_description,
+                "constraints": handoff_constraints,
+                "detection_state": state or None,
+            }
+            if handoff_status != "release_detected":
+                result_status = "failed" if handoff_status == "succeeded" else handoff_status
+                result = {
+                    **common_result,
+                    "status": result_status,
+                    "reason": (
+                        "Robot brain reported rollout completion without release evidence; task success "
+                        "cannot be inferred from duration alone."
+                        if handoff_status == "succeeded"
+                        else common_result.get("reason")
+                    ),
+                }
+                self.emit(
+                    "tool_blocked",
+                    "VLA Grab Object",
+                    str(result.get("reason") or f"VLA handoff finished with status {handoff_status}."),
+                    result,
+                )
+                return result
+
+            evidence_paths = self._persist_basket_release_images(runtime_images)
+            verification = self._verify_basket_release(runtime_images)
+            verification_status = str(verification.get("status") or "unavailable")
+            if verification_status != "succeeded":
+                result = {
+                    **common_result,
+                    "status": verification_status,
+                    "reason": (
+                        "The VLA release was detected, but basket verification did not approve the outcome: "
+                        f"{verification.get('reason') or verification_status}. The arms remain at the release pose."
+                    ),
+                    "basket_verification": verification,
+                    "release_evidence_paths": evidence_paths,
+                    "stow": {
+                        "status": "skipped",
+                        "reason": "NAV_STOW is allowed only after successful basket verification.",
+                    },
+                }
+                self.emit("tool_blocked", "Basket Verification", result["reason"], result)
+                return result
+
+            stow = _post_robot_brain(self.config, "/vla/stow", {})
+            stow_status = str(stow.get("status") or "failed")
+            status = "succeeded" if stow_status == "succeeded" else "failed"
+            result = {
+                **common_result,
+                "status": status,
+                "reason": (
+                    "The bottle was verified inside the basket and both arms returned to NAV_STOW."
+                    if status == "succeeded"
+                    else "Basket placement was verified, but the arms did not return safely to NAV_STOW."
+                ),
+                "basket_verification": verification,
+                "release_evidence_paths": evidence_paths,
+                "stow": stow,
+            }
+            if status == "succeeded":
+                self._verified_item_in_basket = True
+            self.emit(
+                "tool_executed" if status == "succeeded" else "tool_blocked",
+                "VLA Grab Object",
+                str(result.get("reason") or f"VLA handoff finished with status {status}."),
+                result,
+            )
+            return result
         result = {
             "tool": "grab_object",
             "status": "mock_succeeded",
@@ -2195,6 +2312,135 @@ class HomeAgentToolRuntime:
             "reason": "Mock grab_object completed. This is the future VLA skill entrypoint.",
         }
         self.emit("tool_executed", "Grab Object Mock", result["reason"], result)
+        return result
+
+    def _verify_basket_release(self, runtime_images: list[Any]) -> dict[str, Any]:
+        if not runtime_images:
+            return {
+                "status": "unavailable",
+                "approved": False,
+                "reason": "Robot brain returned no right-wrist release images.",
+                "runtime_image_count": 0,
+            }
+        try:
+            verifier = self._basket_verifier()
+            return verifier.verify(runtime_images).to_dict()
+        except Exception as exc:
+            return {
+                "status": "unavailable",
+                "approved": False,
+                "reason": f"Basket verifier could not run: {exc}",
+                "runtime_image_count": len(runtime_images),
+            }
+
+    def _basket_verifier(self) -> BasketOutcomeVerifier:
+        if self._basket_verifier_override is not None:
+            return self._basket_verifier_override
+        if self._basket_verifier_instance is not None:
+            return self._basket_verifier_instance
+        model = self.config.basket_verifier_model or self.config.specialist_model or self.config.model
+        if model.provider == "mock":
+            raise RuntimeError("configure a vision-capable basket verifier model on the offload computer")
+        model_config = _llm_model_config(
+            replace(model, temperature=0.0, max_tokens=min(max(model.max_tokens, 1), 300))
+        )
+        router = AgentLLMRouter(
+            AgentModelSuite(planner=model_config, critic=model_config, coder=model_config)
+        )
+        self._basket_verifier_instance = BasketOutcomeVerifier(
+            llm_router=router,
+            model_config=model_config,
+            config=BasketVerificationConfig(
+                manifest_path=Path(self.config.basket_verification_manifest_path).expanduser().resolve(),
+                minimum_confidence=self.config.basket_verification_minimum_confidence,
+                max_positive_examples=self.config.basket_verification_max_positive_examples,
+                max_image_edge_px=self.config.basket_verification_max_image_edge_px,
+                jpeg_quality=self.config.basket_verification_jpeg_quality,
+            ),
+        )
+        return self._basket_verifier_instance
+
+    def _persist_basket_release_images(self, runtime_images: list[Any]) -> list[str]:
+        output_dir = (
+            Path(self.config.agent_artifacts_root).expanduser()
+            / self.run_id
+            / "basket_verification"
+        )
+        saved: list[str] = []
+        try:
+            output_dir.mkdir(parents=True, exist_ok=True)
+            for index, image in enumerate(runtime_images, start=1):
+                if not isinstance(image, str) or not image.startswith("data:image/"):
+                    continue
+                header, separator, encoded = image.partition(",")
+                if not separator or ";base64" not in header:
+                    continue
+                extension = ".png" if "image/png" in header else ".jpg"
+                path = output_dir / f"release_{index:02d}{extension}"
+                path.write_bytes(base64.b64decode(encoded))
+                saved.append(str(path.resolve()))
+        except Exception as exc:
+            self.emit(
+                "artifact_write_failed",
+                "Basket Evidence",
+                f"Could not persist basket-verification images: {exc}",
+                {},
+            )
+        return saved
+
+    def return_to_start(self, *, constraints: dict[str, Any] | None = None) -> dict[str, Any]:
+        constraints = constraints or {}
+        start = self.memory.get("start_pose") if isinstance(self.memory, dict) else None
+        pose = start.get("pose") if isinstance(start, dict) and isinstance(start.get("pose"), dict) else None
+        if not isinstance(pose, dict) or "x" not in pose or "y" not in pose:
+            result = {
+                "tool": "return_to_start",
+                "status": "blocked",
+                "reason": "Home memory does not contain a usable dock/start pose.",
+            }
+            self.emit("tool_blocked", "Return To Start", result["reason"], result)
+            return result
+        if str(start.get("source") or "") == "default_map_origin":
+            result = {
+                "tool": "return_to_start",
+                "status": "blocked",
+                "reason": "The start pose is only the default map origin, not an operator-approved dock pose.",
+            }
+            self.emit("tool_blocked", "Return To Start", result["reason"], result)
+            return result
+
+        target = _json_pose(pose)
+        name = str(start.get("name") or "start")
+        waypoint_name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "start"
+        navigation = self.navigate_to_waypoint(
+            waypoint_id=f"return_to_{waypoint_name}",
+            x=target["x"],
+            y=target["y"],
+            yaw=target["yaw"],
+            constraints=constraints,
+        )
+        status = "succeeded" if navigation.get("status") == "succeeded" else "blocked"
+        result = {
+            "tool": "return_to_start",
+            "status": status,
+            "reason": (
+                f"Robot returned to `{name}`; the verified item is ready in the basket."
+                if status == "succeeded" and self._verified_item_in_basket
+                else f"Robot returned to `{name}`."
+                if status == "succeeded"
+                else f"Robot could not return to `{name}`: {navigation.get('reason') or navigation.get('status')}."
+            ),
+            "start_name": name,
+            "start_pose": target,
+            "navigation": navigation,
+            "handoff_ready": status == "succeeded" and self._verified_item_in_basket,
+        }
+        self.emit(
+            "tool_executed" if status == "succeeded" else "tool_blocked",
+            "Return To Start",
+            result["reason"],
+            result,
+        )
         return result
 
     def _capture_rgb_for_object_tool(self, *, tool_name: str, object_label: str, attempt_index: int) -> dict[str, Any]:
@@ -2973,12 +3219,29 @@ class HomeAgentToolRuntime:
 
     def stop_robot(self, *, reason: str = "") -> dict[str, Any]:
         self.stopped = True
+        stops = _request_motion_stop(self.config)
+        robot_brain = stops["robot_brain"]
+        physically_stopped = bool(robot_brain.get("succeeded")) or robot_brain.get("status") in {
+            "succeeded",
+            "stopped",
+        }
         result = {
             "tool": "stop_robot",
-            "status": "accepted",
+            "status": "succeeded" if physically_stopped else "failed",
             "reason": reason or "operator_or_agent_requested_stop",
+            "navigation_stop": stops["navigation"],
+            "robot_brain_stop": robot_brain,
         }
-        self.emit("tool_executed", "Stop", "Stop request accepted by the home agent runtime.", result)
+        self.emit(
+            "tool_executed" if physically_stopped else "tool_blocked",
+            "Stop",
+            (
+                "Navigation cancellation was requested and robot brain acknowledged the software motion stop."
+                if physically_stopped
+                else "The stop request did not receive confirmation from robot brain; use the physical e-stop."
+            ),
+            result,
+        )
         return result
 
     def _initial_pose(self) -> dict[str, Any]:
@@ -3082,9 +3345,9 @@ class HomeTaskAgent:
             self.emit("agent_blocked", "Missing Memory", record.summary, {})
             return
         if "stop" in command.lower():
-            record.status = "blocked"
-            record.summary = "Only region navigation resolution is exposed in this phase."
-            self.emit("agent_blocked", "Tool Not Exposed", record.summary, {"requested": "stop_robot"})
+            result = runtime.stop_robot(reason="Operator requested stop through HomeTaskAgent.")
+            record.status = "completed" if result.get("status") == "succeeded" else "failed"
+            record.summary = str(result.get("reason") or "Stop request dispatched.")
             return
 
         target = self._target_from_command(command, memory)
@@ -3252,7 +3515,7 @@ class HomeTaskAgent:
 
         @function_tool
         def grab_object(object_label: str, detection_id: str = "", object_description: str = "", constraints_json: str = "{}") -> str:
-            """Mock VLA grasp entrypoint for a focused object at grasp staging range."""
+            """Run the configured VLA grasp handoff for an object at grasp staging range."""
             return tool_result(
                 "grab_object",
                 runtime.grab_object(
@@ -3262,6 +3525,19 @@ class HomeTaskAgent:
                     constraints=_loads_object(constraints_json),
                 ),
             )
+
+        @function_tool
+        def return_to_start(constraints_json: str = "{}") -> str:
+            """Return to the operator-approved dock/start pose with the verified item in the basket."""
+            return tool_result(
+                "return_to_start",
+                runtime.return_to_start(constraints=_loads_object(constraints_json)),
+            )
+
+        @function_tool
+        def stop_robot(reason: str = "") -> str:
+            """Immediately cancel navigation and send the software motion stop to robot brain."""
+            return tool_result("stop_robot", runtime.stop_robot(reason=reason))
 
         agent = Agent(
             name="NavigationAgent",
@@ -3280,6 +3556,8 @@ class HomeTaskAgent:
                 focus_detected_object,
                 approach_detected_object,
                 grab_object,
+                return_to_start,
+                stop_robot,
             ],
         )
         result = Runner.run_sync(agent, command, max_turns=self.config.max_turns)
@@ -3292,7 +3570,7 @@ class HomeTaskAgent:
                 "You are Robot42's HomeTaskAgent.",
                 "For navigation commands, act as the NavigationAgent delegated by HomeTaskAgent.",
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
-                "Available tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, focus_detected_object, approach_detected_object, and grab_object.",
+                "Available tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, focus_detected_object, approach_detected_object, grab_object, return_to_start, and stop_robot.",
                 "Navigation model:",
                 "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
                 f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
@@ -3315,9 +3593,12 @@ class HomeTaskAgent:
                 "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. When the object reaches the configured staging band, it performs one fresh detector pass and at most one rotation-only final bbox-centering nudge before returning success. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Once approach_detected_object has been called for an object, stay in visual/RGB-D approach mode. Do not call relocalize_here between approach attempts; stale ROS camera/head state can make final approach worse. If approach returns partial after useful motion and the object was still detected, retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false, \"reset_head_pan_before_approach\": true}' so the retry refreshes the camera-forward detection and checks reachability without repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
-                "- grab_object is mocked for now; it is the future VLA skill entrypoint and should only be called after focus and approach succeed. If it returns mock_succeeded, report that the mock VLA handoff succeeded, not that a real physical pickup happened.",
+                "- grab_object is the VLA skill entrypoint and should only be called after focus and approach succeed. It succeeds only after the second gripper opening, vision verification that the bottle is released inside the basket, and a successful NAV_STOW motion. In dry-run or when VLA handoff is disabled it returns mock_succeeded; do not report that as a real physical pickup.",
+                "- For bring/fetch requests, after grab_object returns status='succeeded', call return_to_start. Only after return_to_start succeeds should you tell the user that the item is ready in the basket.",
+                "- If grab_object returns failed, uncertain, unavailable, timed_out, cancelled, or blocked, do not return home automatically and do not claim the object was collected.",
+                "- If the user asks to stop, call stop_robot immediately and do not call any other tool afterward.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
-                "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate using resolve_navigation_to_region with navigation_purpose='object_search' before any execute_region_exploration_plan call. Once near the returned search-entry goal, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
+                "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate using resolve_navigation_to_region with navigation_purpose='object_search' before any execute_region_exploration_plan call. Once near the returned search-entry goal, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. For bring/fetch wording, call return_to_start after verified grab success. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
                 f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
@@ -3325,7 +3606,7 @@ class HomeTaskAgent:
                 "If navigation succeeds and next_waypoint.is_final_waypoint is false, call resolve_navigation_to_region again from the updated pose and repeat.",
                 "If navigation fails, inspect reason, pre_nav_auto_rotation, direct_fallback_plan, local_clearance_recovery, fallback_navigation, nav2.nav2_logs, distance_remaining_m, actual_pose_delta_m, estimated_feedback_path_m, and current_pose.",
                 "If the target is within 0.5m and only a small final correction remains, use micro_adjust_to_pose.",
-                "Do not call or describe unrelated perception, skill execution, approval, or stop tools; they are intentionally not exposed yet.",
+                "Do not call or describe unrelated perception, skill execution, or approval tools; they are intentionally not exposed yet.",
                 "Do not infer a navigation target yourself from a region shape.",
                 "Return a concise final summary of the navigation status, final/current pose, and any relocalization correction.",
                 "",
@@ -3341,6 +3622,7 @@ class HomeTaskAgent:
                 "Example far object-search request: for `navigate to kitchen, recognize the small yellow bottle, and move into grabbing position`, do not start with execute_region_exploration_plan if the kitchen is far. First call resolve_navigation_to_region(target_label='kitchen', constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"small yellow bottle\"}'), then navigate_to_waypoint and relocalize_here in the normal loop. After the final search-entry waypoint succeeds and relocalize_here has run, call execute_region_exploration_plan(region_label='kitchen', object_label='small yellow bottle').",
                 "Example nearby object-search request: if the robot is already beside the TV area and the target region is local, execute_region_exploration_plan(region_label='TV Area', object_label='small yellow bottle', constraints_json='{\"max_stops\": 2, \"shots_per_stop\": 2}') is appropriate.",
                 "Example object-grab flow after reaching the region: execute_region_exploration_plan(region_label='kitchen', object_label='coke can'), then focus_detected_object(detection_id=selected_detection_id, object_label='coke can'), then approach_detected_object(detection_id=selected_detection_id, object_label='coke can'), then grab_object(object_label='coke can', detection_id=selected_detection_id, object_description='detected coke can').",
+                "Example fetch completion: after the verified grab_object call succeeds, call return_to_start(constraints_json='{}'), then report that the item is ready only if that return succeeds.",
                 "Bad example: do not respond to a far kitchen search by repeatedly using execute_region_exploration_plan, micro_adjust_to_pose, or local_clearance_recovery as the primary route. Those are local search/recovery tools; long travel must go through navigate_to_waypoint/Nav2 and relocalize_here.",
                 "",
                 "Long-term home memory context:",
@@ -3485,7 +3767,7 @@ class HomeAgentController:
             self._paused = False
             self.emit("resumed", "Resumed", "Resume requested.", {})
 
-    def stop(self) -> None:
+    def stop(self) -> dict[str, Any]:
         with self._confirmation_condition:
             self._status = "stopped"
             self.emit("stop_requested", "Stop Requested", "Operator requested stop.", {})
@@ -3496,6 +3778,19 @@ class HomeAgentController:
                     "reason": "Operator stopped the run while object confirmation was pending.",
                 }
                 self._confirmation_condition.notify_all()
+        stops = _request_motion_stop(self.config)
+        result = {
+            "status": "stopping",
+            "navigation_stop": stops["navigation"],
+            "robot_brain_stop": stops["robot_brain"],
+        }
+        self.emit(
+            "stop_dispatched",
+            "Physical Stop Dispatched",
+            "Sent cancellation to navigation and the software motion stop to robot brain.",
+            result,
+        )
+        return result
 
     def emit(self, kind: str, title: str, summary: str, details: dict[str, Any] | None = None) -> None:
         event = {
@@ -3520,6 +3815,11 @@ class HomeAgentController:
                 "models": {
                     "main": self.config.model.__dict__,
                     "specialist": self.config.specialist_model.__dict__ if self.config.specialist_model else None,
+                    "basket_verifier": (
+                        self.config.basket_verifier_model.__dict__
+                        if self.config.basket_verifier_model
+                        else None
+                    ),
                 },
                 "home_memory": {
                     "path": str(memory_path) if memory_path is not None else self.config.home_memory_path,
@@ -3720,8 +4020,7 @@ class HomeAgentServer:
                     self._send_json({"status": "running"})
                     return
                 if self.path == "/api/stop":
-                    controller.stop()
-                    self._send_json({"status": "stopping"})
+                    self._send_json(controller.stop())
                     return
                 if self.path == "/api/object-confirmation/respond":
                     decision = str(payload.get("decision") or payload.get("status") or "").strip().lower()
@@ -3806,6 +4105,21 @@ def config_from_env() -> HomeAgentConfig:
             base_url=os.getenv("ROBOT42_SPECIALIST_BASE_URL"),
             api_key=os.getenv("ROBOT42_SPECIALIST_API_KEY"),
         )
+    basket_verifier_model_name = os.getenv("ROBOT42_BASKET_VERIFIER_MODEL")
+    basket_verifier = None
+    if basket_verifier_model_name:
+        basket_verifier = HomeAgentModelConfig(
+            provider=os.getenv("ROBOT42_BASKET_VERIFIER_PROVIDER", provider),
+            model=basket_verifier_model_name,
+            base_url=os.getenv("ROBOT42_BASKET_VERIFIER_BASE_URL") or os.getenv("ROBOT42_AGENT_BASE_URL"),
+            api_key=(
+                os.getenv("ROBOT42_BASKET_VERIFIER_API_KEY")
+                or os.getenv("ROBOT42_AGENT_API_KEY")
+                or os.getenv("OPENAI_API_KEY")
+            ),
+            temperature=0.0,
+            max_tokens=300,
+        )
     return HomeAgentConfig(
         home_memory_path=os.getenv("ROBOT42_HOME_MEMORY_PATH"),
         home_memory_search_roots=_search_roots_from_env(),
@@ -3827,6 +4141,26 @@ def config_from_env() -> HomeAgentConfig:
         port=int(os.getenv("ROBOT42_AGENT_PORT", "8765")),
         max_turns=int(os.getenv("ROBOT42_AGENT_MAX_TURNS", "18")),
         exploration_backend_url=os.getenv("ROBOT42_EXPLORATION_BACKEND_URL", "http://127.0.0.1:8770"),
+        robot_brain_url=os.getenv("ROBOT42_ROBOT_BRAIN_URL", "http://127.0.0.1:8765"),
+        vla_handoff_enabled=_env_bool("ROBOT42_VLA_HANDOFF_ENABLED", False),
+        vla_handoff_duration_s=float(os.getenv("ROBOT42_VLA_HANDOFF_DURATION_S", "60")),
+        basket_verifier_model=basket_verifier,
+        basket_verification_manifest_path=os.getenv(
+            "ROBOT42_BASKET_VERIFICATION_MANIFEST",
+            str(_DEFAULT_BASKET_VERIFICATION_MANIFEST),
+        ),
+        basket_verification_minimum_confidence=float(
+            os.getenv("ROBOT42_BASKET_VERIFICATION_MINIMUM_CONFIDENCE", "0.8")
+        ),
+        basket_verification_max_positive_examples=int(
+            os.getenv("ROBOT42_BASKET_VERIFICATION_MAX_POSITIVE_EXAMPLES", "10")
+        ),
+        basket_verification_max_image_edge_px=int(
+            os.getenv("ROBOT42_BASKET_VERIFICATION_MAX_IMAGE_EDGE_PX", "1024")
+        ),
+        basket_verification_jpeg_quality=int(
+            os.getenv("ROBOT42_BASKET_VERIFICATION_JPEG_QUALITY", "85")
+        ),
         navigation_waypoint_horizon_m=float(
             os.getenv("ROBOT42_NAVIGATION_WAYPOINT_HORIZON_M", str(DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M))
         ),
@@ -3965,7 +4299,13 @@ def _loads_object(payload: str) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
-def _post_exploration_backend(config: HomeAgentConfig, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+def _post_exploration_backend(
+    config: HomeAgentConfig,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
     base_url = str(config.exploration_backend_url or "").rstrip("/")
     url = f"{base_url}{path}"
     body = json.dumps(payload or {}).encode("utf-8")
@@ -3976,7 +4316,8 @@ def _post_exploration_backend(config: HomeAgentConfig, path: str, payload: dict[
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=max(float(config.backend_request_timeout_s), 1.0)) as response:
+        timeout = config.backend_request_timeout_s if timeout_s is None else timeout_s
+        with urllib.request.urlopen(request, timeout=max(float(timeout), 1.0)) as response:
             raw = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         try:
@@ -4006,6 +4347,70 @@ def _post_exploration_backend(config: HomeAgentConfig, path: str, payload: dict[
             "_backend_url": url,
         }
     return parsed if isinstance(parsed, dict) else {"status": "failed", "reason": "Exploration backend response was not an object."}
+
+
+def _post_robot_brain(
+    config: HomeAgentConfig,
+    path: str,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float | None = None,
+) -> dict[str, Any]:
+    base_url = str(config.robot_brain_url or "").rstrip("/")
+    url = f"{base_url}{path}"
+    body = json.dumps(payload or {}).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    try:
+        timeout = config.backend_request_timeout_s if timeout_s is None else timeout_s
+        with urllib.request.urlopen(request, timeout=max(float(timeout), 1.0)) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            raw_error = exc.read().decode("utf-8")
+        except Exception:
+            raw_error = str(exc)
+        return {
+            "status": "failed",
+            "reason": f"Robot brain returned HTTP {exc.code}: {raw_error[:400]}",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {
+            "status": "unavailable",
+            "reason": f"Robot brain is unavailable at {url}: {exc}",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    try:
+        parsed = json.loads(raw or "{}")
+    except json.JSONDecodeError:
+        return {
+            "status": "failed",
+            "reason": f"Robot brain returned non-JSON response from {url}.",
+            "_transport_error": True,
+            "_backend_url": url,
+        }
+    return parsed if isinstance(parsed, dict) else {"status": "failed", "reason": "Robot brain response was not an object."}
+
+
+def _request_motion_stop(config: HomeAgentConfig) -> dict[str, dict[str, Any]]:
+    navigation = (
+        _post_exploration_backend(config, "/api/task/cancel", {}, timeout_s=5.0)
+        if config.exploration_backend_url
+        else {"status": "unavailable", "reason": "No exploration backend URL is configured."}
+    )
+    robot_brain = (
+        _post_robot_brain(config, "/stop", {}, timeout_s=5.0)
+        if config.robot_brain_url
+        else {"status": "unavailable", "reason": "No robot brain URL is configured."}
+    )
+    return {"navigation": navigation, "robot_brain": robot_brain}
 
 
 def _get_exploration_backend(config: HomeAgentConfig, path: str) -> dict[str, Any]:
@@ -4576,6 +4981,42 @@ def _compact_agent_tool_result(result: dict[str, Any], *, tool_name: str = "") -
 
     if tool == "grab_object":
         _compact_update(compact, result, ("object_description", "constraints"))
+        verification = result.get("basket_verification")
+        if isinstance(verification, dict):
+            compact["basket_verification"] = {
+                key: verification.get(key)
+                for key in (
+                    "status",
+                    "approved",
+                    "bottle_in_basket",
+                    "bottle_released",
+                    "confidence",
+                    "reason",
+                )
+                if verification.get(key) is not None
+            }
+        if isinstance(result.get("stow"), dict):
+            compact["stow"] = _compact_status_reason(result["stow"])
+        compact["next_recommended_tool"] = (
+            "return_to_start" if result.get("status") == "succeeded" else "stop_and_report_manipulation_failure"
+        )
+        return _drop_none(compact)
+
+    if tool == "return_to_start":
+        _compact_update(compact, result, ("start_name", "start_pose", "handoff_ready"))
+        navigation = result.get("navigation") if isinstance(result.get("navigation"), dict) else None
+        if navigation is not None:
+            compact["navigation"] = _compact_status_reason(navigation)
+            if isinstance(navigation.get("current_pose"), dict):
+                compact["current_pose"] = _json_pose(navigation["current_pose"])
+        compact["next_recommended_tool"] = "final_summary"
+        return _drop_none(compact)
+
+    if tool == "stop_robot":
+        if isinstance(result.get("navigation_stop"), dict):
+            compact["navigation_stop"] = _compact_status_reason(result["navigation_stop"])
+        if isinstance(result.get("robot_brain_stop"), dict):
+            compact["robot_brain_stop"] = _compact_status_reason(result["robot_brain_stop"])
         compact["next_recommended_tool"] = "final_summary"
         return _drop_none(compact)
 

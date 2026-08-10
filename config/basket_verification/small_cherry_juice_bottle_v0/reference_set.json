@@ -1,0 +1,28 @@
+{
+  "name": "small_cherry_juice_bottle_v0",
+  "task": "Verify that the small square bottle of cherry juice has been released inside the robot basket.",
+  "object_label": "small square bottle of cherry juice with a white cap and dark red liquid",
+  "destination_label": "white perforated plastic robot basket",
+  "task_context": [
+    {
+      "path": "task_context/task-overview-annotated.jpg",
+      "description": "Annotated wide task overview. The upper blue circle marks the target juice bottle and the lower blue circle marks the destination basket."
+    },
+    {
+      "path": "task_context/bottle-in-basket-closeup-annotated.jpg",
+      "description": "Annotated external close-up showing the target bottle resting inside the destination basket."
+    }
+  ],
+  "positive_examples": [
+    "positive_examples/episode-02_frame-0559.jpg",
+    "positive_examples/episode-07_frame-0523.jpg",
+    "positive_examples/episode-09_frame-0551.jpg",
+    "positive_examples/episode-17_frame-0499.jpg",
+    "positive_examples/episode-20_frame-0653.jpg",
+    "positive_examples/episode-25_frame-0492.jpg",
+    "positive_examples/episode-31_frame-0502.jpg",
+    "positive_examples/episode-36_frame-0489.jpg",
+    "positive_examples/episode-39_frame-0491.jpg",
+    "positive_examples/episode-48_frame-0492.jpg"
+  ]
+}

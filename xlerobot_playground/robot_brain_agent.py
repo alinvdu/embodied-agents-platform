@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
+import os
 from pathlib import Path
 import threading
 import time
@@ -22,6 +23,7 @@ from xlerobot_playground.rgbd_transport import (
     rgb_payload_to_ppm,
     unpack_rgbd_frame,
 )
+from xlerobot_playground.vla_handoff_runtime import VLAHandoffConfig, VLAHandoffRuntime
 
 try:
     from aiohttp import WSMsgType, web
@@ -76,6 +78,30 @@ class RobotBrainAgentConfig:
     camera_pan_settle_s: float = 0.5
     left_wheel_motor: str = "base_left_wheel"
     right_wheel_motor: str = "base_right_wheel"
+    cameras: dict[str, Any] = field(default_factory=dict)
+    vla_policy_path: Path | None = None
+    vla_dataset_repo_id: str = "alindumitru/small-juice-bottle-to-basket-right-arm"
+    vla_dataset_root: Path = Path("datasets/small-juice-bottle-to-basket-right-arm")
+    vla_task: str = "Pick up the small bottle of cherry juice and put it in the robot basket."
+    vla_device: str = "mps"
+    vla_duration_s: float = 60.0
+    vla_max_duration_s: float = 180.0
+    vla_fps: float = 30.0
+    vla_action_steps: int = 50
+    vla_max_joint_delta: float = 50.0
+    vla_max_gripper_delta: float = 50.0
+    vla_camera_max_age_s: float = 1.0
+    vla_startup_pose: bool = True
+    vla_worker_log_path: Path = Path("artifacts/vla_worker/smolvla_handoff.log")
+    vla_hf_datasets_cache: Path | None = None
+    vla_release_open_threshold: float = 30.0
+    vla_release_closed_threshold: float = 10.0
+    vla_release_transition_samples: int = 3
+    vla_release_observed_open_samples: int = 2
+    vla_release_observed_open_timeout_s: float = 2.0
+    vla_release_settle_s: float = 1.0
+    vla_release_capture_count: int = 4
+    vla_release_capture_interval_s: float = 0.25
 
 
 class ImuStreamState:
@@ -354,6 +380,7 @@ class RobotBrainAgent:
             max_angular_rad_s=config.max_angular_rad_s,
             debug_motion=config.debug_motion,
             calibration_prompt_response=config.calibration_prompt_response,
+            cameras=config.cameras,
         )
         self.runtime = runtime or RealXLeRobotDirectRuntime(runtime_config)
         self._motion_lock = threading.Lock()
@@ -373,8 +400,46 @@ class RobotBrainAgent:
         self._camera_motion_axis: str | None = None
         self._camera_motion_started_s: float | None = None
         self._camera_motion_until_s: float | None = None
+        self.vla_handoff: VLAHandoffRuntime | None = None
+        if config.vla_policy_path is not None:
+            self.vla_handoff = VLAHandoffRuntime(
+                config=VLAHandoffConfig(
+                    policy_path=config.vla_policy_path,
+                    dataset_repo_id=config.vla_dataset_repo_id,
+                    dataset_root=config.vla_dataset_root,
+                    task=config.vla_task,
+                    device=config.vla_device,
+                    robot_type=config.robot_kind,
+                    duration_s=config.vla_duration_s,
+                    max_duration_s=config.vla_max_duration_s,
+                    fps=config.vla_fps,
+                    action_steps=config.vla_action_steps,
+                    max_joint_delta=config.vla_max_joint_delta,
+                    max_gripper_delta=config.vla_max_gripper_delta,
+                    startup_pose=config.vla_startup_pose,
+                    worker_log_path=config.vla_worker_log_path,
+                    hf_datasets_cache=config.vla_hf_datasets_cache,
+                    release_open_threshold=config.vla_release_open_threshold,
+                    release_closed_threshold=config.vla_release_closed_threshold,
+                    release_transition_samples=config.vla_release_transition_samples,
+                    release_observed_open_samples=config.vla_release_observed_open_samples,
+                    release_observed_open_timeout_s=config.vla_release_observed_open_timeout_s,
+                    release_settle_s=config.vla_release_settle_s,
+                    release_capture_count=config.vla_release_capture_count,
+                    release_capture_interval_s=config.vla_release_capture_interval_s,
+                ),
+                robot_runtime=self.runtime,
+                motion_lock=self._motion_lock,
+                head_frame_provider=self._latest_vla_head_frame,
+            )
 
     def velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, Any]:
+        if self.vla_handoff is not None and self.vla_handoff.active:
+            return {
+                "succeeded": False,
+                "message": "Base velocity is locked while the VLA handoff is active.",
+                "metadata": {"vla": self.vla_handoff.status()},
+            }
         commanded_angular_rad_s = float(angular_rad_s) * float(self.config.base_angular_action_sign)
         if self.config.debug_motion:
             print(
@@ -396,6 +461,8 @@ class RobotBrainAgent:
         }
 
     def stop(self) -> dict[str, Any]:
+        if self.vla_handoff is not None:
+            self.vla_handoff.cancel()
         if self.config.debug_motion:
             print("[robot_brain_agent] /stop requested", flush=True)
         with self._motion_lock:
@@ -420,6 +487,13 @@ class RobotBrainAgent:
 
     def ingest_rgbd_payload(self, data: bytes) -> PackedRgbdFrame:
         return self.rgbd_stream.publish_payload(data)
+
+    def _latest_vla_head_frame(self) -> PackedRgbdFrame | None:
+        stats = self.rgbd_stream.stats()
+        age_s = stats.get("age_s")
+        if age_s is None or float(age_s) > max(0.0, self.config.vla_camera_max_age_s):
+            return None
+        return self.rgbd_stream.latest_frame
 
     def imu_snapshot(self) -> dict[str, Any] | None:
         return self.imu_stream.latest_sample
@@ -539,6 +613,12 @@ class RobotBrainAgent:
         action_key: str | None = None,
         settle_s: float | None = None,
     ) -> dict[str, Any]:
+        if self.vla_handoff is not None and self.vla_handoff.active:
+            return {
+                "succeeded": False,
+                "message": "Camera motion is locked while the VLA handoff is active.",
+                "metadata": {"vla": self.vla_handoff.status()},
+            }
         if not self.config.allow_motion_commands:
             return {
                 "succeeded": False,
@@ -603,6 +683,12 @@ class RobotBrainAgent:
         action_key: str | None = None,
         settle_s: float | None = None,
     ) -> dict[str, Any]:
+        if self.vla_handoff is not None and self.vla_handoff.active:
+            return {
+                "succeeded": False,
+                "message": "Camera motion is locked while the VLA handoff is active.",
+                "metadata": {"vla": self.vla_handoff.status()},
+            }
         if not self.config.allow_motion_commands:
             return {
                 "succeeded": False,
@@ -693,11 +779,44 @@ class RobotBrainAgent:
         return -1.0 if float(value) < 0.0 else 1.0
 
     def close(self) -> None:
+        if self.vla_handoff is not None:
+            self.vla_handoff.close()
         with self._motion_lock:
             try:
                 self.runtime.stop()
             finally:
                 self.runtime.close()
+
+    def run_vla(self, *, duration_s: float | None = None, task: str | None = None) -> dict[str, Any]:
+        if self.vla_handoff is None:
+            return {
+                "status": "not_configured",
+                "reason": "VLA handoff is disabled. Start robot_brain_agent with --vla-policy-path.",
+            }
+        if not self.config.allow_motion_commands:
+            return {
+                "status": "blocked",
+                "reason": "VLA motion is disabled. Start robot_brain_agent with --allow-motion-commands.",
+            }
+        return self.vla_handoff.run(duration_s=duration_s, task=task)
+
+    def stow_after_vla(self) -> dict[str, Any]:
+        if self.vla_handoff is None:
+            return {
+                "status": "not_configured",
+                "reason": "VLA handoff is disabled. Start robot_brain_agent with --vla-policy-path.",
+            }
+        if not self.config.allow_motion_commands:
+            return {
+                "status": "blocked",
+                "reason": "Arm motion is disabled. Start robot_brain_agent with --allow-motion-commands.",
+            }
+        return self.vla_handoff.stow()
+
+    def vla_status(self) -> dict[str, Any]:
+        if self.vla_handoff is None:
+            return {"enabled": False, "active": False, "phase": "disabled"}
+        return self.vla_handoff.status()
 
     def file_path(self, route: str) -> Path | None:
         if route == "/rgb":
@@ -775,6 +894,7 @@ async def _handle_health(_request: web.Request) -> web.Response:
             "wheel_state": agent.wheel_state_stream.stats(),
             "rgbd": agent.rgbd_stream.stats(),
             "camera": agent.camera_state(),
+            "vla": agent.vla_status(),
         }
     )
 
@@ -916,6 +1036,36 @@ async def _handle_stop(request: web.Request) -> web.Response:
             pass
     response = await asyncio.to_thread(agent.stop)
     return web.json_response(response)
+
+
+async def _handle_vla_status(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    return web.json_response(agent.vla_status())
+
+
+async def _handle_vla_run(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    raw = await request.read() if request.can_read_body else b""
+    payload = json.loads(raw.decode("utf-8")) if raw else {}
+    response = await asyncio.to_thread(
+        agent.run_vla,
+        duration_s=payload.get("duration_s"),
+        task=payload.get("task"),
+    )
+    status = 409 if response.get("status") == "busy" else 200
+    return web.json_response(response, status=status)
+
+
+async def _handle_vla_stow(request: web.Request) -> web.Response:
+    agent: RobotBrainAgent = request.app["agent"]
+    if request.can_read_body:
+        try:
+            await request.read()
+        except Exception:
+            pass
+    response = await asyncio.to_thread(agent.stow_after_vla)
+    status = 409 if response.get("status") == "busy" else 200
+    return web.json_response(response, status=status)
 
 
 async def _imu_sender(agent: RobotBrainAgent, ws: web.WebSocketResponse, queue: asyncio.Queue[str]) -> None:
@@ -1074,6 +1224,9 @@ def build_app(agent: RobotBrainAgent) -> web.Application:
         app.router.add_get("/ws/wheel_state", _handle_wheel_state_websocket)
     app.router.add_post("/cmd_vel", _handle_cmd_vel)
     app.router.add_post("/stop", _handle_stop)
+    app.router.add_get("/vla/status", _handle_vla_status)
+    app.router.add_post("/vla/run", _handle_vla_run)
+    app.router.add_post("/vla/stow", _handle_vla_stow)
     return app
 
 
@@ -1146,6 +1299,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wheel-state-log-every", type=int, default=500)
     parser.add_argument("--camera-max-frame-bytes", type=int, default=16 * 1024 * 1024)
     parser.add_argument("--camera-log-every", type=int, default=30)
+    parser.add_argument(
+        "--camera",
+        action="append",
+        default=[],
+        metavar="NAME=DRIVER:SOURCE",
+        help="Robot camera config, for example right_wrist=opencv:1.",
+    )
+    parser.add_argument("--camera-width", type=int, default=640)
+    parser.add_argument("--camera-height", type=int, default=480)
+    parser.add_argument("--camera-fps", type=int, default=30)
     parser.add_argument("--initial-camera-pitch-rad", type=float, default=0.0)
     parser.add_argument("--initial-camera-pitch-deg", type=float, default=None)
     parser.add_argument("--initial-camera-pan-rad", type=float, default=0.0)
@@ -1193,10 +1356,59 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-pan-settle-s", type=float, default=0.5)
     parser.add_argument("--left-wheel-motor", default="base_left_wheel")
     parser.add_argument("--right-wheel-motor", default="base_right_wheel")
+    parser.add_argument(
+        "--vla-policy-path",
+        default=None,
+        help="Enable on-demand VLA handoff with this local SmolVLA checkpoint.",
+    )
+    parser.add_argument(
+        "--vla-dataset-repo-id",
+        default="alindumitru/small-juice-bottle-to-basket-right-arm",
+    )
+    parser.add_argument(
+        "--vla-dataset-root",
+        default="datasets/small-juice-bottle-to-basket-right-arm",
+    )
+    parser.add_argument(
+        "--vla-task",
+        default="Pick up the small bottle of cherry juice and put it in the robot basket.",
+    )
+    parser.add_argument("--vla-device", default="mps")
+    parser.add_argument("--vla-duration-s", type=float, default=60.0)
+    parser.add_argument("--vla-max-duration-s", type=float, default=180.0)
+    parser.add_argument("--vla-fps", type=float, default=30.0)
+    parser.add_argument("--vla-action-steps", type=int, default=50)
+    parser.add_argument("--vla-max-joint-delta", type=float, default=50.0)
+    parser.add_argument("--vla-max-gripper-delta", type=float, default=50.0)
+    parser.add_argument("--vla-camera-max-age-s", type=float, default=1.0)
+    parser.add_argument("--vla-release-open-threshold", type=float, default=30.0)
+    parser.add_argument("--vla-release-closed-threshold", type=float, default=10.0)
+    parser.add_argument("--vla-release-transition-samples", type=int, default=3)
+    parser.add_argument("--vla-release-observed-open-samples", type=int, default=2)
+    parser.add_argument("--vla-release-observed-open-timeout-s", type=float, default=2.0)
+    parser.add_argument("--vla-release-settle-s", type=float, default=1.0)
+    parser.add_argument("--vla-release-capture-count", type=int, default=4)
+    parser.add_argument("--vla-release-capture-interval-s", type=float, default=0.25)
+    parser.add_argument(
+        "--vla-startup-pose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Move NAV_STOW -> ACTION_READY after a VLA handoff is requested.",
+    )
+    parser.add_argument(
+        "--vla-worker-log-path",
+        default="artifacts/vla_worker/smolvla_handoff.log",
+    )
+    parser.add_argument(
+        "--vla-hf-datasets-cache",
+        default=os.getenv("HF_DATASETS_CACHE"),
+    )
     return parser
 
 
 def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
+    from xlerobot_playground.real_backend import _build_camera_configs
+
     return RobotBrainAgentConfig(
         host=args.host,
         port=args.port,
@@ -1226,6 +1438,12 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         wheel_state_log_every=args.wheel_state_log_every,
         camera_max_frame_bytes=args.camera_max_frame_bytes,
         camera_log_every=args.camera_log_every,
+        cameras=_build_camera_configs(
+            args.camera,
+            width=args.camera_width,
+            height=args.camera_height,
+            fps=args.camera_fps,
+        ),
         initial_camera_pitch_rad=(
             args.initial_camera_pitch_rad
             if args.initial_camera_pitch_deg is None
@@ -1247,6 +1465,37 @@ def config_from_args(args: argparse.Namespace) -> RobotBrainAgentConfig:
         camera_pan_settle_s=args.camera_pan_settle_s,
         left_wheel_motor=args.left_wheel_motor,
         right_wheel_motor=args.right_wheel_motor,
+        vla_policy_path=(
+            None
+            if not args.vla_policy_path
+            else Path(args.vla_policy_path).expanduser().resolve()
+        ),
+        vla_dataset_repo_id=args.vla_dataset_repo_id,
+        vla_dataset_root=Path(args.vla_dataset_root).expanduser().resolve(),
+        vla_task=args.vla_task,
+        vla_device=args.vla_device,
+        vla_duration_s=args.vla_duration_s,
+        vla_max_duration_s=args.vla_max_duration_s,
+        vla_fps=args.vla_fps,
+        vla_action_steps=args.vla_action_steps,
+        vla_max_joint_delta=args.vla_max_joint_delta,
+        vla_max_gripper_delta=args.vla_max_gripper_delta,
+        vla_camera_max_age_s=args.vla_camera_max_age_s,
+        vla_release_open_threshold=args.vla_release_open_threshold,
+        vla_release_closed_threshold=args.vla_release_closed_threshold,
+        vla_release_transition_samples=args.vla_release_transition_samples,
+        vla_release_observed_open_samples=args.vla_release_observed_open_samples,
+        vla_release_observed_open_timeout_s=args.vla_release_observed_open_timeout_s,
+        vla_release_settle_s=args.vla_release_settle_s,
+        vla_release_capture_count=args.vla_release_capture_count,
+        vla_release_capture_interval_s=args.vla_release_capture_interval_s,
+        vla_startup_pose=args.vla_startup_pose,
+        vla_worker_log_path=Path(args.vla_worker_log_path).expanduser().resolve(),
+        vla_hf_datasets_cache=(
+            None
+            if not args.vla_hf_datasets_cache
+            else Path(args.vla_hf_datasets_cache).expanduser().resolve()
+        ),
     )
 
 
@@ -1266,6 +1515,13 @@ def main(argv: list[str] | None = None) -> int:
             if config.stream_imu
             else "imu_stream=disabled"
         ),
+        flush=True,
+    )
+    print(
+        "Robot brain cameras: "
+        f"{', '.join(sorted(config.cameras)) if config.cameras else 'none'}; "
+        "VLA handoff: "
+        f"{config.vla_policy_path if config.vla_policy_path is not None else 'disabled'}",
         flush=True,
     )
     web.run_app(build_app(agent), host=config.host, port=config.port, access_log=None)
