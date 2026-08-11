@@ -1,17 +1,6 @@
 # End-to-End Action Inference
 
-Replace these values in the commands:
-
-```text
-192.168.1.133              Mac/robot-brain IP
-YOUR_MODEL                 HomeTaskAgent model
-YOUR_VISION_MODEL          basket-verification vision model
-YOUR_API_KEY               model-provider API key
-YOUR_REPLICATE_API_TOKEN   Replicate API token
-OFFLOAD_IP                 offload-PC IP
-```
-
-This setup uses wheel odometry, the saved environment on `/map`, and only the temporary
+This setup uses wheel odometry, the saved environment republished on `/projected_map`, and only the temporary
 relocalization OctoMap. Do not start the normal OctoMap, IMU filter, or RGB-D odometry.
 
 ## Mac Terminal RB-1: Robot Brain And SmolVLA
@@ -19,6 +8,7 @@ relocalization OctoMap. Do not start the normal OctoMap, IMU filter, or RGB-D od
 ```bash
 cd /Users/alindumitru/embodied-agents-platform
 conda activate xlerobot
+python -m pip install aiohttp
 
 python -m xlerobot_playground.robot_brain_agent \
   --allow-motion-commands \
@@ -74,10 +64,7 @@ Build once if needed:
 ```bash
 cd /Users/alindumitru/embodied-agents-platform
 
-cmake -S tools/orbbec_rgb_test \
-  -B build/orbbec_rgb_test \
-  -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
-
+cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME/orbbec/sdk"
 cmake --build build/orbbec_rgb_test
 ```
 
@@ -116,7 +103,7 @@ python -m xlerobot_playground.real_nav2_config \
   --base-nav2-params /opt/ros/humble/share/nav2_bringup/params/nav2_params.yaml \
   --output-dir /home/alin/Robot42/artifacts/nav2 \
   --scan-topic /scan \
-  --global-map-topic /map \
+  --global-map-topic /projected_map \
   --map-frame map \
   --odom-frame odom \
   --base-frame base_link \
@@ -149,6 +136,7 @@ cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 export ROBOT_BRAIN_IP=192.168.1.133
+python -m pip install aiohttp
 
 python -m xlerobot_playground.real_ros_bridge \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
@@ -161,7 +149,7 @@ python -m xlerobot_playground.real_ros_bridge \
   --cmd-vel-timeout-s 0.5 \
   --max-linear-m-s 0.1 \
   --max-angular-rad-s 0.50 \
-  --camera-x-m 0.24 \
+  --camera-x-m 0.21 \
   --camera-y-m 0.0 \
   --camera-z-m 1.05 \
   --camera-yaw-rad 0.0 \
@@ -203,19 +191,27 @@ python -m xlerobot_playground.wheel_odometry \
   --right-wheel-position-sign 1
 ```
 
-## Offload Terminal OC-3: Relocalization Transform
+## Offload Terminal OC-3: Saved-Map Transform
 
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
-ros2 run tf2_ros static_transform_publisher \
-  0 0 0 0 0 0 \
-  odom relocalization_map
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 map odom
 ```
 
-## Offload Terminal OC-4: Relocalization OctoMap
+## Offload Terminal OC-4: Relocalization Transform
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 odom relocalization_map
+```
+
+## Offload Terminal OC-5: Relocalization OctoMap
 
 ```bash
 cd /home/alin/Robot42
@@ -226,7 +222,7 @@ ros2 launch /home/alin/Robot42/launch/xlerobot_relocalization_octomap.launch.py 
   cloud_topic:=/camera/head/points
 ```
 
-## Offload Terminal OC-5: Nav2
+## Offload Terminal OC-6: Nav2
 
 ```bash
 cd /home/alin/Robot42
@@ -239,7 +235,7 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-## Offload Terminal OC-6: Loaded-Map Navigation Backend
+## Offload Terminal OC-7: Loaded-Map Navigation Backend
 
 ```bash
 cd /home/alin/Robot42
@@ -247,96 +243,82 @@ source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 export ROBOT_BRAIN_IP=192.168.1.133
 
+curl -s -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
+  -H 'Content-Type: application/json' \
+  -d '{"pitch_deg": 30, "settle_s": 0.5}' | python -m json.tool
+
 python -m xlerobot_playground.real_agentic_exploration \
   --memory-root /home/alin/Robot42/artifacts/memories \
-  --session action_inference \
+  --session real_house_v1 \
   --explorer-policy heuristic \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
-  --ros-map-topic /map \
-  --ros-map-updates-topic /map_updates \
+  --ros-navigation-map-source external \
+  --ros-map-topic /projected_map \
+  --ros-map-updates-topic /projected_map_updates \
   --ros-map-frame map \
   --ros-scan-topic /scan \
   --ros-point-cloud-topic /camera/head/points \
   --ros-scan-active-topic /xlerobot/scan_active \
   --ros-nav-active-topic /xlerobot/nav_active \
   --ros-local-rotation-active-topic /xlerobot/local_rotation_active \
-  --ros-publish-identity-map-to-odom \
   --relocalization true \
-  --ros-relocalization-map-topic /relocalization_projected_map \
-  --ros-relocalization-reset-service /relocalization_octomap_server/reset \
-  --ros-relocalization-accept-confidence 0.65 \
-  --ros-odom-reset-topic /xlerobot/odom/set_pose \
+  --ros-relocalization-accept-confidence 0.85 \
   --ros-scan-active-release-delay-s 3.0 \
   --ros-ready-timeout-s 30 \
   --ros-turn-scan-timeout-s 75 \
   --ros-turn-scan-mode camera_pan \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --camera-pan-action-key head_motor_1.pos \
-  --camera-pan-settle-s 0.25 \
+  --camera-pan-settle-s 1.2 \
   --camera-pan-step-deg 60 \
-  --camera-pan-compute-s 0.8 \
+  --camera-pan-compute-s 1.5 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
   --ros-manual-spin-direction-sign 1 \
   --ros-robot-length-m 0.3913 \
   --ros-robot-width-m 0.459 \
   --ros-base-link-x-from-wheel-axle-m 0.0 \
   --ros-base-link-y-from-wheel-axle-m 0.0 \
-  --ros-camera-center-forward-m 0.24 \
+  --ros-camera-center-forward-m 0.21 \
   --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
   --max-decisions 8
 ```
 
-## Offload Terminal OC-7: HomeTaskAgent
+## Offload Terminal OC-8: HomeTaskAgent
 
 ```bash
 cd /home/alin/Robot42
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
 export ROBOT_BRAIN_IP=192.168.1.133
-export OPENAI_API_KEY=YOUR_API_KEY
-export REPLICATE_API_TOKEN=YOUR_REPLICATE_API_TOKEN
+export OPENAI_API_KEY=""
+export REPLICATE_API_TOKEN=""
+export ROBOT42_AGENT_MODEL=gpt-5.6-terra
+export ROBOT42_BASKET_VERIFIER_MODEL=gpt-5.6-terra
 
 python examples/robot42_agent_backend.py \
   --host 0.0.0.0 \
   --port 8765 \
   --memory-root /home/alin/Robot42/artifacts/memories \
   --provider openai \
-  --model YOUR_MODEL \
-  --agent-tool-output-mode compact \
-  --agent-artifacts-root /home/alin/Robot42/artifacts/agent_runs \
-  --navigation-waypoint-horizon-m 2.0 \
-  --navigation-auto-rotate-threshold-deg 45 \
+  --model "$ROBOT42_AGENT_MODEL" \
   --basket-verifier-provider openai \
-  --basket-verifier-model YOUR_VISION_MODEL \
+  --basket-verifier-model "$ROBOT42_BASKET_VERIFIER_MODEL" \
   --basket-verification-manifest /home/alin/Robot42/config/basket_verification/small_cherry_juice_bottle_v0/reference_set.json \
   --basket-verification-minimum-confidence 0.8 \
   --object-detector-provider replicate_grounding_dino \
-  --object-detector-api-key "$REPLICATE_API_TOKEN" \
-  --object-detector-model adirik/grounding-dino \
-  --object-detector-box-threshold 0.25 \
-  --object-detector-text-threshold 0.25 \
-  --object-detector-min-confidence 0.55 \
-  --object-detector-max-image-edge-px 1280 \
-  --object-detector-jpeg-quality 85 \
-  --object-approach-target-min-m 0.35 \
-  --object-approach-target-max-m 0.45 \
-  --object-approach-target-tolerance-m 0.025 \
-  --object-approach-step-m 0.25 \
-  --object-approach-step-fraction 0.8 \
-  --object-approach-max-attempts 20 \
   --exploration-backend-url http://127.0.0.1:8770 \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --vla-handoff \
   --vla-handoff-duration-s 60 \
-  --backend-request-timeout-s 300 \
+  --backend-request-timeout-s 180 \
   --max-turns 32 \
   --no-dry-run
 ```
 
-## Offload Terminal OC-8: React UI
+## Offload Terminal OC-9: React UI
 
 Run `npm install` once if needed:
 
@@ -345,20 +327,15 @@ cd /home/alin/Robot42/frontend/robot42
 npm install
 ```
 
-Run the UI:
-
 ```bash
 cd /home/alin/Robot42/frontend/robot42
-
-VITE_AGENT_API_TARGET=http://127.0.0.1:8765 \
-VITE_EXPLORATION_API_TARGET=http://127.0.0.1:8770 \
-npx vite --host 0.0.0.0 --port 5173
+npm run dev
 ```
 
 Open:
 
 ```text
-http://OFFLOAD_IP:5173
+http://127.0.0.1:5173
 ```
 
 In `Configure Environment`:
@@ -370,7 +347,7 @@ In `Configure Environment`:
 
 Then open the Agent screen and select the same environment memory.
 
-## Offload Terminal OC-9: RViz
+## Offload Terminal OC-10: RViz
 
 ```bash
 cd /home/alin/Robot42
@@ -384,7 +361,7 @@ Set `Fixed Frame` to `map`. Add:
 
 ```text
 TF
-Map /map
+Map /projected_map
 Map /global_costmap/costmap
 Map /local_costmap/costmap
 Map /relocalization_projected_map
