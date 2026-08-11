@@ -309,6 +309,9 @@ python examples/robot42_agent_backend.py \
   --basket-verification-manifest /home/alin/Robot42/config/basket_verification/small_cherry_juice_bottle_v0/reference_set.json \
   --basket-verification-minimum-confidence 0.8 \
   --object-detector-provider replicate_grounding_dino \
+  --object-approach-target-min-m 0.20 \
+  --object-approach-target-max-m 0.28 \
+  --object-approach-target-tolerance-m 0.01 \
   --exploration-backend-url http://127.0.0.1:8770 \
   --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
   --vla-handoff \
