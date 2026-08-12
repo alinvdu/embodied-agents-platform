@@ -289,6 +289,7 @@ def resolve_region_navigation_goal(
     current_pose: dict[str, Any] | None = None,
     min_clearance_m: float = DEFAULT_NAVIGATION_CLEARANCE_M,
     waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M,
+    waypoint_breakdown_enabled: bool = True,
     navigation_purpose: str = "",
     object_label: str = "",
     exploration_constraints: dict[str, Any] | None = None,
@@ -310,6 +311,7 @@ def resolve_region_navigation_goal(
             current_pose=current_pose,
             min_clearance_m=min_clearance_m,
             waypoint_horizon_m=waypoint_horizon_m,
+            waypoint_breakdown_enabled=waypoint_breakdown_enabled,
             object_label=object_label,
             exploration_constraints=exploration_constraints or {},
         )
@@ -329,6 +331,7 @@ def resolve_region_navigation_goal(
                 current_pose,
                 waypoint_horizon_m,
             ),
+            "waypoint_breakdown_enabled": bool(waypoint_breakdown_enabled),
             "source": "region.default_waypoints",
             "candidate_count": 1,
             "clearance_m": None,
@@ -487,24 +490,36 @@ def resolve_region_navigation_goal(
         "yaw": _resolved_goal_yaw(current_pose),
     }
     path_length_m = _path_length_m(_path_points_for_waypoint(path_cells, grid, current_pose, goal_pose))
-    next_waypoint = _next_waypoint_payload(
-        path_cells,
-        grid,
-        current_pose,
-        goal_pose,
-        waypoint_horizon_m,
-        target_label=region.get("label") or name_or_label,
-        region_id=region.get("region_id"),
-    )
-    centerline_waypoints = _centerline_waypoints_payload(
-        path_cells,
-        grid,
-        current_pose,
-        goal_pose,
-        waypoint_horizon_m,
-        target_label=region.get("label") or name_or_label,
-        region_id=region.get("region_id"),
-    )
+    if waypoint_breakdown_enabled:
+        next_waypoint = _next_waypoint_payload(
+            path_cells,
+            grid,
+            current_pose,
+            goal_pose,
+            waypoint_horizon_m,
+            target_label=region.get("label") or name_or_label,
+            region_id=region.get("region_id"),
+        )
+        centerline_waypoints = _centerline_waypoints_payload(
+            path_cells,
+            grid,
+            current_pose,
+            goal_pose,
+            waypoint_horizon_m,
+            target_label=region.get("label") or name_or_label,
+            region_id=region.get("region_id"),
+        )
+    else:
+        next_waypoint = _direct_goal_waypoint_payload(
+            path_cells,
+            grid,
+            current_pose,
+            goal_pose,
+            waypoint_horizon_m,
+            target_label=region.get("label") or name_or_label,
+            region_id=region.get("region_id"),
+        )
+        centerline_waypoints = [dict(next_waypoint)]
     status = "succeeded" if best_clearance >= min_clearance_m else "low_clearance"
     return {
         "tool": "resolve_region_navigation_goal",
@@ -515,6 +530,7 @@ def resolve_region_navigation_goal(
         "goal_pose": goal_pose,
         "next_waypoint": next_waypoint,
         "centerline_waypoints": centerline_waypoints,
+        "waypoint_breakdown_enabled": bool(waypoint_breakdown_enabled),
         "source": (
             "home_memory.occupancy_region_inside_edge_approach"
             if goal_selection == "inside_region_edge_approach"
@@ -546,6 +562,7 @@ def _resolve_region_search_entry_navigation_goal(
     current_pose: dict[str, Any] | None,
     min_clearance_m: float,
     waypoint_horizon_m: float,
+    waypoint_breakdown_enabled: bool,
     object_label: str,
     exploration_constraints: dict[str, Any],
 ) -> dict[str, Any]:
@@ -630,7 +647,8 @@ def _resolve_region_search_entry_navigation_goal(
     path_cells = _centered_path_cells(grid, start_cell, goal_cell, footprint_safe_cells) if start_cell is not None else []
     path_clearance = min((_cell_clearance_m(cell, grid) for cell in path_cells), default=_cell_clearance_m(goal_cell, grid))
     path_length_m = _path_length_m(_path_points_for_waypoint(path_cells, grid, current_pose, goal_pose))
-    next_waypoint = _next_waypoint_payload(
+    waypoint_builder = _next_waypoint_payload if waypoint_breakdown_enabled else _direct_goal_waypoint_payload
+    next_waypoint = waypoint_builder(
         path_cells,
         grid,
         current_pose,
@@ -649,6 +667,7 @@ def _resolve_region_search_entry_navigation_goal(
         "object_label": object_label,
         "goal_pose": goal_pose,
         "next_waypoint": next_waypoint,
+        "waypoint_breakdown_enabled": bool(waypoint_breakdown_enabled),
         "source": "home_memory.region_search_entry",
         "goal_selection": "region_search_entry",
         "search_stop": stop,
@@ -1552,6 +1571,38 @@ def _path_payload(path_cells: list[tuple[int, int]], grid: dict[str, Any]) -> li
         }
         for cell in path_cells
     ]
+
+
+def _direct_goal_waypoint_payload(
+    path_cells: list[tuple[int, int]],
+    grid: dict[str, Any],
+    current_pose: dict[str, Any] | None,
+    goal_pose: dict[str, float],
+    horizon_m: float,
+    *,
+    target_label: str,
+    region_id: Any,
+) -> dict[str, Any]:
+    """Return the final planned goal without agent-level route segmentation."""
+    points = _path_points_for_waypoint(path_cells, grid, current_pose, goal_pose)
+    total_m = _path_length_m(points)
+    waypoint = _waypoint_payload(
+        target_label,
+        region_id,
+        goal_pose,
+        horizon_m=max(float(horizon_m or DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M), float(grid["resolution"])),
+        distance_from_start_m=total_m,
+        remaining_to_goal_m=0.0,
+        is_final_waypoint=True,
+    )
+    waypoint_pose = _json_pose(goal_pose)
+    waypoint["waypoint_id"] = (
+        f"{_slug(str(target_label or region_id or 'target'))}_direct_"
+        f"x{int(round(waypoint_pose['x'] * 100.0))}_"
+        f"y{int(round(waypoint_pose['y'] * 100.0))}"
+    )
+    waypoint["navigation_mode"] = "direct_final_goal"
+    return waypoint
 
 
 def _next_waypoint_payload(

@@ -1,9 +1,22 @@
-# End-to-End Action Inference
+# End-to-End Autonomous Exploration
 
-This setup uses wheel odometry, the saved environment republished on `/projected_map`, and only the temporary
-relocalization OctoMap. Do not start the normal OctoMap, IMU filter, or RGB-D odometry.
+This is the exploration-only counterpart to `end-to-end-action-inference.md`. It starts a fresh real-world
+mapping run with wheel odometry, OctoMap, Nav2, automatic frontier exploration, the exploration review UI,
+and RViz monitoring.
 
-## Mac Terminal RB-1: Robot Brain And SmolVLA
+Each launch uses a timestamped session and working-snapshot file. Starting exploration clears only the new
+process's live OctoMap; it does not load, delete, or overwrite existing approved maps under
+`artifacts/memories/`. Approving the new map saves it under its own timestamped memory ID.
+
+It intentionally does not start HomeTaskAgent, object detection, basket verification, SmolVLA, the React
+agent UI, or the temporary relocalization map.
+
+The robot starts exploring immediately when the final command is launched. Keep the physical e-stop within
+reach and supervise the run; autonomous exploration is not a reason to leave the hardware unattended.
+
+Start the robot at the location that should become map coordinate `(0, 0, 0)`.
+
+## Mac Terminal RB-1: Robot Brain
 
 ```bash
 cd /Users/alindumitru/embodied-agents-platform
@@ -33,28 +46,7 @@ python -m xlerobot_playground.robot_brain_agent \
   --initial-camera-pitch-deg 0 \
   --stream-wheel-state \
   --wheel-state-stream-rate-hz 100 \
-  --no-stream-imu \
-  --camera right_wrist=opencv:1 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --camera-fps 30 \
-  --vla-policy-path outputs/train/pretrained_vla_batch_16_30k_new_dataset \
-  --vla-dataset-root datasets/small-juice-bottle-to-basket-right-arm \
-  --vla-dataset-repo-id alindumitru/small-juice-bottle-to-basket-right-arm \
-  --vla-device mps \
-  --vla-duration-s 60 \
-  --vla-action-steps 50 \
-  --vla-max-joint-delta 50 \
-  --vla-max-gripper-delta 50 \
-  --vla-camera-max-age-s 1 \
-  --vla-release-open-threshold 30 \
-  --vla-release-closed-threshold 10 \
-  --vla-release-transition-samples 3 \
-  --vla-release-observed-open-samples 2 \
-  --vla-release-observed-open-timeout-s 2 \
-  --vla-release-settle-s 1 \
-  --vla-release-capture-count 4 \
-  --vla-release-capture-interval-s 0.25
+  --no-stream-imu
 ```
 
 ## Mac Terminal RB-2: Orbbec
@@ -68,7 +60,7 @@ cmake -S tools/orbbec_rgb_test -B build/orbbec_rgb_test -DORBBEC_SDK_ROOT="$HOME
 cmake --build build/orbbec_rgb_test
 ```
 
-Run every time:
+Run for every exploration session:
 
 ```bash
 cd /Users/alindumitru/embodied-agents-platform
@@ -93,6 +85,8 @@ sudo ./build/orbbec_rgb_test/orbbec_rgb_test \
 ```
 
 ## Offload Terminal OC-0: Generate Nav2 Parameters Once
+
+Run this once, and rerun it only after changing the Nav2 configuration.
 
 ```bash
 cd /home/alin/Robot42
@@ -192,7 +186,7 @@ python -m xlerobot_playground.wheel_odometry \
   --right-wheel-position-sign 1
 ```
 
-## Offload Terminal OC-3: Saved-Map Transform
+## Offload Terminal OC-3: Map Transform
 
 ```bash
 cd /home/alin/Robot42
@@ -202,28 +196,19 @@ source /home/alin/Robot42/.venv-maniskill/bin/activate
 ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 map odom
 ```
 
-## Offload Terminal OC-4: Relocalization Transform
+## Offload Terminal OC-4: Exploration OctoMap
+
+This is the normal exploration OctoMap, not the temporary relocalization OctoMap.
 
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 
-ros2 run tf2_ros static_transform_publisher 0 0 0 0 0 0 odom relocalization_map
+ros2 launch /home/alin/Robot42/launch/xlerobot_octomap.launch.py
 ```
 
-## Offload Terminal OC-5: Relocalization OctoMap
-
-```bash
-cd /home/alin/Robot42
-source /opt/ros/humble/setup.bash
-source /home/alin/Robot42/.venv-maniskill/bin/activate
-
-ros2 launch /home/alin/Robot42/launch/xlerobot_relocalization_octomap.launch.py \
-  cloud_topic:=/camera/head/points
-```
-
-## Offload Terminal OC-6: Nav2
+## Offload Terminal OC-5: Nav2
 
 ```bash
 cd /home/alin/Robot42
@@ -236,25 +221,62 @@ ros2 launch nav2_bringup navigation_launch.py \
   params_file:=/home/alin/Robot42/artifacts/nav2/xlerobot_nav2_params.yaml
 ```
 
-## Offload Terminal OC-7: Loaded-Map Navigation Backend
+## Offload Terminal OC-6: RViz Monitoring
+
+Start RViz before launching exploration so the initial camera-pan scan is visible.
+
+```bash
+cd /home/alin/Robot42
+source /opt/ros/humble/setup.bash
+source /home/alin/Robot42/.venv-maniskill/bin/activate
+
+rviz2
+```
+
+Set `Fixed Frame` to `map`, then add:
+
+```text
+TF
+Map /projected_map
+Map /global_costmap/costmap
+Map /local_costmap/costmap
+MarkerArray /occupied_cells_vis_array
+PointCloud2 /camera/head/points
+LaserScan /scan
+Odometry /odom
+Path /plan
+```
+
+## Offload Terminal OC-7: Start Autonomous Exploration
+
+The command creates a unique session and working-snapshot path, starts immediately, performs the initial
+camera-pan scan, selects reachable frontiers with the heuristic policy, navigates with Nav2, scans again after
+each arrival, and stops when exploration finishes or reaches 32 decisions.
 
 ```bash
 cd /home/alin/Robot42
 source /opt/ros/humble/setup.bash
 source /home/alin/Robot42/.venv-maniskill/bin/activate
 export ROBOT_BRAIN_IP=192.168.1.137
+export ROBOT42_EXPLORATION_SESSION="exploration_$(date +%Y%m%d_%H%M%S)"
+export ROBOT42_EXPLORATION_SNAPSHOT="/home/alin/Robot42/artifacts/exploration_runs/${ROBOT42_EXPLORATION_SESSION}.json"
+mkdir -p /home/alin/Robot42/artifacts/exploration_runs
 
 curl -s -X POST "http://${ROBOT_BRAIN_IP}:8765/camera/head/pitch" \
   -H 'Content-Type: application/json' \
   -d '{"pitch_deg": 30, "settle_s": 0.5}' | python -m json.tool
 
 python -m xlerobot_playground.real_agentic_exploration \
+  --persist-path "$ROBOT42_EXPLORATION_SNAPSHOT" \
   --memory-root /home/alin/Robot42/artifacts/memories \
-  --session real_house_v1 \
+  --session "$ROBOT42_EXPLORATION_SESSION" \
+  --no-restore-persisted-state \
   --explorer-policy heuristic \
   --serve-review-ui \
   --review-host 0.0.0.0 \
   --review-port 8770 \
+  --no-wait-for-ui-start \
+  --no-pause-for-operator-approval \
   --ros-navigation-map-source external \
   --ros-map-topic /projected_map \
   --ros-map-updates-topic /projected_map_updates \
@@ -275,6 +297,7 @@ python -m xlerobot_playground.real_agentic_exploration \
   --camera-pan-step-deg 60 \
   --camera-pan-compute-s 1.5 \
   --ros-manual-spin-angular-speed-rad-s 0.30 \
+  --ros-manual-spin-publish-hz 50 \
   --ros-manual-spin-direction-sign 1 \
   --ros-robot-length-m 0.3913 \
   --ros-robot-width-m 0.459 \
@@ -283,114 +306,22 @@ python -m xlerobot_playground.real_agentic_exploration \
   --ros-camera-center-forward-m 0.21 \
   --ros-camera-center-lateral-m 0.0 \
   --no-ros-local-rotation-safety-enabled \
-  --max-decisions 8
+  --finish-coverage-threshold 0.96 \
+  --max-decisions 32
 ```
 
-## Offload Terminal OC-8: HomeTaskAgent
-
-```bash
-cd /home/alin/Robot42
-source /home/alin/Robot42/.venv-maniskill/bin/activate
-
-export ROBOT_BRAIN_IP=192.168.1.137
-export OPENAI_API_KEY=""
-export REPLICATE_API_TOKEN=""
-export ROBOT42_AGENT_MODEL=gpt-5.6-terra
-export ROBOT42_BASKET_VERIFIER_MODEL=gpt-5.6-terra
-
-python examples/robot42_agent_backend.py \
-  --host 0.0.0.0 \
-  --port 8765 \
-  --memory-root /home/alin/Robot42/artifacts/memories \
-  --provider openai \
-  --model "$ROBOT42_AGENT_MODEL" \
-  --basket-verifier-provider openai \
-  --basket-verifier-model "$ROBOT42_BASKET_VERIFIER_MODEL" \
-  --basket-verification-manifest /home/alin/Robot42/config/basket_verification/small_cherry_juice_bottle_v0/reference_set.json \
-  --basket-verification-minimum-confidence 0.8 \
-  --no-navigation-waypoint-breakdown \
-  --object-detector-provider replicate_grounding_dino \
-  --object-approach-target-min-m 0.26 \
-  --object-approach-target-max-m 0.32 \
-  --object-approach-target-tolerance-m 0.015 \
-  --exploration-backend-url http://127.0.0.1:8770 \
-  --robot-brain-url "http://${ROBOT_BRAIN_IP}:8765" \
-  --vla-handoff \
-  --vla-handoff-duration-s 60 \
-  --backend-request-timeout-s 180 \
-  --max-turns 32 \
-  --no-dry-run
-```
-
-## Offload Terminal OC-9: React UI
-
-Run `npm install` once if needed:
-
-```bash
-cd /home/alin/Robot42/frontend/robot42
-npm install
-```
-
-```bash
-cd /home/alin/Robot42/frontend/robot42
-npm run dev
-```
-
-Open:
+Monitor the exploration review UI at:
 
 ```text
-http://127.0.0.1:5173
+http://OFFLOAD_IP:8770
 ```
 
-In `Configure Environment`:
-
-1. Select the saved environment.
-2. Click `Load`.
-3. Click `Start Nav Session`.
-4. Click `Relocalize`.
-
-Then open the Agent screen and select the same environment memory.
-
-## Offload Terminal OC-10: RViz
-
-```bash
-cd /home/alin/Robot42
-source /opt/ros/humble/setup.bash
-source /home/alin/Robot42/.venv-maniskill/bin/activate
-
-rviz2
-```
-
-Set `Fixed Frame` to `map`. Add:
+The process remains alive after exploration finishes so the map can be inspected. Use `Approve + Save Memory` in
+the review UI when the map is ready to become long-term environment memory. Its timestamped ID keeps existing
+approved memories untouched. Saved environments appear under:
 
 ```text
-TF
-Map /projected_map
-Map /global_costmap/costmap
-Map /local_costmap/costmap
-Map /relocalization_projected_map
-PointCloud2 /camera/head/points
-LaserScan /scan
-Odometry /odom
+/home/alin/Robot42/artifacts/memories/<memory_id>/
 ```
 
-## Run The Task
-
-In the Agent screen, send:
-
-```text
-Go to the kitchen, find the small cherry juice bottle, put it in the robot basket, return to the dock, and tell me when it is ready for handoff.
-```
-
-Accept the object-detection confirmation only when the displayed candidate is the correct
-cherry juice bottle.
-
-## Software Stop
-
-From the offload PC:
-
-```bash
-curl -s -X POST http://127.0.0.1:8765/api/stop \
-  -H 'Content-Type: application/json' \
-  -d '{}' | python -m json.tool
-```
+Press `Ctrl-C` in OC-7 only after reviewing or saving the completed map.

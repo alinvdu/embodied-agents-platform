@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import struct
 import tempfile
+import threading
 import time
 import unittest
 from urllib.error import HTTPError
@@ -43,9 +44,35 @@ class _Vector:
 
 
 class _Twist:
+    def __init__(self, *, linear: float = 0.04, angular: float = 0.12) -> None:
+        self.linear = _Vector(x=linear)
+        self.angular = _Vector(z=angular)
+
+
+class _MotionRuntime:
     def __init__(self) -> None:
-        self.linear = _Vector(x=0.04)
-        self.angular = _Vector(z=0.12)
+        self.calls: list[tuple[str, float, float]] = []
+        self.stopped = threading.Event()
+
+    def drive_velocity(self, *, linear_m_s: float, angular_rad_s: float) -> dict[str, object]:
+        self.calls.append(("drive", linear_m_s, angular_rad_s))
+        return {"succeeded": True}
+
+    def stop(self) -> dict[str, object]:
+        self.calls.append(("stop", 0.0, 0.0))
+        self.stopped.set()
+        return {"succeeded": True}
+
+
+class _BlockingRgbdSource:
+    def __init__(self) -> None:
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def capture(self) -> _Frame:
+        self.entered.set()
+        self.release.wait(timeout=2.0)
+        return _Frame(time.time())
 
 
 class _FakeBrainClient:
@@ -91,6 +118,16 @@ class _Frame:
         self.timestamp_s = timestamp_s
 
 
+class _ClockInstant:
+    def to_msg(self) -> object:
+        return object()
+
+
+class _Clock:
+    def now(self) -> _ClockInstant:
+        return _ClockInstant()
+
+
 class _Logger:
     def __init__(self) -> None:
         self.messages: list[str] = []
@@ -111,6 +148,7 @@ class RealRosBridgeTests(unittest.TestCase):
         self.assertEqual(config.odom_source, "none")
         self.assertEqual(config.max_linear_m_s, 0.05)
         self.assertEqual(config.max_angular_rad_s, 0.20)
+        self.assertEqual(config.motion_command_rate_hz, 50.0)
         self.assertEqual(config.camera_z_m, 0.35)
         self.assertEqual(config.camera_pan_topic, "/camera/head/pan_rad")
         self.assertEqual(config.scan_active_topic, "/xlerobot/scan_active")
@@ -235,6 +273,65 @@ class RealRosBridgeTests(unittest.TestCase):
 
     def test_twist_to_base_velocity_uses_forward_and_yaw_only(self) -> None:
         self.assertEqual(twist_to_base_velocity(_Twist()), (0.04, 0.12))
+
+    def test_explicit_stop_reaches_hardware_while_rgbd_capture_is_blocked(self) -> None:
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        bridge.config = RealRosBridgeConfig(cmd_vel_timeout_s=0.5)
+        bridge.runtime = _MotionRuntime()
+        bridge.rgbd_source = _BlockingRgbdSource()
+        bridge._latest_twist = _Twist(angular=0.2)
+        bridge._latest_cmd_stamp = time.monotonic()
+        bridge._velocity_lock = threading.Lock()
+        bridge._motion_lock = threading.Lock()
+        bridge._last_motion_step_stamp = time.monotonic()
+        bridge._last_linear = 0.0
+        bridge._last_angular = 0.2
+        bridge._last_motion_error = ""
+        bridge._base_motion_active = True
+        bridge._x = 0.0
+        bridge._y = 0.0
+        bridge._yaw = 0.0
+        bridge._poll_camera_pose = lambda *, now_s: None
+        bridge.get_clock = lambda: _Clock()
+        bridge._publish_transforms = lambda **_kwargs: None
+        bridge._publish_scan = lambda **_kwargs: None
+        bridge._publish_head_images = lambda **_kwargs: None
+        bridge._publish_head_points = lambda **_kwargs: None
+
+        camera_thread = threading.Thread(target=bridge.step)
+        camera_thread.start()
+        self.assertTrue(bridge.rgbd_source.entered.wait(timeout=1.0))
+
+        bridge._on_cmd_vel(_Twist(linear=0.0, angular=0.0))
+
+        self.assertTrue(bridge.runtime.stopped.wait(timeout=0.2))
+        self.assertTrue(camera_thread.is_alive())
+        self.assertEqual(bridge.runtime.calls[-1][0], "stop")
+        bridge.rgbd_source.release.set()
+        camera_thread.join(timeout=1.0)
+        self.assertFalse(camera_thread.is_alive())
+
+    def test_motion_watchdog_stops_stale_command_without_sensor_step(self) -> None:
+        bridge = real_ros_bridge.RealXLeRobotRosBridge.__new__(real_ros_bridge.RealXLeRobotRosBridge)
+        bridge.config = RealRosBridgeConfig(cmd_vel_timeout_s=0.5)
+        bridge.runtime = _MotionRuntime()
+        bridge._latest_twist = _Twist(angular=0.2)
+        bridge._latest_cmd_stamp = time.monotonic() - 1.0
+        bridge._velocity_lock = threading.Lock()
+        bridge._motion_lock = threading.Lock()
+        bridge._last_motion_step_stamp = time.monotonic()
+        bridge._last_linear = 0.0
+        bridge._last_angular = 0.2
+        bridge._last_motion_error = ""
+        bridge._base_motion_active = True
+        bridge._x = 0.0
+        bridge._y = 0.0
+        bridge._yaw = 0.0
+
+        bridge.motion_step()
+
+        self.assertEqual(bridge.runtime.calls, [("stop", 0.0, 0.0)])
+        self.assertFalse(bridge._base_motion_active)
 
     def test_yaw_to_quaternion(self) -> None:
         _x, _y, z, w = yaw_to_quaternion_xyzw(0.0)

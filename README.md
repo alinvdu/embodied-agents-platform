@@ -47,7 +47,7 @@ For real hardware runs, Nav2 performs path planning and local velocity control. 
 
 ### Real-World Exploration
 
-The real robot can perform an initial 360 degree camera-pan scan, build an occupancy representation, select frontiers, navigate to them with Nav2, and keep expanding the map. The default real path is documented in [REAL_EXPLORATION_END_TO_END.md](REAL_EXPLORATION_END_TO_END.md).
+The real robot can perform an initial 360 degree camera-pan scan, build an occupancy representation, select frontiers, navigate to them with Nav2, and keep expanding the map. Use [end-to-end-exploration.md](end-to-end-exploration.md) for the concise exploration-only commands; [REAL_EXPLORATION_END_TO_END.md](REAL_EXPLORATION_END_TO_END.md) contains the detailed setup, alternatives, calibration, and troubleshooting notes.
 
 ### Navigation and Mapping
 

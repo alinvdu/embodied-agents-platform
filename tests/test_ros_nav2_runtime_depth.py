@@ -138,6 +138,7 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
         self.assertEqual(result["base_from_camera_transform"]["source_frame"], "head_camera_link")
         self.assertAlmostEqual(result["base_from_camera_transform"]["yaw_deg"], 0.0, delta=0.01)
         self.assertAlmostEqual(result["forward_m"], 0.8, delta=0.02)
+        self.assertAlmostEqual(result["rear_drive_alignment"]["bearing_error_deg"], 0.0, delta=0.01)
         self.assertGreater(result["valid_sample_count"], 12)
 
     def test_detection_geometry_can_disable_point_cloud_fallback(self) -> None:
@@ -160,6 +161,13 @@ class RosNav2RuntimeDepthTest(unittest.TestCase):
 
             def wait_for_rgbd_update(self, **kwargs) -> bool:
                 return False
+
+            def _estimate_detection_geometry_from_depth(self, payload, bbox):
+                return ros_nav2_runtime.RosExplorationRuntime._estimate_detection_geometry_from_depth(
+                    self,
+                    payload,
+                    bbox,
+                )
 
         result = ros_nav2_runtime.RosExplorationRuntime.estimate_detection_geometry(
             FakeRuntime(),

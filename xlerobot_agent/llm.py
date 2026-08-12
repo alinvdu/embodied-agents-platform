@@ -304,9 +304,12 @@ class AgentLLMRouter:
         payload: dict[str, Any] = {
             "model": config.model,
             "messages": messages,
-            "temperature": config.temperature,
-            "max_tokens": config.max_tokens,
         }
+        if _uses_reasoning_chat_completion_parameters(config.model):
+            payload["max_completion_tokens"] = config.max_tokens
+        else:
+            payload["temperature"] = config.temperature
+            payload["max_tokens"] = config.max_tokens
         if config.reasoning_effort:
             payload["reasoning_effort"] = config.reasoning_effort
         if config.thinking:
@@ -566,6 +569,11 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
         return json.loads(cleaned[start : end + 1])
     except json.JSONDecodeError:
         return None
+
+
+def _uses_reasoning_chat_completion_parameters(model: str) -> bool:
+    normalized = model.strip().lower()
+    return normalized.startswith(("gpt-5", "o1", "o3", "o4"))
 
 
 def _ollama_generate_endpoint(base_url: str | None) -> str:

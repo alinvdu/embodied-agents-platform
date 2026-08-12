@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=75.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.30)
-    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=10.0)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=50.0)
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)

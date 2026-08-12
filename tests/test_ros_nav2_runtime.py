@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+import xlerobot_playground.ros_nav2_runtime as ros_nav2_runtime
 from xlerobot_agent.exploration import Pose2D
 from xlerobot_playground.ros_nav2_runtime import (
     RosRuntimeConfig,
@@ -14,17 +15,21 @@ from xlerobot_playground.ros_nav2_runtime import (
     check_rear_axle_rotation_sweep_occupancy,
     compute_turn_command,
     default_map_updates_topic,
+    evaluate_turn_completion,
     fuse_projected_maps,
     rear_axle_pose_from_base_pose,
     rear_axle_rotation_sweep_base_poses,
     rear_drive_camera_center_shift,
+    rear_drive_object_alignment,
     remaining_turn_delta_rad,
+    turn_completion_warnings,
 )
 
 
 class RosNav2RuntimeTests(unittest.TestCase):
     def test_local_spin_uses_nav2_yaw_sign_by_default(self) -> None:
         self.assertEqual(RosRuntimeConfig().manual_spin_direction_sign, 1.0)
+        self.assertEqual(RosRuntimeConfig().manual_spin_publish_hz, 50.0)
         self.assertEqual(RosRuntimeConfig().local_rotation_active_topic, "/xlerobot/local_rotation_active")
         self.assertFalse(RosRuntimeConfig().local_rotation_safety_enabled)
         self.assertAlmostEqual(RosRuntimeConfig().base_link_x_from_wheel_axle_m, 0.0)
@@ -41,6 +46,16 @@ class RosNav2RuntimeTests(unittest.TestCase):
         self.assertAlmostEqual(shift["distance_m"], 0.0502, places=4)
         self.assertGreater(shift["lateral_m"], 0.0)
 
+    def test_rear_drive_object_alignment_uses_wheel_axle_pivot(self) -> None:
+        alignment = rear_drive_object_alignment(
+            object_forward_from_base_m=0.4912,
+            object_lateral_from_base_m=-0.0537,
+            base_link_x_from_wheel_axle_m=0.0,
+            base_link_y_from_wheel_axle_m=0.0,
+        )
+
+        self.assertAlmostEqual(alignment["bearing_error_deg"], -6.24, places=2)
+
     def test_compute_turn_command_stops_at_target(self) -> None:
         command, done = compute_turn_command(
             requested_angular_rad_s=0.3,
@@ -50,6 +65,48 @@ class RosNav2RuntimeTests(unittest.TestCase):
 
         self.assertEqual(command, 0.0)
         self.assertTrue(done)
+
+    def test_accurate_turn_succeeds_without_a_settling_gate(self) -> None:
+        completed, reason, error = evaluate_turn_completion(
+            used_feedback=True,
+            command_stop_reason="target_yaw_reached",
+            target_yaw_rad=math.radians(-12.0),
+            actual_yaw_rad=math.radians(-13.1),
+        )
+
+        self.assertTrue(completed)
+        self.assertEqual(reason, "target_yaw_reached")
+        self.assertAlmostEqual(math.degrees(error), 1.1)
+
+    def test_turn_overshoot_is_diagnostic_not_a_completion_failure(self) -> None:
+        completed, reason, error = evaluate_turn_completion(
+            used_feedback=True,
+            command_stop_reason="target_yaw_reached",
+            target_yaw_rad=math.radians(-46.0),
+            actual_yaw_rad=math.radians(-81.0),
+        )
+
+        self.assertTrue(completed)
+        self.assertEqual(reason, "target_yaw_reached")
+        self.assertAlmostEqual(math.degrees(error), 35.0)
+        self.assertEqual(
+            turn_completion_warnings(
+                used_feedback=True,
+                target_yaw_rad=math.radians(-46.0),
+                actual_yaw_rad=math.radians(-81.0),
+            ),
+            ["rotation_overshoot"],
+        )
+
+    def test_sparse_stop_feedback_does_not_create_a_warning_for_accurate_turn(self) -> None:
+        self.assertEqual(
+            turn_completion_warnings(
+                used_feedback=True,
+                target_yaw_rad=math.radians(-12.0),
+                actual_yaw_rad=math.radians(-13.1),
+            ),
+            [],
+        )
 
     def test_remaining_turn_delta_catches_up_segment_shortfall(self) -> None:
         self.assertAlmostEqual(
@@ -68,6 +125,90 @@ class RosNav2RuntimeTests(unittest.TestCase):
             ),
             0.0,
         )
+
+    def test_stop_hold_requires_fresh_feedback_and_cumulative_stability(self) -> None:
+        class Publisher:
+            def publish(self, _message) -> None:
+                pass
+
+        class FakeRuntime:
+            def __init__(self) -> None:
+                self._cmd_vel_pub = Publisher()
+                self.samples = iter(
+                    [
+                        ("odom", math.radians(0.0), 0),
+                        ("odom", math.radians(0.5), 1),
+                        ("odom", math.radians(1.0), 2),
+                        ("odom", math.radians(1.5), 3),
+                        ("odom", math.radians(2.0), 4),
+                        ("odom", math.radians(2.0), 5),
+                        ("odom", math.radians(2.0), 6),
+                    ]
+                )
+                self.last_sample = ("odom", math.radians(2.0), 6)
+
+            def _current_turn_feedback_sample(self):
+                self.last_sample = next(self.samples, self.last_sample)
+                return self.last_sample
+
+            def _spin_once(self, *, timeout_sec: float) -> None:
+                pass
+
+        clock = [0.0]
+
+        def advancing_time() -> float:
+            clock[0] += 0.01
+            return clock[0]
+
+        with (
+            patch.object(ros_nav2_runtime, "Twist", object),
+            patch.object(ros_nav2_runtime.time, "time", side_effect=advancing_time),
+            patch.object(ros_nav2_runtime.time, "sleep"),
+        ):
+            result = RosExplorationRuntime.hold_stop_until_stable(
+                FakeRuntime(),
+                duration_s=0.5,
+                yaw_stable_tolerance_rad=math.radians(0.6),
+                min_stable_cycles=2,
+            )
+
+        self.assertTrue(result["stable"])
+        self.assertEqual(result["fresh_feedback_samples"], 6)
+        self.assertAlmostEqual(result["observed_yaw_delta_rad"], math.radians(2.0))
+
+    def test_stop_hold_does_not_count_duplicate_feedback_samples(self) -> None:
+        class Publisher:
+            def publish(self, _message) -> None:
+                pass
+
+        class FakeRuntime:
+            _cmd_vel_pub = Publisher()
+
+            def _current_turn_feedback_sample(self):
+                return "odom", 0.0, 1
+
+            def _spin_once(self, *, timeout_sec: float) -> None:
+                pass
+
+        clock = [0.0]
+
+        def advancing_time() -> float:
+            clock[0] += 0.01
+            return clock[0]
+
+        with (
+            patch.object(ros_nav2_runtime, "Twist", object),
+            patch.object(ros_nav2_runtime.time, "time", side_effect=advancing_time),
+            patch.object(ros_nav2_runtime.time, "sleep"),
+        ):
+            result = RosExplorationRuntime.hold_stop_until_stable(
+                FakeRuntime(),
+                duration_s=0.1,
+                min_stable_cycles=2,
+            )
+
+        self.assertFalse(result["stable"])
+        self.assertEqual(result["fresh_feedback_samples"], 0)
 
     def test_rear_axle_rotation_sweep_moves_base_link_in_arc(self) -> None:
         start = Pose2D(0.2, 0.0, 0.0)

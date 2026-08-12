@@ -57,6 +57,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
     )
     parser.add_argument("--navigation-waypoint-horizon-m", type=float, default=None)
+    parser.add_argument(
+        "--navigation-waypoint-breakdown",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Split semantic navigation into short agent-level waypoints. "
+            "Use --no-navigation-waypoint-breakdown to send the final resolved goal directly to Nav2."
+        ),
+    )
     parser.add_argument("--navigation-auto-rotate-threshold-deg", type=float, default=None)
     parser.add_argument("--backend-request-timeout-s", type=float, default=None)
     parser.add_argument("--agent-artifacts-root", default=None)
@@ -126,6 +135,10 @@ def main(argv: list[str] | None = None) -> int:
         f"minimum confidence={config.basket_verification_minimum_confidence:g}"
     )
     print(f"Navigation auto-rotate threshold: {config.navigation_auto_rotate_threshold_deg:g} deg")
+    print(
+        "Navigation waypoint breakdown: "
+        f"{'enabled' if config.navigation_waypoint_breakdown_enabled else 'disabled'}"
+    )
     print(f"Agent artifacts: {config.agent_artifacts_root}")
     print(f"Object detector: {config.object_detector_provider}")
     print(
@@ -246,6 +259,11 @@ def _merge_args(config: HomeAgentConfig, args: argparse.Namespace) -> HomeAgentC
             args.navigation_waypoint_horizon_m
             if args.navigation_waypoint_horizon_m is not None
             else config.navigation_waypoint_horizon_m
+        ),
+        navigation_waypoint_breakdown_enabled=(
+            args.navigation_waypoint_breakdown
+            if args.navigation_waypoint_breakdown is not None
+            else config.navigation_waypoint_breakdown_enabled
         ),
         navigation_auto_rotate_threshold_deg=(
             args.navigation_auto_rotate_threshold_deg

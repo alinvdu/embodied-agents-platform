@@ -85,6 +85,7 @@ class HomeAgentConfig:
     basket_verification_max_image_edge_px: int = 1024
     basket_verification_jpeg_quality: int = 85
     navigation_waypoint_horizon_m: float = DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M
+    navigation_waypoint_breakdown_enabled: bool = True
     navigation_auto_rotate_threshold_deg: float = 45.0
     backend_request_timeout_s: float = 120.0
     agent_artifacts_root: str = "artifacts/agent_runs"
@@ -215,6 +216,7 @@ class HomeAgentToolRuntime:
                 constraints.get("waypoint_horizon_m", self.config.navigation_waypoint_horizon_m)
                 or self.config.navigation_waypoint_horizon_m
             ),
+            waypoint_breakdown_enabled=self.config.navigation_waypoint_breakdown_enabled,
             navigation_purpose=str(constraints.get("navigation_purpose") or constraints.get("purpose") or ""),
             object_label=str(constraints.get("object_label") or constraints.get("search_object_label") or ""),
             exploration_constraints=constraints,
@@ -1631,7 +1633,7 @@ class HomeAgentToolRuntime:
                 if final_centering.get("status") != "skipped":
                     result["final_image_centering"] = final_centering
                     if final_centering.get("status") == "succeeded":
-                        result["reason"] = f"{result['reason']} Applied one final bbox-centering rotation."
+                        result["reason"] = f"{result['reason']} Applied one final RGB-D rear-drive alignment rotation."
                     elif final_centering.get("status") == "already_centered":
                         result["reason"] = f"{result['reason']} Final detector pass confirmed the object is centered."
                 self.emit("tool_executed", "Approach Object", result["reason"], result)
@@ -1969,27 +1971,74 @@ class HomeAgentToolRuntime:
         )
         result["tolerance_norm"] = round(tolerance, 4)
         result["center_error_norm"] = center["error_norm"]
-        if abs(float(center["error_norm"])) <= tolerance:
+        geometry = self._estimate_detection_geometry(
+            detection=selected,
+            capture=capture,
+            constraints=constraints,
+        )
+        result["geometry"] = geometry
+        rear_drive_alignment = (
+            geometry.get("rear_drive_alignment")
+            if isinstance(geometry.get("rear_drive_alignment"), dict)
+            else {}
+        )
+        try:
+            bearing_error_deg = float(
+                rear_drive_alignment.get("bearing_error_deg", geometry.get("bearing_error_deg"))
+            )
+        except (TypeError, ValueError):
+            bearing_error_deg = math.nan
+        if geometry.get("status") != "succeeded" or not math.isfinite(bearing_error_deg):
+            geometry_reason = str(geometry.get("reason") or "rear-drive bearing was not returned")
             result.update(
                 {
-                    "status": "already_centered",
-                    "reason": "Final detector pass found the object within the camera-center tolerance.",
+                    "status": "geometry_unavailable",
+                    "reason": (
+                        f"Final RGB-D rear-drive bearing was unavailable ({geometry_reason}); "
+                        "skipped bbox-only rotation."
+                    ),
                 }
             )
             return result
-        yaw_constraints = {
-            **constraints,
-            "max_yaw_step_deg": constraints.get(
+        horizontal_fov_deg = _bounded_float(
+            constraints.get("horizontal_fov_deg", self.config.object_focus_horizontal_fov_deg),
+            self.config.object_focus_horizontal_fov_deg,
+            minimum=20.0,
+            maximum=120.0,
+        )
+        default_bearing_tolerance_deg = tolerance * horizontal_fov_deg * 0.5
+        bearing_tolerance_deg = _bounded_float(
+            constraints.get("final_centering_bearing_tolerance_deg", default_bearing_tolerance_deg),
+            default_bearing_tolerance_deg,
+            minimum=0.1,
+            maximum=15.0,
+        )
+        result["bearing_error_deg"] = round(bearing_error_deg, 3)
+        result["bearing_tolerance_deg"] = round(bearing_tolerance_deg, 3)
+        result["rotation_source"] = "rgbd_rear_drive_alignment"
+        if abs(bearing_error_deg) <= bearing_tolerance_deg:
+            result.update(
+                {
+                    "status": "already_centered",
+                    "reason": "Final RGB-D bearing is within the rear-drive alignment tolerance.",
+                }
+            )
+            return result
+        max_yaw_step_deg = _bounded_float(
+            constraints.get(
                 "final_centering_max_yaw_step_deg",
                 constraints.get("max_yaw_step_deg", self.config.object_approach_final_center_max_yaw_step_deg),
             ),
-        }
-        yaw_step_deg = _visual_servo_yaw_step_deg(center, yaw_constraints, self.config)
+            self.config.object_approach_final_center_max_yaw_step_deg,
+            minimum=1.0,
+            maximum=45.0,
+        )
+        yaw_step_deg = round(max(min(bearing_error_deg, max_yaw_step_deg), -max_yaw_step_deg), 3)
         result["yaw_step_deg"] = yaw_step_deg
         rotation = self.rotate_by(
             delta_yaw_deg=yaw_step_deg,
-            reason=f"Final one-shot center `{object_label}` from image bbox after approach.",
-            **_object_alignment_rotation_kwargs(constraints, self.config),
+            reason=f"Final one-shot align `{object_label}` from RGB-D rear-drive bearing after approach.",
+            rotation_scope="rear_drive",
         )
         result["rotation"] = rotation
         if rotation.get("status") not in {"succeeded", "partial"}:
@@ -2008,7 +2057,7 @@ class HomeAgentToolRuntime:
         result.update(
             {
                 "status": "succeeded",
-                "reason": "Applied exactly one final bbox-centering rotation after approach.",
+                "reason": "Applied exactly one final RGB-D rear-drive alignment rotation after approach.",
             }
         )
         return result
@@ -2400,15 +2449,6 @@ class HomeAgentToolRuntime:
             }
             self.emit("tool_blocked", "Return To Start", result["reason"], result)
             return result
-        if str(start.get("source") or "") == "default_map_origin":
-            result = {
-                "tool": "return_to_start",
-                "status": "blocked",
-                "reason": "The start pose is only the default map origin, not an operator-approved dock pose.",
-            }
-            self.emit("tool_blocked", "Return To Start", result["reason"], result)
-            return result
-
         target = _json_pose(pose)
         name = str(start.get("name") or "start")
         waypoint_name = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_") or "start"
@@ -2431,6 +2471,7 @@ class HomeAgentToolRuntime:
                 else f"Robot could not return to `{name}`: {navigation.get('reason') or navigation.get('status')}."
             ),
             "start_name": name,
+            "start_source": str(start.get("source") or "home_memory"),
             "start_pose": target,
             "navigation": navigation,
             "handoff_ready": status == "succeeded" and self._verified_item_in_basket,
@@ -3528,7 +3569,7 @@ class HomeTaskAgent:
 
         @function_tool
         def return_to_start(constraints_json: str = "{}") -> str:
-            """Return to the operator-approved dock/start pose with the verified item in the basket."""
+            """Return to the initial dock/start coordinates with the verified item in the basket."""
             return tool_result(
                 "return_to_start",
                 runtime.return_to_start(constraints=_loads_object(constraints_json)),
@@ -3565,6 +3606,15 @@ class HomeTaskAgent:
 
     def _agent_instructions(self, memory: dict[str, Any] | None) -> str:
         context = home_memory_agent_context(memory) if memory else {}
+        waypoint_policy = (
+            "Navigation waypoint breakdown is enabled: use the configured short-horizon waypoint loop."
+            if self.config.navigation_waypoint_breakdown_enabled
+            else (
+                "Navigation waypoint breakdown is disabled: resolve_navigation_to_region returns the final "
+                "safe region/search-entry goal as one final waypoint. Send that goal to Nav2 once; do not "
+                "create or request intermediate travel waypoints."
+            )
+        )
         return "\n".join(
             [
                 "You are Robot42's HomeTaskAgent.",
@@ -3572,7 +3622,8 @@ class HomeTaskAgent:
                 "You receive the full long-term home memory in context. Do not call memory lookup tools.",
                 "Available tools are resolve_navigation_to_region, plan_region_exploration, execute_region_exploration_plan, navigate_to_waypoint, relocalize_here, rotate_by, rotate_towards_point, micro_adjust_to_pose, focus_detected_object, approach_detected_object, grab_object, return_to_start, and stop_robot.",
                 "Navigation model:",
-                "- resolve_navigation_to_region computes a safe centered path and a short waypoint.",
+                "- resolve_navigation_to_region computes a safe centered path and the configured navigation waypoint.",
+                f"- {waypoint_policy}",
                 f"- navigate_to_waypoint auto-rotates toward the waypoint before Nav2 when bearing error is above {self.config.navigation_auto_rotate_threshold_deg:.1f} degrees, then uses Nav2 first.",
                 "- If Nav2 fails, navigate_to_waypoint can automatically use a short direct primitive fallback only when the saved occupancy map proves the straight corridor is footprint-clear.",
                 "- If Nav2 fails with little/no progress and direct fallback is too far or blocked, inspect local_clearance_recovery. If it contains a recovery_pose, call micro_adjust_to_pose to that pose, then relocalize_here, then retry navigation.",
@@ -3583,14 +3634,14 @@ class HomeTaskAgent:
                 "- plan_region_exploration generates inspection stops and 65-degree shot cones for visual search inside a known region.",
                 "- execute_region_exploration_plan runs that region search motion: it navigates the base to each inspection stop, aims the head camera for each shot yaw when possible, saves RGB debug shots, and runs object detection when a detector provider is configured. It uses base rotation for shots only as a fallback when head pan is unavailable or outside limits.",
                 "- execute_region_exploration_plan is for local visual search after the robot is already near the target region. Do not use exploration stops as a shortcut for long-distance navigation.",
-                "- For far object-search regions such as kitchen from another room, first use resolve_navigation_to_region with constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"<object>\"}'. This aims the normal short-horizon waypoint loop at the first useful search/scan stop instead of the room center.",
+                "- For far object-search regions such as kitchen from another room, first use resolve_navigation_to_region with constraints_json='{\"navigation_purpose\":\"object_search\",\"object_label\":\"<object>\"}'. This aims navigation at the first useful search/scan stop instead of the room center.",
                 "- If execute_region_exploration_plan returns status='requires_navigation', follow its suggested_navigation by calling resolve_navigation_to_region, then navigate_to_waypoint and relocalize_here until the search-entry waypoint is reached.",
                 "- For nearby regions already within roughly one short-horizon waypoint, execute_region_exploration_plan may be used directly for search.",
                 "- Local clearance recovery is only an unstick maneuver after Nav2 fails: one small micro_adjust_to_pose to the suggested recovery_pose, relocalize_here, then retry Nav2. Never chain local recovery or micro_adjust_to_pose calls to create a route to a far region.",
                 "- If execute_region_exploration_plan returns detection_status='matched', a detector match was confirmed by the operator, remaining shots were aborted, and selected_detection contains the best box. If the operator rejects a candidate, the tool marks that shot rejected and keeps searching.",
                 "- focus_detected_object reuses the tracked bbox when possible, then uses bounded rotation to center the object.",
                 "- approach_detected_object uses the first matched search-shot bbox before any new detector pass: if the object was seen with the head camera panned, it combines that shot yaw with the bbox horizontal offset, faces the head camera forward, and rotates the robot body toward the object. Only after this initial angle correction does it capture/DINO again to reacquire a front-camera bbox for RGB-D geometry. If that reacquire misses, it performs one local reacquire sweep: rotate left 15 deg and detect, then rotate right 30 deg and detect. If either sweep shot finds the object, it trusts that bbox for one centering correction and approach.",
-                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. When the object reaches the configured staging band, it performs one fresh detector pass and at most one rotation-only final bbox-centering nudge before returning success. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
+                "- approach_detected_object solves RGB-D bbox depth from the depth image using real camera_info or fallback-FOV intrinsics, uses estimated_pose_camera.x as the grasp-staging forward distance when available, uses at most one RGB bbox centering correction, then commits to forward approach without extra recentering. When the object reaches the configured staging band, it performs one fresh detector pass, grounds it in RGB-D, and applies at most one rotation-only correction from the differential-drive wheel-axle bearing before returning success; it will not make that final turn from bbox pixels alone. It infers nearby occupied support-surface angle from long-term memory, aligns the robot body perpendicular when useful, and moves toward grasp staging using 80% of the remaining gap capped by max step until the object is in the configured staging band. If no footprint-clear support-surface standoff exists, it continues with visual centering and forward approach from the current pose instead of blocking. Do not request relocalize_after_surface_alignment unless the user explicitly asks for it.",
                 "- approach_detected_object does not refresh immediately after its single bbox-centering correction; it commits to the forward approach from that corrected pose. After forward approach steps, it refreshes detection by default so the next distance estimate uses a fresh RGB bbox with the latest depth image.",
                 "- Once approach_detected_object has been called for an object, stay in visual/RGB-D approach mode. Do not call relocalize_here between approach attempts; stale ROS camera/head state can make final approach worse. If approach returns partial after useful motion and the object was still detected, retry approach_detected_object with constraints_json='{\"allow_surface_alignment\": false, \"reset_head_pan_before_approach\": true}' so the retry refreshes the camera-forward detection and checks reachability without repeating support-surface realignment. If that retry is still partial or blocked while the object is visible, report that it was found but not safely reachable.",
                 "- grab_object is the VLA skill entrypoint and should only be called after focus and approach succeed. It succeeds only after the second gripper opening, vision verification that the bottle is released inside the basket, and a successful NAV_STOW motion. In dry-run or when VLA handoff is disabled it returns mock_succeeded; do not report that as a real physical pickup.",
@@ -3599,7 +3650,11 @@ class HomeTaskAgent:
                 "- If the user asks to stop, call stop_robot immediately and do not call any other tool afterward.",
                 "For semantic region navigation such as `go to kitchen`, first call resolve_navigation_to_region.",
                 "For object-search-and-grab commands such as `bring me the Coke from the kitchen`, first decide whether the region is nearby. If it is far, navigate using resolve_navigation_to_region with navigation_purpose='object_search' before any execute_region_exploration_plan call. Once near the returned search-entry goal, call execute_region_exploration_plan for that region and object label. If it matches, call focus_detected_object, then approach_detected_object, then grab_object. For bring/fetch wording, call return_to_start after verified grab success. If detection_status is not_configured, say detection is not configured. If it is not_found, summarize where the robot looked.",
-                f"The default short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters.",
+                (
+                    f"The short-horizon waypoint length is {self.config.navigation_waypoint_horizon_m:.1f} meters."
+                    if self.config.navigation_waypoint_breakdown_enabled
+                    else "Intermediate navigation waypoint breakdown is disabled; next_waypoint is the final resolved goal."
+                ),
                 "Use the resolver's next_waypoint exactly; do not invent arbitrary waypoint coordinates.",
                 "Call navigate_to_waypoint with next_waypoint.waypoint_id, x, y, and yaw.",
                 "After each successful waypoint, call relocalize_here before resolving the next waypoint.",
@@ -4163,6 +4218,10 @@ def config_from_env() -> HomeAgentConfig:
         ),
         navigation_waypoint_horizon_m=float(
             os.getenv("ROBOT42_NAVIGATION_WAYPOINT_HORIZON_M", str(DEFAULT_NAVIGATION_WAYPOINT_HORIZON_M))
+        ),
+        navigation_waypoint_breakdown_enabled=_env_bool(
+            "ROBOT42_NAVIGATION_WAYPOINT_BREAKDOWN_ENABLED",
+            True,
         ),
         navigation_auto_rotate_threshold_deg=float(os.getenv("ROBOT42_NAVIGATION_AUTO_ROTATE_THRESHOLD_DEG", "45")),
         backend_request_timeout_s=float(os.getenv("ROBOT42_AGENT_BACKEND_REQUEST_TIMEOUT_S", "120")),

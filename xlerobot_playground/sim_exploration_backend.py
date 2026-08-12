@@ -153,7 +153,7 @@ class SimExplorationConfig:
     ros_turn_scan_timeout_s: float = 45.0
     ros_turn_scan_settle_s: float = 1.0
     ros_manual_spin_angular_speed_rad_s: float = 0.25
-    ros_manual_spin_publish_hz: float = 20.0
+    ros_manual_spin_publish_hz: float = 50.0
     ros_manual_spin_direction_sign: float = 1.0
     ros_robot_length_m: float = 0.3913
     ros_robot_width_m: float = 0.459
@@ -6190,7 +6190,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
-    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=50.0)
     parser.add_argument("--ros-manual-spin-direction-sign", type=float, choices=(-1.0, 1.0), default=1.0)
     parser.add_argument("--ros-robot-length-m", type=float, default=0.3913)
     parser.add_argument("--ros-robot-width-m", type=float, default=0.459)

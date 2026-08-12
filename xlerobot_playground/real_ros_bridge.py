@@ -112,6 +112,7 @@ class RealRosBridgeConfig:
     publish_head_camera: bool = True
     publish_imu: bool = True
     publish_rate_hz: float = 30.0
+    motion_command_rate_hz: float = 50.0
     imu_publish_rate_hz: float = 200.0
     imu_ws_path: str = "/ws/imu"
     imu_ws_reconnect_delay_s: float = 1.0
@@ -594,7 +595,9 @@ class RealXLeRobotRosBridge(Node):
         self.tf_broadcaster = TransformBroadcaster(self)
         self._latest_twist = Twist()
         self._latest_cmd_stamp = 0.0
-        self._last_step_stamp = time.monotonic()
+        self._velocity_lock = threading.Lock()
+        self._motion_lock = threading.Lock()
+        self._last_motion_step_stamp = time.monotonic()
         self._x = 0.0
         self._y = 0.0
         self._yaw = 0.0
@@ -616,6 +619,7 @@ class RealXLeRobotRosBridge(Node):
         self._imu_stream_stop = threading.Event()
         self._imu_stream_thread: threading.Thread | None = None
         self._cmd_vel_callback_group = MutuallyExclusiveCallbackGroup()
+        self._motion_callback_group = MutuallyExclusiveCallbackGroup()
         self._step_callback_group = MutuallyExclusiveCallbackGroup()
         self._imu_callback_group = MutuallyExclusiveCallbackGroup()
 
@@ -669,6 +673,11 @@ class RealXLeRobotRosBridge(Node):
             self.step,
             callback_group=self._step_callback_group,
         )
+        self.motion_timer = self.create_timer(
+            1.0 / max(config.motion_command_rate_hz, 1e-6),
+            self.motion_step,
+            callback_group=self._motion_callback_group,
+        )
         self.imu_timer = None
         if config.publish_imu and brain_client is not None:
             require_aiohttp()
@@ -684,32 +693,47 @@ class RealXLeRobotRosBridge(Node):
             f"robot={config.robot_kind} port1={config.port1} port2={config.port2} "
             f"cmd_vel={config.cmd_vel_topic} odom={config.odom_topic} scan={config.scan_topic} "
             f"odom_source={config.odom_source} motion_enabled={config.allow_motion_commands} "
+            f"motion_rate_hz={config.motion_command_rate_hz} "
             f"publish_imu={config.publish_imu} "
             f"robot_brain_url={config.robot_brain_url or 'local'}"
         )
 
     def _on_cmd_vel(self, message: Any) -> None:
-        self._latest_twist = message
-        self._latest_cmd_stamp = time.monotonic()
+        with self._velocity_lock:
+            self._latest_twist = message
+            self._latest_cmd_stamp = time.monotonic()
+        linear, angular = twist_to_base_velocity(message)
+        if abs(linear) <= 1e-6 and abs(angular) <= 1e-6:
+            # Do not wait for the periodic motion loop to forward an explicit
+            # stop. In particular, RGB-D capture may be blocked in step().
+            self.motion_step()
 
-    def _active_velocity(self) -> tuple[float, float]:
-        if self._latest_cmd_stamp <= 0.0:
-            return 0.0, 0.0
-        if time.monotonic() - self._latest_cmd_stamp > self.config.cmd_vel_timeout_s:
-            return 0.0, 0.0
-        return twist_to_base_velocity(self._latest_twist)
+    def _active_velocity(self, *, now_s: float | None = None) -> tuple[float, float]:
+        now_s = time.monotonic() if now_s is None else float(now_s)
+        with self._velocity_lock:
+            if self._latest_cmd_stamp <= 0.0:
+                return 0.0, 0.0
+            if now_s - self._latest_cmd_stamp > self.config.cmd_vel_timeout_s:
+                return 0.0, 0.0
+            return twist_to_base_velocity(self._latest_twist)
+
+    def motion_step(self) -> None:
+        """Forward base motion and enforce its watchdog independently of sensors."""
+        with self._motion_lock:
+            now = time.monotonic()
+            dt = max(0.0, now - self._last_motion_step_stamp)
+            self._last_motion_step_stamp = now
+            linear, angular = self._active_velocity(now_s=now)
+            self._update_base_motion_state(linear=linear, angular=angular, now_s=now)
+            motion_sent = self._drive_or_stop(linear=linear, angular=angular)
+            if motion_sent:
+                self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
 
     def step(self) -> None:
         now = time.monotonic()
-        dt = max(0.0, now - self._last_step_stamp)
-        self._last_step_stamp = now
         self._poll_camera_pose(now_s=now)
-        linear, angular = self._active_velocity()
-        self._update_base_motion_state(linear=linear, angular=angular, now_s=now)
-        motion_sent = self._drive_or_stop(linear=linear, angular=angular)
-        if motion_sent:
-            self._integrate_commanded_odom(linear=linear, angular=angular, dt=dt)
         frame = self.rgbd_source.capture()
+        linear, angular = self._active_velocity()
         stamp = self.get_clock().now().to_msg()
         self._publish_transforms(stamp=stamp, linear=linear, angular=angular)
         self._publish_scan(frame=frame, stamp=stamp)
@@ -1405,6 +1429,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--publish-rate-hz", type=float, default=30.0)
     parser.add_argument(
+        "--motion-command-rate-hz",
+        type=float,
+        default=50.0,
+        help=(
+            "Independent base-command forwarding and cmd_vel watchdog rate. "
+            "This loop does not wait for RGB-D capture."
+        ),
+    )
+    parser.add_argument(
         "--imu-publish-rate-hz",
         type=float,
         default=200.0,
@@ -1476,6 +1509,7 @@ def config_from_args(args: argparse.Namespace) -> RealRosBridgeConfig:
         publish_head_camera=args.publish_head_camera,
         publish_imu=args.publish_imu,
         publish_rate_hz=args.publish_rate_hz,
+        motion_command_rate_hz=args.motion_command_rate_hz,
         imu_publish_rate_hz=args.imu_publish_rate_hz,
         imu_ws_path=args.imu_ws_path,
         imu_ws_reconnect_delay_s=args.imu_ws_reconnect_delay_s,

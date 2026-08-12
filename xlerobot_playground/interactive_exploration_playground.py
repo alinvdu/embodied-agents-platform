@@ -4838,7 +4838,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ros-turn-scan-timeout-s", type=float, default=45.0)
     parser.add_argument("--ros-turn-scan-settle-s", type=float, default=1.0)
     parser.add_argument("--ros-manual-spin-angular-speed-rad-s", type=float, default=0.25)
-    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=20.0)
+    parser.add_argument("--ros-manual-spin-publish-hz", type=float, default=50.0)
     parser.add_argument("--ros-turn-scan-mode", choices=("camera_pan", "robot_spin"), default="camera_pan")
     parser.add_argument("--robot-brain-url", default="http://127.0.0.1:8765")
     parser.add_argument("--camera-pan-action-key", default="head_motor_1.pos")

@@ -30,6 +30,8 @@ class RealAgenticExplorationTests(unittest.TestCase):
         self.assertIn("--memory-root", translated)
         self.assertEqual(translated[translated.index("--memory-root") + 1], "./artifacts/memories")
         self.assertEqual(translated[translated.index("--ros-manual-spin-angular-speed-rad-s") + 1], "0.3")
+        self.assertEqual(args.ros_manual_spin_publish_hz, 50.0)
+        self.assertEqual(translated[translated.index("--ros-manual-spin-publish-hz") + 1], "50.0")
         self.assertEqual(translated[translated.index("--ros-manual-spin-direction-sign") + 1], "1.0")
         self.assertEqual(translated[translated.index("--ros-base-link-x-from-wheel-axle-m") + 1], "0.0")
         self.assertEqual(translated[translated.index("--ros-camera-center-forward-m") + 1], "0.24")
@@ -90,6 +92,13 @@ class RealAgenticExplorationTests(unittest.TestCase):
         args = build_backend_parser().parse_args(["--relocalization", "false"])
 
         self.assertFalse(args.relocalization)
+
+    def test_backend_defaults_manual_spin_control_to_50_hz(self) -> None:
+        args = build_backend_parser().parse_args([])
+
+        self.assertEqual(args.ros_manual_spin_publish_hz, 50.0)
+        config = SimExplorationConfig(repo_root=".", persist_path="/tmp/robot42-test-map.json")
+        self.assertEqual(config.ros_manual_spin_publish_hz, 50.0)
 
     def test_backend_accepts_no_relocalization_alias(self) -> None:
         args = build_backend_parser().parse_args(["--no-relocalization"])

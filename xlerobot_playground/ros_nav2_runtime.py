@@ -503,6 +503,42 @@ def compute_turn_command(
     return command_direction * commanded_speed, False
 
 
+def evaluate_turn_completion(
+    *,
+    used_feedback: bool,
+    command_stop_reason: str,
+    target_yaw_rad: float,
+    actual_yaw_rad: float,
+) -> tuple[bool, str, float | None]:
+    """Judge controller completion while retaining final yaw error for warnings."""
+    if not used_feedback:
+        completed = command_stop_reason == "time_fallback_elapsed"
+        return completed, command_stop_reason, None
+    final_error_rad = abs(float(target_yaw_rad) - float(actual_yaw_rad))
+    if command_stop_reason != "target_yaw_reached":
+        return False, command_stop_reason, final_error_rad
+    return True, "target_yaw_reached", final_error_rad
+
+
+def turn_completion_warnings(
+    *,
+    used_feedback: bool,
+    target_yaw_rad: float,
+    actual_yaw_rad: float,
+    final_tolerance_rad: float = math.radians(4.0),
+) -> list[str]:
+    if not used_feedback:
+        return []
+    tolerance = max(float(final_tolerance_rad), 0.0)
+    target_magnitude = abs(float(target_yaw_rad))
+    actual_magnitude = abs(float(actual_yaw_rad))
+    if actual_magnitude > target_magnitude + tolerance:
+        return ["rotation_overshoot"]
+    if actual_magnitude < max(target_magnitude - tolerance, 0.0):
+        return ["rotation_undershoot"]
+    return []
+
+
 def _unwrap_yaw_sequence(yaws: Iterable[float]) -> list[float]:
     sequence = list(yaws)
     if not sequence:
@@ -618,6 +654,28 @@ def rear_drive_camera_center_shift(
         "forward_m": round(shift_x, 4),
         "lateral_m": round(shift_y, 4),
         "distance_m": round(math.hypot(shift_x, shift_y), 4),
+    }
+
+
+def rear_drive_object_alignment(
+    *,
+    object_forward_from_base_m: float,
+    object_lateral_from_base_m: float,
+    base_link_x_from_wheel_axle_m: float = 0.0,
+    base_link_y_from_wheel_axle_m: float = 0.0,
+) -> dict[str, Any]:
+    """Express an RGB-D object point from the differential-drive yaw pivot."""
+    axle_forward_m = float(object_forward_from_base_m) + float(base_link_x_from_wheel_axle_m)
+    axle_lateral_m = float(object_lateral_from_base_m) + float(base_link_y_from_wheel_axle_m)
+    return {
+        "model": "object bearing from differential-drive wheel-axle pivot",
+        "forward_m": round(axle_forward_m, 4),
+        "lateral_m": round(axle_lateral_m, 4),
+        "bearing_error_deg": round(math.degrees(math.atan2(axle_lateral_m, axle_forward_m)), 3),
+        "base_link_from_wheel_axle": {
+            "x_m": round(float(base_link_x_from_wheel_axle_m), 4),
+            "y_m": round(float(base_link_y_from_wheel_axle_m), 4),
+        },
     }
 
 
@@ -828,7 +886,7 @@ class RosRuntimeConfig:
     turn_scan_timeout_s: float = 45.0
     turn_scan_settle_s: float = 1.0
     manual_spin_angular_speed_rad_s: float = 0.25
-    manual_spin_publish_hz: float = 20.0
+    manual_spin_publish_hz: float = 50.0
     manual_spin_direction_sign: float = 1.0
     robot_length_m: float = 0.3913
     robot_width_m: float = 0.459
@@ -1027,6 +1085,7 @@ class RosExplorationRuntime(Node):
         self.latest_imu_msg: Imu | None = None
         self._latest_imu_orientation_yaw_rad: float | None = None
         self._latest_imu_orientation_unwrapped_yaw_rad: float | None = None
+        self._latest_imu_orientation_generation = 0
         self._scan_sensor_yaw_offset_rad: float | None = None
         self._use_turn_feedback_for_scan_pose = False
         self.scan_observations: list[dict[str, Any]] = []
@@ -1329,6 +1388,7 @@ class RosExplorationRuntime(Node):
                 math.cos(yaw_rad - self._latest_imu_orientation_yaw_rad),
             )
         self._latest_imu_orientation_yaw_rad = yaw_rad
+        self._latest_imu_orientation_generation += 1
 
     def recent_nav2_log_events(self, *, since_wall_s: float, limit: int = 20) -> list[dict[str, Any]]:
         events = [
@@ -1338,12 +1398,36 @@ class RosExplorationRuntime(Node):
         return events[-max(int(limit), 1):]
 
     def _current_turn_feedback(self) -> tuple[str, float] | tuple[None, None]:
+        feedback_frame, yaw, _sample_token = self._current_turn_feedback_sample()
+        return feedback_frame, yaw
+
+    def _current_turn_feedback_sample(self) -> tuple[str, float, object] | tuple[None, None, None]:
         if self._latest_imu_orientation_unwrapped_yaw_rad is not None:
-            return "imu", float(self._latest_imu_orientation_unwrapped_yaw_rad)
-        pose = self.current_pose_in_frame(self.config.odom_frame)
-        if pose is not None:
-            return self.config.odom_frame, float(pose.yaw)
-        return None, None
+            return (
+                "imu",
+                float(self._latest_imu_orientation_unwrapped_yaw_rad),
+                ("imu", int(self._latest_imu_orientation_generation)),
+            )
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                self.config.odom_frame,
+                self.config.base_frame,
+                RosTime(),
+            )
+        except (LookupException, ConnectivityException, ExtrapolationException):
+            return None, None, None
+        rotation = transform.transform.rotation
+        stamp = transform.header.stamp
+        return (
+            self.config.odom_frame,
+            yaw_from_quaternion_xyzw(
+                float(rotation.x),
+                float(rotation.y),
+                float(rotation.z),
+                float(rotation.w),
+            ),
+            ("tf", int(stamp.sec), int(stamp.nanosec)),
+        )
 
     def _scan_pose_with_turn_feedback(self, sensor_pose: Pose2D) -> Pose2D:
         if not self.config.publish_internal_navigation_map:
@@ -1549,6 +1633,16 @@ class RosExplorationRuntime(Node):
         forward_m = float(object_base[0])
         lateral_m = float(object_base[1])
         vertical_m = float(object_base[2])
+        rear_drive_alignment = rear_drive_object_alignment(
+            object_forward_from_base_m=forward_m,
+            object_lateral_from_base_m=lateral_m,
+            base_link_x_from_wheel_axle_m=float(
+                getattr(self.config, "base_link_x_from_wheel_axle_m", 0.0)
+            ),
+            base_link_y_from_wheel_axle_m=float(
+                getattr(self.config, "base_link_y_from_wheel_axle_m", 0.0)
+            ),
+        )
         range_m = math.sqrt(forward_m * forward_m + lateral_m * lateral_m + vertical_m * vertical_m)
         target_max_m = clamp(float(payload.get("target_max_m", 0.45) or 0.45), 0.1, 2.0)
         safety = _safe_forward_step_from_points(
@@ -1592,6 +1686,7 @@ class RosExplorationRuntime(Node):
             "lateral_m": round(lateral_m, 3),
             "vertical_m": round(vertical_m, 3),
             "bearing_error_deg": round(math.degrees(math.atan2(lateral_m, max(forward_m, 1e-6))), 2),
+            "rear_drive_alignment": rear_drive_alignment,
             "safety": safety,
         }
 
@@ -1752,6 +1847,16 @@ class RosExplorationRuntime(Node):
         forward_m = float(object_base[0])
         lateral_m = float(object_base[1])
         vertical_m = float(object_base[2])
+        rear_drive_alignment = rear_drive_object_alignment(
+            object_forward_from_base_m=forward_m,
+            object_lateral_from_base_m=lateral_m,
+            base_link_x_from_wheel_axle_m=float(
+                getattr(self.config, "base_link_x_from_wheel_axle_m", 0.0)
+            ),
+            base_link_y_from_wheel_axle_m=float(
+                getattr(self.config, "base_link_y_from_wheel_axle_m", 0.0)
+            ),
+        )
         range_m = math.sqrt(forward_m * forward_m + lateral_m * lateral_m + vertical_m * vertical_m)
         target_max_m = clamp(float(payload.get("target_max_m", 0.45) or 0.45), 0.1, 2.0)
         safety = _safe_forward_step_from_points(
@@ -1805,6 +1910,7 @@ class RosExplorationRuntime(Node):
             "lateral_m": round(lateral_m, 3),
             "vertical_m": round(vertical_m, 3),
             "bearing_error_deg": round(math.degrees(math.atan2(lateral_m, max(forward_m, 1e-6))), 2),
+            "rear_drive_alignment": rear_drive_alignment,
             "safety": safety,
         }
 
@@ -1944,32 +2050,54 @@ class RosExplorationRuntime(Node):
         min_stable_cycles: int = 3,
     ) -> dict[str, Any]:
         deadline = time.time() + max(float(duration_s), 0.0)
-        _feedback_frame, previous_yaw = self._current_turn_feedback()
+        feedback_frame, previous_yaw, previous_sample_token = self._current_turn_feedback_sample()
+        stable_anchor_yaw = previous_yaw
         stable_cycles = 0
+        fresh_feedback_samples = 0
         observed_yaw_delta = 0.0
         while time.time() < deadline:
             self._cmd_vel_pub.publish(Twist())
             self._spin_once(timeout_sec=0.05)
-            feedback_frame, current_yaw = self._current_turn_feedback()
-            if current_yaw is None or previous_yaw is None:
+            current_frame, current_yaw, sample_token = self._current_turn_feedback_sample()
+            if current_yaw is None:
                 time.sleep(0.05)
                 continue
+            if previous_yaw is None or current_frame != feedback_frame:
+                feedback_frame = current_frame
+                previous_yaw = current_yaw
+                previous_sample_token = sample_token
+                stable_anchor_yaw = current_yaw
+                stable_cycles = 0
+                time.sleep(0.05)
+                continue
+            if sample_token == previous_sample_token:
+                time.sleep(0.05)
+                continue
+            previous_sample_token = sample_token
+            fresh_feedback_samples += 1
             delta = math.atan2(
                 math.sin(current_yaw - previous_yaw),
                 math.cos(current_yaw - previous_yaw),
             )
             observed_yaw_delta += delta
             previous_yaw = current_yaw
-            if abs(delta) <= yaw_stable_tolerance_rad:
+            assert stable_anchor_yaw is not None
+            stable_window_delta = math.atan2(
+                math.sin(current_yaw - stable_anchor_yaw),
+                math.cos(current_yaw - stable_anchor_yaw),
+            )
+            if abs(stable_window_delta) <= yaw_stable_tolerance_rad:
                 stable_cycles += 1
                 if stable_cycles >= max(int(min_stable_cycles), 1):
                     break
             else:
                 stable_cycles = 0
+                stable_anchor_yaw = current_yaw
             time.sleep(0.05)
         return {
             "stable": stable_cycles >= max(int(min_stable_cycles), 1),
             "stable_cycles": stable_cycles,
+            "fresh_feedback_samples": fresh_feedback_samples,
             "observed_yaw_delta_rad": observed_yaw_delta,
         }
 
@@ -3028,18 +3156,35 @@ class RosExplorationRuntime(Node):
         else:
             stop_reason = "timeout"
         self._cmd_vel_pub.publish(Twist())
-        stop_hold = self.hold_stop_until_stable(duration_s=max(step_s * 6.0, 0.4), min_stable_cycles=2)
+        stop_hold = self.hold_stop_until_stable(duration_s=max(step_s * 6.0, 1.0), min_stable_cycles=2)
         if used_feedback:
             last_relative_yaw += float(stop_hold.get("observed_yaw_delta_rad", 0.0))
-        completed = bool(
-            (used_feedback and abs(last_relative_yaw) >= max(abs(target_yaw_rad) - math.radians(2.0), 0.0))
-            or (not used_feedback and stop_reason == "time_fallback_elapsed")
+        completed, final_stop_reason, final_yaw_error_rad = evaluate_turn_completion(
+            used_feedback=used_feedback,
+            command_stop_reason=stop_reason,
+            target_yaw_rad=target_yaw_rad,
+            actual_yaw_rad=last_relative_yaw,
         )
+        warnings = turn_completion_warnings(
+            used_feedback=used_feedback,
+            target_yaw_rad=target_yaw_rad,
+            actual_yaw_rad=last_relative_yaw,
+        )
+        if warnings:
+            self.get_logger().warning(
+                "Local rotation completed with warning(s): "
+                f"{', '.join(warnings)}; final_yaw_error_deg={math.degrees(final_yaw_error_rad or 0.0):.2f}"
+            )
         return {
             "spin_completed": completed,
-            "spin_stop_reason": stop_reason,
+            "spin_stop_reason": final_stop_reason,
+            "spin_command_stop_reason": stop_reason,
             "spin_feedback_frame": feedback_frame if used_feedback else "time_fallback",
             "actual_unwrapped_yaw_delta_rad": round(last_relative_yaw, 3) if used_feedback else None,
+            "final_yaw_error_deg": round(math.degrees(final_yaw_error_rad), 2) if final_yaw_error_rad is not None else None,
+            "stop_feedback_stable": bool(stop_hold.get("stable", False)),
+            "warnings": warnings,
+            "stop_hold": stop_hold,
             "spin_command_angular_speed_rad_s": round(command_direction * max_command_speed, 3),
             "spin_timeout_s": round(timeout_s, 3),
             "rotation_safety": safety_events[-1] if safety_events else None,
