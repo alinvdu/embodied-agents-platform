@@ -68,8 +68,8 @@ folded
 It then waits 5 seconds and moves to `ACTION_READY` using staged deltas:
 
 ```text
-elbow_flex    -80
-shoulder_lift +80
+elbow_flex    -65
+shoulder_lift +55
 wrist_flex    -40
 ```
 
@@ -88,10 +88,14 @@ This avoids a direct sweep from folded navigation pose to an IK-friendly pose th
 The default ACTION_READY deltas are already baked in. Override them only when testing:
 
 ```bash
---vr-action-ready-elbow-delta -80 \
---vr-action-ready-shoulder-delta 80 \
+--vr-action-ready-elbow-delta -65 \
+--vr-action-ready-shoulder-delta 55 \
 --vr-action-ready-wrist-delta -40
 ```
+
+The `+55` shoulder and `-65` elbow deltas are the physically validated
+ACTION_READY pose for new recordings. Use the earlier values explicitly only
+when reproducing a dataset or checkpoint captured with an older pose.
 
 To change the wait after folded pose:
 
@@ -162,7 +166,7 @@ target3d=(fwd=...,lat=...,h=...,pan=...)
 Forward/back controller motion should change `fwd`, side motion should change `lat` and `pan`, and up/down should change `h`. If side motion points the wrong way, flip the lateral gain:
 
 ```bash
---vr-arm-yawed-lateral-gain -0.5
+--vr-arm-yawed-lateral-gain -0.30
 ```
 
 If the arm pans opposite to the desired lateral target, flip the pan sign:
@@ -170,6 +174,18 @@ If the arm pans opposite to the desired lateral target, flip the pan sign:
 ```bash
 --vr-arm-yawed-pan-sign -1
 ```
+
+Yawed lateral control defaults to a `0.30` gain and limits shoulder-pan changes
+to `3.0` degrees per update:
+
+```bash
+--vr-arm-yawed-lateral-gain 0.30
+--vr-arm-yawed-pan-step-limit 3.0
+```
+
+The runtime reconstructs the Cartesian IK target from the observed joint pose
+and holds three controller frames whenever ACTION_READY or a menu hold is
+released. This prevents the arm from jumping when live VR control resumes.
 
 To skip the startup pose routine and use the old zero/middle behavior:
 
@@ -202,11 +218,17 @@ If you need a specific wrist camera frame rate later, add an override directly i
 
 The right thumbstick axis controls the differential base. Pressing the right thumbstick opens the recording menu. Robot42 smooths base velocity commands before sending them to the wheels.
 
+While a dataset episode is actively recording, the base is hard-stopped by
+default. It is also hard-stopped whenever the VR menu is open. Base control is
+available between episodes for repositioning. Use
+`--allow-vr-base-while-recording` only for a dataset that intentionally records
+mobile-base motion.
+
 Default base tuning:
 
 ```text
-max linear speed    0.25 m/s
-max angular speed   75 deg/s
+max linear speed    0.12 m/s
+max angular speed   35 deg/s
 linear accel        0.9 m/s^2
 angular accel       240 deg/s^2
 deadzone            0.14
@@ -227,6 +249,16 @@ Finish                 finalize dataset and exit
 ```
 
 Cancel and Finish remain menu-only so accidental shortcut presses cannot discard or finalize the dataset.
+
+The headset status badge shows `Saved: N`, and the open recording menu shows
+`Episodes saved this session: N`. The counter starts at zero for each backend
+run and increments only after an episode is saved successfully. Existing
+episodes in a resumed dataset are not included.
+
+Only an explicit Save action persists the active episode. Finish, Ctrl-C, and
+unexpected shutdowns discard any active unsaved episode before finalizing the
+episodes that were already saved. Saving does not depend on the robot's action
+phase.
 
 In plain `manipulate` mode, left thumbstick down also resets the robot to `ACTION_READY`.
 
@@ -301,7 +333,8 @@ For VLA data collection:
 
 ```text
 1. Let the robot navigate folded in NAV_STOW.
-2. Move to ACTION_READY outside the recorded episode.
+2. Move to ACTION_READY outside the recorded episode. The runtime locks both arms
+   there until the first episode starts.
 3. Press the left thumbstick to start recording.
 4. Demonstrate grab and basket drop.
 5. Return to ACTION_READY and let the boundary lock engage.

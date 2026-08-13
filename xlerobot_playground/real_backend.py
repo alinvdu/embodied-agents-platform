@@ -41,6 +41,7 @@ class RecordingSession:
     task: str
     dataset_root: Path | None = None
     active: bool = False
+    session_episode_count: int = 0
     orbbec_output_dir: Path | None = None
     orbbec_camera_key: str = "head"
     latest_observation_images: dict[str, tuple[Any, float]] = field(default_factory=dict)
@@ -86,6 +87,7 @@ class VrArmTuning:
     yawed_lateral_gain: float
     yawed_pan_sign: float
     yawed_pan_limit: float
+    yawed_pan_step_limit: float
     shoulder_lift_min: float
     shoulder_lift_max: float
     elbow_flex_min: float
@@ -128,6 +130,7 @@ _VR_SESSION_STATUS: dict[str, Any] = {
     "recording_active": False,
     "recording_missing": [],
     "episode_frame_count": 0,
+    "session_episode_count": 0,
     "episode_phase": "idle",
     "held_sides": [],
     "finish_requested": False,
@@ -164,6 +167,9 @@ _NAV_STOW_ARM_POSE = {
     "wrist_roll": 0.1709,
     "gripper": 0.9466,
 }
+_ACTION_READY_ELBOW_DELTA = -65.0
+_ACTION_READY_SHOULDER_DELTA = 55.0
+_ACTION_READY_WRIST_DELTA = -40.0
 _VR_ARM_CLUTCH_RELEASE_HOLD_FRAMES = 3
 _XLEVR_ORIGINAL_PRINT: Any | None = None
 _VR_BASKET_POSE_DEFAULTS = {
@@ -490,12 +496,20 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         default=2.0,
         help="Seconds used to ramp back to ACTION_READY after pressing the action-ready button.",
     )
-    parser.add_argument("--vr-base-max-linear", type=float, default=0.25)
-    parser.add_argument("--vr-base-max-angular", type=float, default=75.0)
+    parser.add_argument("--vr-base-max-linear", type=float, default=0.12)
+    parser.add_argument("--vr-base-max-angular", type=float, default=35.0)
     parser.add_argument("--vr-base-linear-accel", type=float, default=0.9)
     parser.add_argument("--vr-base-angular-accel", type=float, default=240.0)
     parser.add_argument("--vr-base-deadzone", type=float, default=0.14)
     parser.add_argument("--vr-base-curve", type=float, default=1.5)
+    parser.add_argument(
+        "--allow-vr-base-while-recording",
+        action="store_true",
+        help=(
+            "Allow right-thumbstick base motion during an active recording. "
+            "By default the base is hard-stopped while recording."
+        ),
+    )
     parser.add_argument("--vr-arm-vertical-sign", type=float, default=1.0)
     parser.add_argument("--vr-arm-y-gain", type=float, default=1.4)
     parser.add_argument("--vr-arm-z-gain", type=float, default=1.0)
@@ -515,7 +529,7 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--vr-arm-yawed-lateral-gain",
         type=float,
-        default=0.5,
+        default=0.30,
         help="Sideways gain for yawed 3D arm IK. Use a negative value to flip lateral direction.",
     )
     parser.add_argument(
@@ -529,6 +543,12 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
         type=float,
         default=120.0,
         help="Absolute shoulder pan limit used by yawed 3D arm IK.",
+    )
+    parser.add_argument(
+        "--vr-arm-yawed-pan-step-limit",
+        type=float,
+        default=3.0,
+        help="Maximum shoulder-pan change per VR update in yawed IK mode.",
     )
     parser.add_argument(
         "--vr-arm-debug",
@@ -588,19 +608,19 @@ def _add_shared_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--vr-action-ready-elbow-delta",
         type=float,
-        default=-80.0,
+        default=_ACTION_READY_ELBOW_DELTA,
         help="Elbow flex delta applied when moving from NAV_STOW to ACTION_READY.",
     )
     parser.add_argument(
         "--vr-action-ready-shoulder-delta",
         type=float,
-        default=80.0,
+        default=_ACTION_READY_SHOULDER_DELTA,
         help="Shoulder lift delta applied after elbow when moving from NAV_STOW to ACTION_READY.",
     )
     parser.add_argument(
         "--vr-action-ready-wrist-delta",
         type=float,
-        default=-40.0,
+        default=_ACTION_READY_WRIST_DELTA,
         help="Optional wrist flex delta applied during the elbow stage of ACTION_READY.",
     )
     parser.add_argument("--vr-startup-pose-steps", type=int, default=40)
@@ -665,7 +685,7 @@ def main(argv: list[str] | None = None) -> int:
                 extra_observation_features=extra_observation_features,
             ),
             task=args.task,
-            dataset_root=Path(args.dataset_root).expanduser(),
+            dataset_root=Path(args.dataset_root).expanduser().resolve(),
             orbbec_output_dir=orbbec_output_dir,
         )
 
@@ -729,6 +749,7 @@ def main(argv: list[str] | None = None) -> int:
             deadzone=args.vr_base_deadzone,
             curve=args.vr_base_curve,
         ),
+        lock_base_while_recording=not args.allow_vr_base_while_recording,
         arm_tuning=VrArmTuning(
             ik_mode=args.vr_arm_ik_mode,
             vertical_sign=args.vr_arm_vertical_sign,
@@ -739,6 +760,7 @@ def main(argv: list[str] | None = None) -> int:
             yawed_lateral_gain=args.vr_arm_yawed_lateral_gain,
             yawed_pan_sign=args.vr_arm_yawed_pan_sign,
             yawed_pan_limit=args.vr_arm_yawed_pan_limit,
+            yawed_pan_step_limit=args.vr_arm_yawed_pan_step_limit,
             shoulder_lift_min=args.vr_arm_shoulder_lift_min,
             shoulder_lift_max=args.vr_arm_shoulder_lift_max,
             elbow_flex_min=args.vr_arm_elbow_flex_min,
@@ -1255,10 +1277,18 @@ def _move_to_joint_targets(
             time.sleep(delay_s)
 
 
-def _sync_vr_teleop_to_current_pose(robot: Any, vr_teleop: Any) -> None:
+def _sync_vr_teleop_to_current_pose(
+    robot: Any,
+    vr_teleop: Any,
+    *,
+    rebaseline_frames: int = _VR_ARM_CLUTCH_RELEASE_HOLD_FRAMES,
+) -> None:
     obs = _get_robot_observation(robot, use_camera=False)
     for side in ("left", "right"):
         _sync_vr_arm_to_observation(vr_teleop, side, obs)
+        arm = getattr(vr_teleop, f"{side}_arm", None)
+        if arm is not None and rebaseline_frames > 0:
+            setattr(arm, "ik_clutch_rebaseline_frames", int(rebaseline_frames))
 
     head = getattr(vr_teleop, "head_control", None)
     if head is not None:
@@ -1284,9 +1314,10 @@ def _sync_vr_arm_to_observation(vr_teleop: Any, side: str, obs: dict[str, Any]) 
         arm.target_positions = targets
         arm.pitch = targets.get("wrist_flex", 0.0) + targets.get("shoulder_lift", 0.0) + targets.get("elbow_flex", 0.0)
         kin = getattr(arm, "kinematics", None)
-        if kin is not None and hasattr(kin, "forward_kinematics"):
+        if kin is not None:
             try:
-                arm.current_x, arm.current_y = kin.forward_kinematics(
+                arm.current_x, arm.current_y = _so101_forward_kinematics(
+                    kin,
                     targets.get("shoulder_lift", 0.0),
                     targets.get("elbow_flex", 0.0),
                 )
@@ -1305,6 +1336,24 @@ def _sync_vr_arm_yawed_target_from_pose(arm: Any, targets: dict[str, float]) -> 
     arm.current_forward = radial * math.cos(pan_rad)
     arm.current_lateral = radial * math.sin(pan_rad)
     arm.current_height = planar_y
+
+
+def _so101_forward_kinematics(
+    kinematics: Any,
+    shoulder_lift_deg: float,
+    elbow_flex_deg: float,
+) -> tuple[float, float]:
+    """Invert the SO101 IK branch used by this runtime."""
+    l1 = float(getattr(kinematics, "l1", 0.1159))
+    l2 = float(getattr(kinematics, "l2", 0.1350))
+    theta1_offset = math.atan2(0.028, 0.11257)
+    theta2_offset = math.atan2(0.0052, 0.1349) + theta1_offset
+    theta1 = math.radians(90.0 - float(shoulder_lift_deg)) - theta1_offset
+    theta2 = math.radians(float(elbow_flex_deg) + 90.0) - theta2_offset
+    return (
+        l1 * math.cos(theta1) + l2 * math.cos(theta1 - theta2),
+        l1 * math.sin(theta1) + l2 * math.sin(theta1 - theta2),
+    )
 
 
 def _clear_vr_arm_controller_baseline(arm: Any) -> None:
@@ -1903,26 +1952,34 @@ def _orbbec_vr_overlay_js(
     const status = payload && payload.robot42 ? payload.robot42 : {};
     robot42LatestStatus = status;
     const missing = Array.isArray(status.recording_missing) ? status.recording_missing : [];
-    if (status.recording_operation === 'saving') return 'Saving...';
-    if (status.recording_operation === 'starting') return 'Starting...';
-    if (status.recording_operation === 'cancelling') return 'Cancelling...';
-    if (status.recording_operation === 'finishing') return 'FINISHING';
-    if (status.finish_requested) return 'FINISHING';
-    if (status.recording_active && missing.length > 0) {
-      return status.menu_open ? `MENU - Missing ${missing[0]}` : `REC BLOCKED: ${missing[0]}`;
+    let text = '';
+    if (status.recording_operation === 'saving') text = 'Saving...';
+    else if (status.recording_operation === 'starting') text = 'Starting...';
+    else if (status.recording_operation === 'cancelling') text = 'Cancelling...';
+    else if (status.recording_operation === 'finishing') text = 'FINISHING';
+    else if (status.finish_requested) text = 'FINISHING';
+    if (!text && status.recording_active && missing.length > 0) {
+      text = status.menu_open ? `MENU - Missing ${missing[0]}` : `REC BLOCKED: ${missing[0]}`;
+    } else if (!text && status.recording_active) {
+      text = status.menu_open ? 'MENU - Recording...' : 'Recording...';
+    } else if (!text && status.episode_phase === 'await_finish') {
+      text = status.menu_open ? 'MENU - Save or cancel' : 'Action ready - open menu';
+    } else if (!text && status.episode_phase === 'await_start') {
+      text = status.menu_open ? 'MENU - Record or finish' : 'Ready - open menu';
+    } else if (!text && status.menu_open) {
+      text = status.recording_enabled ? 'MENU - Idle' : 'MENU';
+    } else if (!text) {
+      text = status.recording_enabled ? 'Idle' : 'Teleop';
     }
-    if (status.recording_active) return status.menu_open ? 'MENU - Recording...' : 'Recording...';
-    if (status.episode_phase === 'await_finish') return status.menu_open ? 'MENU - Save or cancel' : 'Action ready - open menu';
-    if (status.episode_phase === 'await_start') return status.menu_open ? 'MENU - Record or finish' : 'Ready - open menu';
-    if (status.menu_open) return status.recording_enabled ? 'MENU - Idle' : 'MENU';
-    return status.recording_enabled ? 'Idle' : 'Teleop';
+    const count = Math.max(0, Number.parseInt(status.session_episode_count || 0, 10) || 0);
+    return status.recording_enabled ? `${text} | Saved: ${count}` : text;
   }
 
   function statusColor(text) {
     if (text.includes('BLOCKED') || text.includes('Missing')) return '#b91c1c';
     if (text.includes('Saving') || text.includes('Starting') || text.includes('Cancelling')) return '#b7791f';
     if (text.includes('Recording')) return '#cf2e2e';
-    if (text === 'FINISHING') return '#6b21a8';
+    if (text.startsWith('FINISHING')) return '#6b21a8';
     if (text.includes('Save') || text.includes('Action ready')) return '#b7791f';
     if (text.includes('Ready')) return '#2563eb';
     if (text.startsWith('MENU')) return '#111827';
@@ -1955,11 +2012,11 @@ def _orbbec_vr_overlay_js(
     label.id = 'robot42-recording-status-vr';
     label.setAttribute('value', 'IDLE');
     label.setAttribute('align', 'center');
-    label.setAttribute('width', '1.8');
+    label.setAttribute('width', '2.2');
     label.setAttribute('color', '#fff');
     label.setAttribute('position', '0 0.16 -0.99');
     label.setAttribute('side', 'double');
-    label.setAttribute('geometry', 'primitive: plane; width: 0.88; height: 0.075');
+    label.setAttribute('geometry', 'primitive: plane; width: 1.08; height: 0.075');
     label.setAttribute('material', 'color: #333; shader: flat; side: double');
     headset.appendChild(label);
   }
@@ -2053,7 +2110,7 @@ def _orbbec_vr_overlay_js(
 
     const hint = document.createElement('a-text');
     hint.id = 'robot42-recording-menu-hint';
-    hint.setAttribute('value', 'Aim the blue ray, select with trigger');
+    hint.setAttribute('value', 'Episodes saved this session: 0');
     hint.setAttribute('align', 'center');
     hint.setAttribute('width', '1.4');
     hint.setAttribute('color', '#cbd5e1');
@@ -2082,6 +2139,14 @@ def _orbbec_vr_overlay_js(
     root.setAttribute('visible', menuOpen ? 'true' : 'false');
 
     const specs = recordingMenuSpecs();
+    const hint = document.getElementById('robot42-recording-menu-hint');
+    if (hint) {
+      const count = Math.max(
+        0,
+        Number.parseInt((robot42LatestStatus || {}).session_episode_count || 0, 10) || 0
+      );
+      hint.setAttribute('value', `Episodes saved this session: ${count}`);
+    }
     const signature = specs.map(spec => `${spec.action}:${spec.label}`).join('|');
     if (signature === menuSignature && menuButtons.length > 0) {
       setMenuHover(hoveredMenuAction);
@@ -2684,6 +2749,7 @@ def _run_vr_backend(
     arm_clutch_keys: VrArmClutchKeys,
     basket_pose: VrBasketPoseConfig,
     base_smoother: BaseSmoother,
+    lock_base_while_recording: bool,
     arm_tuning: VrArmTuning,
     video_display: VrVideoDisplayConfig,
     vr_video_streams: bool,
@@ -2726,6 +2792,8 @@ def _run_vr_backend(
         f"accel {base_smoother.linear_accel:.2f} m/s^2, "
         f"{base_smoother.angular_accel:.0f} deg/s^2."
     )
+    if recording is not None and lock_base_while_recording:
+        print("VR base safety: wheel commands are hard-stopped while an episode is recording.")
     installed = _install_orbbec_vr_overlay(
         vr_teleop,
         orbbec_rgb.output_dir,
@@ -2768,9 +2836,10 @@ def _run_vr_backend(
     previous_vr_buttons: set[str] = set()
     previous_menu_open = _vr_menu_is_open()
     menu_pointer_hand = _vr_menu_pointer_hand(basket_pose)
-    fixed_arm_modes: dict[str, str] = {}
+    fixed_arm_modes, episode_boundary = _initial_vr_episode_boundary(recording)
     fixed_arm_motion_states: dict[str, FixedArmMotionState] = {}
-    episode_boundary = VrEpisodeBoundaryState()
+    if episode_boundary.phase == "await_start":
+        print("ACTION_READY locked while waiting for the first episode. Press left thumbstick or Record to begin.")
     _update_vr_session_status(recording, episode_boundary, menu_pointer_hand=menu_pointer_hand)
 
     try:
@@ -2937,7 +3006,15 @@ def _run_vr_backend(
                     action_ready_targets,
                     episode_boundary,
                 )
-            action = _smooth_vr_base_action(action, base_smoother)
+            base_locked = menu_pause_this_loop or (
+                lock_base_while_recording
+                and recording is not None
+                and recording.active
+            )
+            if base_locked:
+                action = _force_vr_base_stop(action, base_smoother)
+            else:
+                action = _smooth_vr_base_action(action, base_smoother)
             if action:
                 sent_action = robot.send_action(action)
             else:
@@ -2968,6 +3045,10 @@ def _run_vr_backend(
         _finalize_recording(recording)
         _stop_orbbec_rgb_sidecar(orbbec_process)
         try:
+            try:
+                robot.send_action({"x.vel": 0.0, "theta.vel": 0.0})
+            except Exception:
+                pass
             robot.disconnect()
         finally:
             _force_stop_vr_runtime(vr_teleop)
@@ -3309,12 +3390,13 @@ def _apply_vr_recording_menu_actions(
         elif action == "save":
             if recording is not None and recording.active:
                 print("Training menu: saving episode.")
-                _save_episode(recording)
+                saved = _save_episode(recording)
             else:
                 print("Training menu: save selected, but no episode is active.")
+                saved = False
             _set_vr_menu_open(False)
             _set_vr_recording_operation("")
-            if state.phase == "await_finish":
+            if saved and state.phase == "await_finish":
                 state.phase = "await_start"
                 print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
         elif action == "cancel":
@@ -3350,10 +3432,10 @@ def _apply_left_thumb_recording_shortcut(
         _set_vr_recording_operation("saving")
         try:
             print("Left thumb recording shortcut: saving episode.")
-            _save_episode(recording)
+            saved = _save_episode(recording)
         finally:
             _set_vr_recording_operation("")
-        if state.phase == "await_finish":
+        if saved and state.phase == "await_finish":
             state.phase = "await_start"
             print("ACTION_READY remains locked. Press left thumbstick to start the next episode, or open the menu.")
         return True
@@ -3450,6 +3532,7 @@ def _update_vr_session_status(
                 "recording_active": bool(recording is not None and recording.active),
                 "recording_missing": list(recording.last_missing_features) if recording is not None else [],
                 "episode_frame_count": recording.episode_frame_count if recording is not None else 0,
+                "session_episode_count": recording.session_episode_count if recording is not None else 0,
                 "episode_phase": state.phase,
                 "held_sides": sorted(state.held_sides),
                 "finish_requested": finish_requested,
@@ -3480,14 +3563,27 @@ def _release_episode_boundary_hold(
     for side in tuple(state.held_sides):
         fixed_modes.pop(side, None)
         motion_states.pop(side, None)
-        sync_obs = dict(obs)
-        sync_obs.update(_side_arm_targets(action_ready_targets, side))
+        sync_obs = dict(action_ready_targets)
+        sync_obs.update(obs)
         _sync_vr_arm_to_observation(vr_teleop, side, sync_obs)
         arm = getattr(vr_teleop, f"{side}_arm", None)
         if arm is not None:
+            setattr(arm, "ik_clutch_rebaseline_frames", _VR_ARM_CLUTCH_RELEASE_HOLD_FRAMES)
             setattr(arm, "ik_fixed_pose_paused", False)
     state.held_sides.clear()
     state.phase = "idle"
+
+
+def _initial_vr_episode_boundary(
+    recording: RecordingSession | None,
+) -> tuple[dict[str, str], VrEpisodeBoundaryState]:
+    if recording is None:
+        return {}, VrEpisodeBoundaryState()
+    held_sides = {"left", "right"}
+    return (
+        {side: "episode_hold" for side in held_sides},
+        VrEpisodeBoundaryState(phase="await_start", held_sides=held_sides),
+    )
 
 
 def _update_fixed_arm_modes_from_controls(
@@ -4037,6 +4133,7 @@ def _install_vr_arm_tuning(vr_teleop: Any, tuning: VrArmTuning) -> None:
         f"yawed_forward_gain={tuning.yawed_forward_gain:.2f}, "
         f"yawed_lateral_gain={tuning.yawed_lateral_gain:.2f}, "
         f"yawed_pan_sign={tuning.yawed_pan_sign:g}, "
+        f"yawed_pan_step_limit={tuning.yawed_pan_step_limit:.1f}, "
         f"shoulder_lift=[{tuning.shoulder_lift_min:.1f}, {tuning.shoulder_lift_max:.1f}], "
         f"elbow_flex=[{tuning.elbow_flex_min:.1f}, {tuning.elbow_flex_max:.1f}], "
         f"joint_limits={'on' if tuning.enforce_joint_limits else 'off'}."
@@ -4184,14 +4281,29 @@ def _update_yawed_vr_arm_target(
 ) -> None:
     _ensure_yawed_vr_arm_state(arm)
 
-    arm.current_forward += (-delta_z) * tuning.yawed_forward_gain
-    arm.current_lateral += delta_x * tuning.yawed_lateral_gain
+    candidate_forward = arm.current_forward + (-delta_z) * tuning.yawed_forward_gain
+    candidate_lateral = arm.current_lateral + delta_x * tuning.yawed_lateral_gain
     arm.current_height += tuning.vertical_sign * delta_y
 
-    radial = math.hypot(arm.current_forward, arm.current_lateral)
-    pan_target = math.degrees(math.atan2(arm.current_lateral, arm.current_forward)) * tuning.yawed_pan_sign
+    radial = math.hypot(candidate_forward, candidate_lateral)
+    pan_sign = float(tuning.yawed_pan_sign)
+    if abs(pan_sign) < 1e-6:
+        pan_sign = 1.0
+    desired_pan = math.degrees(math.atan2(candidate_lateral, candidate_forward)) * pan_sign
     pan_limit = abs(float(tuning.yawed_pan_limit))
-    arm.target_positions["shoulder_pan"] = _clip(pan_target, -pan_limit, pan_limit)
+    desired_pan = _clip(desired_pan, -pan_limit, pan_limit)
+    current_pan = float(arm.target_positions.get("shoulder_pan", desired_pan))
+    pan_step_limit = abs(float(tuning.yawed_pan_step_limit))
+    pan_target = (
+        _step_toward(current_pan, desired_pan, pan_step_limit)
+        if pan_step_limit > 0.0
+        else desired_pan
+    )
+    arm.target_positions["shoulder_pan"] = pan_target
+
+    pan_rad = math.radians(pan_target / pan_sign)
+    arm.current_forward = radial * math.cos(pan_rad)
+    arm.current_lateral = radial * math.sin(pan_rad)
 
     arm.current_x = radial
     arm.current_y = arm.current_height
@@ -4375,6 +4487,16 @@ def _smooth_vr_base_action(action: dict[str, Any], smoother: BaseSmoother) -> di
     return smoothed
 
 
+def _force_vr_base_stop(action: dict[str, Any], smoother: BaseSmoother) -> dict[str, Any]:
+    stopped = dict(action)
+    stopped["x.vel"] = 0.0
+    stopped["theta.vel"] = 0.0
+    smoother.x_vel = 0.0
+    smoother.theta_vel = 0.0
+    smoother.last_t = None
+    return stopped
+
+
 def _shape_axis(
     value: float,
     *,
@@ -4440,7 +4562,9 @@ def _create_dataset(
     from lerobot.datasets.utils import INFO_PATH
     from lerobot.utils.constants import ACTION, OBS_STR
 
-    dataset_root_path = Path(dataset_root).expanduser()
+    # XLeVR changes the process working directory while running. Keep every
+    # dataset read and write anchored to the directory selected at startup.
+    dataset_root_path = Path(dataset_root).expanduser().resolve()
     if resume and (dataset_root_path / INFO_PATH).exists():
         print(f"Resuming LeRobot dataset `{dataset_id}` at {dataset_root_path}.")
         return LeRobotDataset.resume(
@@ -4671,7 +4795,7 @@ def _start_recording_session(recording: RecordingSession) -> None:
     recording.last_missing_features = ()
 
 
-def _save_episode(recording: RecordingSession) -> None:
+def _save_episode(recording: RecordingSession) -> bool:
     if not _episode_buffer_has_frames(recording.dataset):
         recording.active = False
         if recording.last_missing_features:
@@ -4682,22 +4806,27 @@ def _save_episode(recording: RecordingSession) -> None:
         else:
             print("Recording stopped. No frames captured, skipping save.")
         recording.episode_frame_count = 0
-        return
+        return False
 
     recording.dataset.save_episode()
     _restore_dataset_owner_after_sudo(recording)
+    recording.session_episode_count += 1
     recording.active = False
     recording.episode_frame_count = 0
     recording.last_missing_features = ()
-    print(f"Saved episode {recording.dataset.meta.total_episodes - 1}.")
+    print(
+        f"Saved episode {recording.dataset.meta.total_episodes - 1} "
+        f"({recording.session_episode_count} saved this session)."
+    )
+    return True
 
 
 def _finalize_recording(recording: RecordingSession | None) -> None:
     if recording is None:
         return
     if recording.active:
-        print("Saving the active episode before exit.")
-        _save_episode(recording)
+        print("Discarding the active unsaved episode before exit.")
+        _discard_episode(recording)
     finalize = getattr(recording.dataset, "finalize", None)
     if callable(finalize):
         print("Finalizing LeRobot dataset.")
