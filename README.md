@@ -4,6 +4,8 @@ An open-source ROS 2 platform for embodied AI agents that perceive, remember, re
 
 This repository is the software stack behind **Robot42**, a low-cost household robot built on XLeRobot. It combines RGB-D perception, ROS 2/Nav2, 3D and 2D mapping, semantic long-term memory, object recognition, LLM-driven task planning, and fine-tuned vision-language-action (VLA) policies.
 
+**[Watch it in action here](https://www.youtube.com/watch?v=Loh6vDGo5GY).**
+
 ![Robot42 household robot](docs/images/robot42-demo/01-robot42.jpg)
 
 ## End-to-End Household Demo
